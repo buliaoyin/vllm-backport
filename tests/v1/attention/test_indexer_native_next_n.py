@@ -23,7 +23,7 @@ def _set_arch(monkeypatch, family: int, *, cuda: bool = True, deep_gemm: bool = 
         "is_device_capability_family",
         lambda capability, device_id=0: capability // 10 == family,
     )
-    monkeypatch.setattr(indexer, "has_deep_gemm", lambda: deep_gemm)
+    monkeypatch.setattr(indexer, "is_deep_gemm_supported", lambda: deep_gemm)
 
 
 @pytest.mark.parametrize(
