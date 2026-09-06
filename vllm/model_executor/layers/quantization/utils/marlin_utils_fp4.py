@@ -39,22 +39,22 @@ def _nvfp4_compute_scale_factor(
     marlin_scales: torch.Tensor,
     a_dtype: torch.dtype | None = None,
 ) -> float:
-    """Compute the power-of-2 scale_factor needed so that all non-zero
-    values in marlin_scales * 2^7 are >= 2 after rescaling.
-    Returns a Python float (power of 2, >= 1.0)."""
+    """Compute a power-of-2 scale factor from the largest positive scale.
+
+    Returns a Python float (power of 2, >= 1.0).
+    """
 
     # Since half has a smaller dynamic range compared to bfloat16,
     # no rescaling is applied here if active dtype is half.
     if a_dtype is not None and a_dtype == torch.half:
         return 1.0
+    if marlin_scales.numel() == 0:
+        return 1.0
 
-    ws_float = marlin_scales.float() * (2**7)
-    nonzero_mask = ws_float > 0
-    if nonzero_mask.any():
-        max_val = ws_float[nonzero_mask].max()
-        if max_val < 448 * (2**7):
-            sf = (448 * (2**7) / max_val).log2().floor().exp2()
-            return sf.item()
+    max_val = marlin_scales.max().float() * (2**7)
+    if max_val > 0 and max_val < 448 * (2**7):
+        sf = (448 * (2**7) / max_val).log2().floor().exp2()
+        return sf.item()
     return 1.0
 
 
@@ -422,6 +422,8 @@ def prepare_nvfp4_moe_layer_for_marlin(
     w13 = repack_weight(w13, "w13")
     w2 = repack_weight(w2, "w2")
 
+    torch.accelerator.empty_cache()
+
     # WEIGHT SCALES
     # Permute scales
     def permute_scales(
@@ -429,7 +431,6 @@ def prepare_nvfp4_moe_layer_for_marlin(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         scales = scales.to(param_dtype)
 
-        tensor_list = []
         if "w13" in name:
             scales = pad_w13(scales)
             size_n, size_k = padded_N * num_shards, K
@@ -441,6 +442,7 @@ def prepare_nvfp4_moe_layer_for_marlin(
         # scale_factor across all experts first, then apply uniformly.
         combined_scale_factor = _nvfp4_compute_scale_factor(scales, param_dtype)
 
+        output: torch.Tensor | None = None
         for i in range(E):
             scale = scales[i].T
             marlin_scales = marlin_permute_scales(
@@ -453,12 +455,18 @@ def prepare_nvfp4_moe_layer_for_marlin(
             marlin_scales, _ = nvfp4_marlin_process_scales(
                 marlin_scales, scale_factor=combined_scale_factor, a_dtype=param_dtype
             )
-            tensor_list.append(marlin_scales)
+            if output is None:
+                output = torch.empty(
+                    (E, *marlin_scales.shape),
+                    dtype=marlin_scales.dtype,
+                    device=marlin_scales.device,
+                )
+            output[i] = marlin_scales
 
-        scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        assert output is not None
         g_scales = nvfp4_marlin_process_global_scale(g_scales, param_dtype)
         g_scales = g_scales / combined_scale_factor
-        return scales, g_scales
+        return output, g_scales
 
     w13_scale, w13_scale_2 = permute_scales(w13_scale, w13_scale_2, "w13")
     w2_scale, w2_scale_2 = permute_scales(w2_scale, w2_scale_2, "w2")

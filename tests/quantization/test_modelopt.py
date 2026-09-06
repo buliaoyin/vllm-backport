@@ -583,6 +583,35 @@ def test_modelopt_nvfp4_config_dispatches_w4a16_method():
 
 
 @pytest.mark.parametrize(
+    "values",
+    [
+        [],
+        [0.0, 0.0],
+        [-1.0, 0.0],
+        [0.0, 0.5, 1.0],
+        [1.0, 3.5, 2.0],
+        [1.0, 224.0, 448.0],
+    ],
+)
+def test_nvfp4_scale_factor_matches_masked_reference(values):
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        _nvfp4_compute_scale_factor,
+    )
+
+    scales = torch.tensor(values, dtype=torch.bfloat16)
+    scales_float = scales.float() * (2**7)
+    positive = scales_float > 0
+    expected = 1.0
+    if positive.any():
+        max_val = scales_float[positive].max()
+        if max_val < 448 * (2**7):
+            expected = (448 * (2**7) / max_val).log2().floor().exp2().item()
+
+    assert _nvfp4_compute_scale_factor(scales, torch.bfloat16) == expected
+    assert _nvfp4_compute_scale_factor(scales, torch.half) == 1.0
+
+
+@pytest.mark.parametrize(
     ("linear_backend", "kernel_cls"),
     [("auto", MarlinNvFp4LinearKernel), ("humming", HummingNvFp4LinearKernel)],
 )
