@@ -237,3 +237,37 @@ def test_glm5next_awq_preserves_unquantized_fused_mlp():
         config.get_scheme_dict(layer, "language_model.model.layers.1.mlp.gate_up_proj")
         is not None
     )
+
+
+@pytest.mark.parametrize("load_target_first", [False, True])
+def test_glm5next_awq_preserves_unquantized_mtp_layers(load_target_first):
+    from compressed_tensors.quantization import QuantizationArgs
+
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors,
+    )
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+    from vllm.models.glm5next.nvidia.mtp import Glm5NextMTP
+
+    config = compressed_tensors.CompressedTensorsConfig(
+        target_scheme_map={"Linear": {"weights": QuantizationArgs(num_bits=4)}},
+        ignore=[
+            f"model.language_model.layers.45.mlp.{expert}.{proj}_proj"
+            for expert in ("experts.0", "shared_experts")
+            for proj in ("gate", "up")
+        ],
+        quant_format="pack-quantized",
+    )
+    if load_target_first:
+        configure_quant_config(config, glm5_model.Glm5NextForConditionalGeneration)
+        configure_quant_config(config, glm5_model.Glm5NextForCausalLM)
+    configure_quant_config(config, Glm5NextMTP)
+    layer = nn.Linear(32, 64, bias=False)
+
+    for expert in ("experts.0", "shared_experts"):
+        prefix = f"model.layers.45.mlp.{expert}.gate_up_proj"
+        assert config.get_scheme_dict(layer, prefix) is None
+    assert (
+        config.get_scheme_dict(layer, "model.layers.44.mlp.experts.0.gate_up_proj")
+        is not None
+    )
