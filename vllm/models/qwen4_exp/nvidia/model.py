@@ -564,11 +564,14 @@ class Qwen4ExpModel(nn.Module):
         )
         # Non-persistent PLE state rebuilt in __init__; skip any ckpt
         # column for them.
-        skip_substrs = (
+        skip_substrs = [
             "hashstats_",
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
-        )
+        ]
+        if self.hyper_connection_mixer is None:
+            # The final mixer exists only on the last pipeline stage.
+            skip_substrs.append("hyper_connection_mixer.")
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={substr: None for substr in skip_substrs}
         )

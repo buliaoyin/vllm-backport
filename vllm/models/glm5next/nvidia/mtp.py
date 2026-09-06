@@ -31,6 +31,7 @@ from .model import (
     Glm5NextMoE,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
+    _unpack_awq_attention_weight,
     get_spec_layer_idx_from_weight_name,
 )
 from .ops.fused_eh_norm import fused_eh_norm
@@ -308,6 +309,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}
+        pending_awq: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
         kv_a_pad_size = 0
@@ -326,6 +328,12 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             if spec_layer is None:
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
+            unpacked = _unpack_awq_attention_weight(
+                name, loaded_weight, pending_awq, self.quant_config
+            )
+            if unpacked is None:
+                continue
+            name, loaded_weight = unpacked
 
             if _try_load_fp8_indexer_wk(
                 name,
@@ -412,6 +420,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        if pending_awq:
+            raise ValueError(f"Incomplete AWQ attention weights: {list(pending_awq)}")
         loaded_layers: set[int] = set()
         for param_name in loaded_params:
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)

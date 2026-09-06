@@ -580,6 +580,7 @@ class Glm5NextModel(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
         self.device = current_platform.device_type
@@ -658,21 +659,23 @@ class Glm5NextModel(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        hidden_shape = (batch_size, self.config.hidden_size)
-        if self.config.mhc:
-            hidden_shape = (
+        # PP intermediates carry the full multi-stream mHC state
+        # (tokens, n, hidden_size): every mHC layer's output is a stream
+        # state whose deferred hc_post is materialized at the boundary
+        # (see Glm5NextModel.forward). Mirrors DSV4's hc_mult hand-off.
+        # Only key "hidden_states"; residual/post/comb are re-derived on
+        # the receiving rank by standalone hc_pre.
+        shape: tuple[int, ...]
+        if getattr(self.config, "mhc", False):
+            shape = (
                 batch_size,
                 self.config.mhc_num_residual_streams,
                 self.config.hidden_size,
             )
+        else:
+            shape = (batch_size, self.config.hidden_size)
         return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    hidden_shape,
-                    dtype=dtype,
-                    device=device,
-                )
-            }
+            {"hidden_states": torch.zeros(shape, dtype=dtype, device=device)}
         )
 
     def forward(
@@ -682,7 +685,7 @@ class Glm5NextModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -693,6 +696,12 @@ class Glm5NextModel(nn.Module):
             comb = None
         else:
             assert intermediate_tensors is not None
+            # The sending rank materialized its last layer's deferred
+            # hc_post, so "hidden_states" arrives as the FULL multi-stream
+            # mHC state (tokens, n * hidden) — the same hand-off DSV4 uses.
+            # The stage's first layer (post is None, layer_idx > 0) re-sets
+            # residual = x in its standalone-hc_pre branch, so no separate
+            # residual key is transported.
             hidden_states = intermediate_tensors["hidden_states"]
             residual = None
             post = None
@@ -708,13 +717,17 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
+            # PP hand-off (DSV4 pattern): materialize this rank's last mHC
+            # layer's deferred hc_post so the full multi-stream state
+            # ([tokens, n, hidden]) crosses the boundary in one key. The
+            # mhc_post kernel here is exactly the post that the next rank's
+            # first layer would have folded into its fused_post_pre, so the
+            # math is unchanged (one extra post kernel per boundary).
+            # post/comb stay None on the receiving rank: its first layer runs
+            # standalone hc_pre on the materialized stream state.
             if post is not None:
-                assert residual is not None and comb is not None
-                hidden_states = self._active_layers[-1].hc_post(
-                    hidden_states,
-                    residual,
-                    post,
-                    comb,
+                hidden_states = self._active_layers[-1].mhc_post_op(
+                    hidden_states, residual, post, comb
                 )
             return IntermediateTensors({"hidden_states": hidden_states})
 
@@ -765,9 +778,14 @@ class Glm5NextModel(nn.Module):
             kv_a_pad_size = self.config.qk_rope_head_dim
 
         _pending_wk_fp8: dict = {}
+        pending_awq: dict = {}
 
         for args in weights:
             name, loaded_weight = args[:2]
+            name = name.replace(".attn_hc.", ".hc_attn_").replace(
+                ".ffn_hc.", ".hc_ffn_"
+            )
+            name = name.replace(".self_attn.forget_gate.", ".self_attn.")
             kwargs: dict = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -775,6 +793,24 @@ class Glm5NextModel(nn.Module):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+            if is_pp_missing_parameter(name, self):
+                continue
+            if name.endswith(".self_attn.conv1d.weight"):
+                for proj, weight in zip(("q", "k", "v"), loaded_weight.chunk(3, dim=0)):
+                    param_name = name.replace(".conv1d.", f".{proj}_conv1d.")
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, weight)
+                    loaded_params.add(param_name)
+                continue
+            unpacked = _unpack_awq_attention_weight(
+                name, loaded_weight, pending_awq, self.quant_config
+            )
+            if unpacked is None:
+                continue
+            name, loaded_weight = unpacked
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
@@ -882,6 +918,8 @@ class Glm5NextModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        if pending_awq:
+            raise ValueError(f"Incomplete AWQ attention weights: {list(pending_awq)}")
         return loaded_params
 
 
@@ -898,6 +936,11 @@ class Glm5NextForCausalLM(
         self.model = Glm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # PP is supported: Glm5NextModel transports the materialized mHC
+        # multi-stream state across stage boundaries (DSV4 pattern).
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -913,14 +956,6 @@ class Glm5NextForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
-
-    def make_empty_intermediate_tensors(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> IntermediateTensors:
-        return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
     def forward(
         self,
@@ -1065,14 +1100,12 @@ class Glm5NextForConditionalGeneration(
                 architectures=["Glm5NextForCausalLM"],
             )
 
-    def make_empty_intermediate_tensors(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> IntermediateTensors:
-        return self.language_model.make_empty_intermediate_tensors(
-            batch_size, dtype, device
+        # PP support: the language model transports the materialized mHC
+        # multi-stream state across stage boundaries (DSV4 pattern). The
+        # Glm4v __init__ (which would alias this automatically) is skipped
+        # above, so alias it explicitly.
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.language_model.make_empty_intermediate_tensors
         )
 
     def get_encoder_cudagraph_config(self):
@@ -1229,3 +1262,45 @@ def _try_load_fp8_attn_proj(
         param.weight_loader(param, weight_bf16, shard_id)
     loaded_params.add(target_w)
     return True
+
+
+def _unpack_awq_attention_weight(
+    name: str,
+    tensor: torch.Tensor,
+    pending: dict[str, dict[str, torch.Tensor]],
+    quant_config: QuantizationConfig | None,
+) -> tuple[str, torch.Tensor] | None:
+    """Dequantize packed attention projections for the BF16 attention modules."""
+    from compressed_tensors.compressors import PackedQuantizationCompressor
+    from compressed_tensors.quantization import QuantizationScheme
+
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors,
+    )
+
+    if not (
+        isinstance(quant_config, compressed_tensors.CompressedTensorsConfig)
+        and quant_config.quant_format == "pack-quantized"
+        and ".self_attn." in name
+    ):
+        return name, tensor
+    prefix, suffix = name.rsplit(".", 1)
+    if suffix not in (
+        "weight_packed",
+        "weight_scale",
+        "weight_shape",
+        "weight_zero_point",
+        "weight_g_idx",
+    ):
+        return name, tensor
+    scheme = QuantizationScheme(
+        targets=["Linear"], weights=quant_config.target_scheme_map["Linear"]["weights"]
+    )
+    required = PackedQuantizationCompressor.compression_param_names(scheme)
+    state = pending.setdefault(prefix, {})
+    state[suffix] = tensor
+    if not all(key in state for key in required):
+        return None
+    weight = PackedQuantizationCompressor.decompress(state, scheme)["weight"]
+    del pending[prefix]
+    return prefix + ".weight", weight

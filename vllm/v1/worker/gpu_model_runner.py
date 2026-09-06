@@ -590,7 +590,9 @@ class GPUModelRunner(
 
         # PLE
         ple_layer_ids = getattr(model_config.hf_text_config, "ple_layer_ids", ())
-        self.uses_ngram_embedding = bool(ple_layer_ids)
+        self.uses_ngram_embedding = (
+            bool(ple_layer_ids) and get_pp_group().is_first_rank
+        )
         if self.uses_ngram_embedding:
             self.ngram_context_len = int(model_config.hf_text_config.ngram_size) - 1
             self.ngram_eos_token_id = int(model_config.hf_text_config.eos_token_id)
@@ -599,13 +601,6 @@ class GPUModelRunner(
             self.ngram_eos_token_id = 0
         if self.uses_ngram_embedding and self.ngram_context_len <= 0:
             raise ValueError("N-gram embedding requires context length >= 1.")
-        if self.uses_ngram_embedding and len(get_pp_group().ranks) > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1. With PP>1, ngram context is only "
-                "injected on the first rank and can become incorrect on "
-                "non-first ranks. Please run with PP=1."
-            )
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm

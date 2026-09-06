@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -13,8 +14,8 @@ from vllm.sequence import IntermediateTensors
 class _DeferredMhcLayer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.forward_state = None
-        self.post_state = None
+        self.forward_state: tuple[torch.Tensor | None, ...] | None = None
+        self.post_state: tuple[torch.Tensor, ...] | None = None
 
     def forward(self, positions, hidden_states, residual, post, comb):
         self.forward_state = (residual, post, comb)
@@ -25,7 +26,7 @@ class _DeferredMhcLayer(nn.Module):
             hidden_states + 4,
         )
 
-    def hc_post(self, hidden_states, residual, post, comb):
+    def mhc_post_op(self, hidden_states, residual, post, comb):
         self.post_state = (hidden_states, residual, post, comb)
         return hidden_states + residual + post + comb
 
@@ -98,3 +99,111 @@ def test_glm5next_pp_receiving_stage_starts_new_mhc_fusion(monkeypatch):
     )
 
     assert layer.forward_state == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_prefix", "parameter_prefix"),
+    [
+        ("attn_hc.", "hc_attn_"),
+        ("ffn_hc.", "hc_ffn_"),
+        ("hc_attn_", "hc_attn_"),
+        ("hc_ffn_", "hc_ffn_"),
+    ],
+)
+def test_glm5next_pp_loads_mhc_checkpoint_names(checkpoint_prefix, parameter_prefix):
+    """Load both checkpoint formats while skipping another PP stage's weights."""
+    model = glm5_model.Glm5NextModel.__new__(glm5_model.Glm5NextModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(is_moe=False, mla_nope=False)
+    model.quant_config = None
+    layer = nn.Module()
+    layer.register_parameter(parameter_prefix + "base", nn.Parameter(torch.zeros(2)))
+    model.layers = nn.ModuleList([layer, glm5_model.PPMissingLayer()])
+    weight = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+
+    loaded = model.load_weights(
+        [(f"layers.{i}.{checkpoint_prefix}base", weight) for i in range(2)]
+    )
+
+    assert loaded == {f"layers.0.{parameter_prefix}base"}
+    torch.testing.assert_close(
+        getattr(layer, parameter_prefix + "base"), weight.float()
+    )
+
+
+def test_glm5next_loads_fused_kda_convolution_and_forget_gate():
+    model = glm5_model.Glm5NextModel.__new__(glm5_model.Glm5NextModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(is_moe=False, mla_nope=False)
+    model.quant_config = None
+    layer = nn.Module()
+    layer.self_attn = nn.Module()
+    for proj in ("q", "k", "v"):
+        setattr(
+            layer.self_attn, f"{proj}_conv1d", nn.Conv1d(2, 2, 4, groups=2, bias=False)
+        )
+    layer.self_attn.dt_bias = nn.Parameter(torch.zeros(2))
+    model.layers = nn.ModuleList([layer])
+    fused = torch.arange(24, dtype=torch.float32).reshape(6, 1, 4)
+    bias = torch.tensor([1.0, 2.0])
+
+    model.load_weights(
+        [
+            ("layers.0.self_attn.conv1d.weight", fused),
+            ("layers.0.self_attn.forget_gate.dt_bias", bias),
+        ]
+    )
+
+    for proj, expected in zip(("q", "k", "v"), fused.chunk(3)):
+        torch.testing.assert_close(
+            getattr(layer.self_attn, f"{proj}_conv1d").weight, expected
+        )
+    torch.testing.assert_close(layer.self_attn.dt_bias, bias)
+
+
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_glm5next_loads_packed_attention_weights_in_any_order(symmetric):
+    from compressed_tensors.compressors import PackedQuantizationCompressor
+    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors,
+    )
+
+    quant_args = QuantizationArgs(
+        num_bits=4, strategy="group", group_size=16, symmetric=symmetric
+    )
+    scheme = QuantizationScheme(targets=["Linear"], weights=quant_args)
+    scales = torch.full((8, 2), 0.5)
+    zero_point = torch.zeros((8, 2), dtype=torch.int8)
+    if not symmetric:
+        zero_point[:, 0] = -1
+        zero_point[:, 1] = 1
+    integers = (torch.arange(256).reshape(8, 32) % 8 - 4).float()
+    expected = (integers - zero_point.repeat_interleave(16, dim=1)) * 0.5
+    packed = PackedQuantizationCompressor.compress(
+        {"weight": expected, "weight_scale": scales, "weight_zero_point": zero_point},
+        scheme,
+    )
+    model = glm5_model.Glm5NextModel.__new__(glm5_model.Glm5NextModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(is_moe=False, mla_nope=False)
+    model.quant_config = compressed_tensors.CompressedTensorsConfig(
+        target_scheme_map={"Linear": {"weights": quant_args}},
+        ignore=[],
+        quant_format="pack-quantized",
+    )
+    layer = nn.Module()
+    layer.self_attn = nn.Module()
+    layer.self_attn.o_proj = nn.Linear(32, 8, bias=False)
+    model.layers = nn.ModuleList([layer])
+
+    loaded = model.load_weights(
+        [
+            (f"layers.0.self_attn.o_proj.{name}", value)
+            for name, value in reversed(list(packed.items()))
+        ]
+    )
+
+    assert loaded == {"layers.0.self_attn.o_proj.weight"}
+    torch.testing.assert_close(layer.self_attn.o_proj.weight, expected)

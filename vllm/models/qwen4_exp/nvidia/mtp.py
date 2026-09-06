@@ -290,7 +290,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hc_count = self.hc_count
         hidden_size = self.hidden_size
 
-        if get_pp_group().is_first_rank:
+        # Native MTP is instantiated with draft PP=1 on the target
+        # model's last PP rank.  get_pp_group() still describes the target
+        # pipeline there, so accept the target hidden states as the draft's
+        # first-stage input instead of waiting for nonexistent draft tensors.
+        if get_pp_group().is_first_rank or hidden_states is not None:
             assert hidden_states is not None
             if inputs_embeds is None:
                 assert input_ids is not None

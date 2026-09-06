@@ -459,6 +459,17 @@ class SingleTypeKVCacheManager(ABC):
         reachable_boundaries = [request.num_prompt_tokens - 1]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
+        if self.use_eagle:
+            # Eagle/MTP prunes the last matching block on the full-attention
+            # side (``find_longest_cache_hit``'s shift), so the longest prefix a
+            # later request can be offered ends one block below the replay
+            # boundary. Retaining only the replay boundary leaves the two sides
+            # exactly one block apart and the hit degrades to zero until a
+            # shared-prefix junction is observed -- i.e. the first repeat of a
+            # prompt never hits. Retain the shifted boundary as well.
+            reachable_boundaries.append(
+                max(request.num_prompt_tokens - 1 - self.block_size, 0)
+            )
 
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,

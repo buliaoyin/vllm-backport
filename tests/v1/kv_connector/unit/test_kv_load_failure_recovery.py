@@ -337,3 +337,40 @@ def test_async_progressive_load_failure(
         assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         assert scheduler.failed_recving_kv_req_ids == {request.request_id}
         assert scheduler.connector.get_num_new_matched_tokens.call_count == 1
+
+
+def test_sync_load_failure_hybrid_groups(scheduler: Scheduler):
+    """Hybrid (multi-group) recovery: truncate at the earliest invalid
+    position across groups and evict each affected group's suffix; requests
+    whose groups hold no invalid block are untouched. Guards the regression
+    where the single-group unpack raised ``too many values to unpack`` on
+    hybrid models the first time a KV load failed at runtime."""
+    block_size = scheduler.block_size
+    request = create_request(num_tokens=10 * block_size)
+    request.num_computed_tokens = 8 * block_size
+
+    group0 = list(range(100, 110))
+    group1 = list(range(200, 210))
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.get_block_ids.return_value = (group0, group1)
+
+    affected, num_tokens, to_evict = scheduler._update_requests_with_invalid_blocks(
+        [request], invalid_block_ids={105, 202}, num_scheduled_tokens={}
+    )
+
+    # group1 fails first (idx 2) -> truncate there; group0 fails at idx 5.
+    assert affected == {request.request_id}
+    assert request.num_computed_tokens == 2 * block_size
+    assert num_tokens == 6 * block_size
+    assert to_evict == set(group0[5:]) | set(group1[2:])
+
+    # No invalid blocks for this request: untouched.
+    request2 = create_request(num_tokens=10 * block_size)
+    request2.num_computed_tokens = 8 * block_size
+    affected2, num_tokens2, to_evict2 = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request2], invalid_block_ids={999}, num_scheduled_tokens={}
+        )
+    )
+    assert affected2 == set() and num_tokens2 == 0 and to_evict2 == set()
+    assert request2.num_computed_tokens == 8 * block_size

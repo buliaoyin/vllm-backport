@@ -3,6 +3,7 @@
 """Unit tests for the vLLM-native GLM-5.3-Flash multimodal processor."""
 
 import math
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -10,8 +11,10 @@ from PIL import Image
 from transformers.image_utils import PILImageResampling
 from transformers.video_utils import VideoMetadata
 
+import vllm.transformers_utils.processors.glm5next as glm5next_module
 from vllm.transformers_utils.processors.glm5next import (
     Glm5NextImageProcessor,
+    Glm5NextProcessor,
     Glm5NextVideoProcessor,
     _get_pad_content_size,
     _resize_or_pad,
@@ -387,3 +390,41 @@ def test_video_config_fields_land():
         )
         == 16
     )
+
+
+def test_processor_from_pretrained_resolves_hf_repo_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class CapturingProcessor(Glm5NextProcessor):
+        def __init__(self, **components):
+            self.components = components
+
+    tokenizer = object()
+    tokenizer_loader = Mock(return_value=tokenizer)
+    image_config_loader = Mock(
+        return_value={"image_processor_type": "Glm5NextImageProcessor"}
+    )
+    processor_config_loader = Mock(
+        return_value={
+            "video_processor": {
+                "video_processor_type": "Glm5NextVideoProcessor",
+                "max_image_tokens": 240000,
+            }
+        }
+    )
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", tokenizer_loader)
+    monkeypatch.setattr(
+        glm5next_module, "get_image_processor_config", image_config_loader
+    )
+    monkeypatch.setattr(glm5next_module, "get_hf_file_to_dict", processor_config_loader)
+
+    repo_id = "wtdcode/GLM-5.3-Flash-AWQ-W4A16"
+    processor = CapturingProcessor.from_pretrained(repo_id, revision="test-revision")
+
+    tokenizer_loader.assert_called_once_with(repo_id, revision="test-revision")
+    image_config_loader.assert_called_once_with(repo_id)
+    processor_config_loader.assert_called_once_with(
+        "processor_config.json", repo_id, revision="test-revision"
+    )
+    assert processor.components["tokenizer"] is tokenizer
+    assert processor.components["video_processor"].max_image_tokens == 30000

@@ -41,19 +41,6 @@ jobs:
     # BUILD_RUNNER (e.g. "self-hosted"); GitHub-hosted otherwise.
     runs-on: self-hosted
     timeout-minutes: 2880
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: "8.6"
-            suffix: sm86
-            tags: lazymio/vllm-backport:latest-sm86,lazymio/vllm-backport:latest
-          - arch: "8.0"
-            suffix: sm80
-            tags: lazymio/vllm-backport:latest-sm80
-          - arch: "8.9"
-            suffix: sm89
-            tags: lazymio/vllm-backport:latest-sm89
     steps:
       - name: Free disk space
         # GitHub-hosted runners only: a cold build overflows their small
@@ -89,9 +76,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ccache-dir
-          key: ccache-${{ matrix.suffix }}-${{ github.run_id }}
+          key: ccache-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ matrix.suffix }}-
+            ccache-
 
       - uses: docker/setup-buildx-action@v3
         with:
@@ -120,6 +107,26 @@ jobs:
           [ "$JOBS" -lt 2 ] && JOBS=2
           echo "max_jobs=$JOBS" >> "$GITHUB_OUTPUT"
 
+      - name: Compute image tags
+        id: tags
+        # One image now carries cubins for sm80, sm86 and sm89, so the old
+        # per-arch tags become aliases for it. They are still published so
+        # existing `:latest-sm86` / `:v0.11.3-sm80` pulls keep working.
+        run: |
+          repo=lazymio/vllm-backport
+          tags="$repo:latest,$repo:latest-sm80,$repo:latest-sm86,$repo:latest-sm89"
+          case "${{ github.ref }}" in
+            refs/tags/*)
+              v="${{ github.ref_name }}"
+              # Tag builds publish the version tags *and* move the rolling
+              # latest tags, so latest tracks the newest build rather than the
+              # last branch push.
+              tags="$repo:$v,$repo:$v-sm80,$repo:$v-sm86,$repo:$v-sm89,$tags"
+              ;;
+          esac
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "$tags" | tr ',' '\n'
+
       - uses: docker/build-push-action@v6
         timeout-minutes: 2400
         with:
@@ -127,14 +134,11 @@ jobs:
           file: docker/Dockerfile
           target: vllm-openai
           push: true
-          # Tag builds publish the version tag *and* the rolling latest tags,
-          # so latest always tracks the newest build rather than the last
-          # branch push.
-          tags: ${{ startsWith(github.ref, 'refs/tags/') && format('lazymio/vllm-backport:{0}-{1},{2}', github.ref_name, matrix.suffix, matrix.tags) || matrix.tags }}
-          cache-from: type=registry,ref=lazymio/vllm-backport:buildcache-${{ matrix.suffix }}
-          cache-to: type=registry,ref=lazymio/vllm-backport:buildcache-${{ matrix.suffix }},mode=max,compression=zstd,ignore-error=true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=registry,ref=lazymio/vllm-backport:buildcache
+          cache-to: type=registry,ref=lazymio/vllm-backport:buildcache,mode=max,compression=zstd,ignore-error=true
           build-args: |
-            torch_cuda_arch_list=${{ matrix.arch }}
+            torch_cuda_arch_list=8.0 8.6 8.9
             max_jobs=${{ steps.parallelism.outputs.max_jobs }}
             nvcc_threads=1
             INSTALL_LMCACHE=true

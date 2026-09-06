@@ -2973,8 +2973,7 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
@@ -2984,6 +2983,41 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
+
+            if len(block_ids_per_group) > 1:
+                # Hybrid memory allocator: one block-id list per KV cache
+                # group, all at the scheduler (unified) block granularity.
+                # Take the conservative recovery: truncate at the earliest
+                # invalid position across groups and evict each affected
+                # group's suffix from its own first invalid position. The
+                # shared-block optimization below is single-group only.
+                first_invalid: list[int | None] = []
+                for group_block_ids in block_ids_per_group:
+                    found = None
+                    for idx, block_id in zip(
+                        range(req_num_computed_blocks), group_block_ids
+                    ):
+                        if block_id in invalid_block_ids:
+                            found = idx
+                            break
+                    first_invalid.append(found)
+                hit_indices = [fi for fi in first_invalid if fi is not None]
+                if hit_indices:
+                    min_idx = min(hit_indices)
+                    request.num_computed_tokens = min_idx * self.block_size
+                    total_affected_tokens += (
+                        req_num_computed_tokens - request.num_computed_tokens
+                    )
+                    if evict_blocks:
+                        for fi, group_block_ids in zip(
+                            first_invalid, block_ids_per_group
+                        ):
+                            if fi is not None:
+                                blocks_to_evict.update(group_block_ids[fi:])
+                    affected_req_ids.add(req_id)
+                continue
+
+            (req_block_ids,) = block_ids_per_group
             for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
                 if block_id not in invalid_block_ids:
                     continue

@@ -204,8 +204,18 @@ class Worker(WorkerBase):
         self._sleep_mode_backend: SleepModeBackend | None = None
 
     def _has_ple_layers(self) -> bool:
-        """Return whether this model configuration constructs PLE layers."""
+        """Return whether this pipeline stage constructs PLE layers."""
         if not envs.VLLM_PLE_CPU_OFFLOAD:
+            return False
+        parallel_config = self.parallel_config
+        pp_stride = (
+            parallel_config.prefill_context_parallel_size
+            * parallel_config.tensor_parallel_size
+        )
+        pp_rank = (
+            self.rank // pp_stride
+        ) % parallel_config.pipeline_parallel_size
+        if pp_rank != 0:
             return False
         text_config = self.model_config.hf_text_config
         return bool(getattr(text_config, "ple_layer_ids", None))
@@ -229,8 +239,6 @@ class Worker(WorkerBase):
                 f"({parallel_config.data_parallel_size_local}/"
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
-        if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:

@@ -9,7 +9,8 @@ Status:
 | `DeepSeek-v4-Flash-0731` | Native FP4 | Fully Supported (0.6.0+) |
 | `Qwen3.8-27B` | BF16, AWQ W4A16 | Fully Supported (v0.8.0+) |
 | `Qwen3.8-Flash-Next` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16) | Fully Supported (v0.9.0+) |
-| `GLM-5.3-Flash` | [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | Fully Supported (v0.11.0+) |
+| `GLM-5.3-Flash` | [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | Fully Supported (v0.11.2+) |
+| `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | [Initial Support (Not production tested)](https://github.com/wtdcode/vllm-backport/tree/dsv4-vision-exp)|
 
 Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-backport) fork for production kvcache serving, **which is also built into our docke images.**
 
@@ -22,11 +23,11 @@ Prebuilt images are published to Docker Hub on every push:
 | `lazymio/vllm-backport:latest-sm86` (also `:latest`) | Ampere sm86 (A6000, RTX 30xx) |
 | `lazymio/vllm-backport:latest-sm80` | Ampere sm80 (A100) |
 | `lazymio/vllm-backport:latest-sm89` | Ada sm89 (RTX 4090, L40S) |
-| `lazymio/vllm-backport:v0.11.0-sm86` / `-sm80` / `-sm89` | pinned release builds |
+| `lazymio/vllm-backport:v0.11.2-sm86` / `-sm80` / `-sm89` | pinned release builds |
 
 Images are single-arch builds (no FA3/Hopper kernels), so pick the tag matching your GPU. The entrypoint is `vllm serve` and `lmcache` is also available within the same image!
 
-`:latest*` tags track the main branch; each release also ships versioned tags like `:v0.11.0-sm86` if you want to pin. Check [Dockerhub](https://hub.docker.com/r/lazymio/vllm-backport/tags) or [Github](https://github.com/wtdcode/vllm-backport/tags) for available latest tags.
+`:latest*` tags track the main branch; each release also ships versioned tags like `:v0.11.2-sm86` if you want to pin. Check [Dockerhub](https://hub.docker.com/r/lazymio/vllm-backport/tags) or [Github](https://github.com/wtdcode/vllm-backport/tags) for available latest tags.
 
 ### Docker Compose Sample
 
@@ -94,12 +95,37 @@ curl http://localhost:8000/v1/models
 ### General Tips
 
 - `FULL_AND_PIECEWISE` captures the whole decode step — attention, MoE dispatch, NCCL all-reduce and the DSpark draft loop — into one CUDA graph. Measured on 4x/8x A6000: single-stream decode 45.6 -> 67-70 tok/s (+47%); prefill is unchanged (compute-bound). Two prerequisites:
-  - Pin NCCL with `NCCL_ALGO=Ring NCCL_PROTO=Simple` (and prefer `--disable-custom-all-reduce`). Graph replay must re-issue the exact captured collective; NCCL's size-adaptive algorithm switching is what made FULL capture "crash on Ampere" — Ampere itself is fine.
-  - Bound `cudagraph_capture_sizes` as shown. FULL graphs keep private memory pools; capturing every batch size up to `--max-num-seqs` can cost >800 MB per GPU and OOM warmup at high `--gpu-memory-utilization`.
+    - Pin NCCL with `NCCL_ALGO=Ring NCCL_PROTO=Simple` (and prefer `--disable-custom-all-reduce`). Graph replay must re-issue the exact captured collective; NCCL's size-adaptive algorithm switching is what made FULL capture "crash on Ampere" — Ampere itself is fine.
+    - Bound `cudagraph_capture_sizes` as shown. FULL graphs keep private memory pools; capturing every batch size up to `--max-num-seqs` can cost >800 MB per GPU and OOM warmup at high `--gpu-memory-utilization`.
 - Adjust your TP (--tensor-parallel-size), PP (--pipeline-parallel-size) and EP (--enable-expert-parallel) accordingly.
 
-
 ### Model Specific setups
+
+#### GLM-5.3-Flash (v0.11.2+)
+
+```bash
+NCCL_ALGO=Ring NCCL_PROTO=Simple
+vllm serve wtdcode/GLM-5.3-Flash-AWQ-W4A16 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name glm-5.3-flash \
+  --tensor-parallel-size 4 \
+  --max-model-len 524288 \
+  --gpu-memory-utilization 0.92 \
+  --max-num-seqs 16 \
+  --max-num-batched-tokens 8192 \
+  --enable-prefix-caching \
+  --enable-prompt-tokens-details \
+  --disable-custom-all-reduce \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,16],"max_cudagraph_capture_size":16}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45
+```
+
+- Verified with MTP-3 on 4x A100-80GB (sm80). On 8x RTX A6000 (sm86) use `--tensor-parallel-size 8` and drop `--gpu-memory-utilization` to 0.85 — with the MTP draft loaded, 0.9+ OOMs during cudagraph warmup on 48 GB cards.
+- Serving directly from the Hugging Face repository ID works; no manual snapshot-path resolution is needed.
 
 #### Qwen3.8-Flash-Next (v0.9.0+)
 
@@ -129,8 +155,7 @@ vllm serve /path/to/your/qwen3.8 \
 
 - `VLLM_PLE_CPU_OFFLOAD=1` keeps the 51B n-gram embedding (fp8, ~51 GiB) in pinned host RAM via a separate `PleOffloadWorker` process. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
 - `--enable-expert-parallel` is required, not optional: with plain TP the 640-wide expert intermediate becomes 160 per rank, which is not a multiple of the 128x128 fp8 block, and vLLM then forces the Triton fp8 MoE kernel (no fp8 tensor cores on sm86). With EP the experts stay whole and the Marlin W8A16 backend is used.
-- AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achives up to 936 tps.
-
+- AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
 
 #### DeepSeek V4 Flash
 
@@ -151,4 +176,4 @@ vllm serve /path/to/your/deepseek \
 
 - Keep `num_speculative_tokens` at 5 on Ampere. Values below 5 (the checkpoint's `dspark_block_size`) are rejected, and 7 needs ~200 KB of shared memory vs the 163 KB Ampere limit (`triton OutOfResources` error). 6 does start, but draft positions past the native block are almost never accepted (3–13% in our measurements), so it only wastes draft compute — output quality and speed are the same as 5.
 - Requests that set neither `thinking` nor `reasoning_effort` now get thinking mode with high effort, matching the official 0731 API mapping (`reasoning_effort: "none"` restores plain chat mode). Agentic/tool-calling clients should pass a `reasoning_effort` explicitly from the first turn of a session — sessions that run without the effort prefix gradually stop thinking and can enter self-reinforcing reasoning loops.
-- `--hf-overrides '{"head_dtype": "float32"}'` once helpped reduce garbage outputs by improving precisions but might be not compulsory.
+- `--hf-overrides '{"head_dtype": "float32"}'` once helped reduce garbage outputs by improving precisions but might be not compulsory.

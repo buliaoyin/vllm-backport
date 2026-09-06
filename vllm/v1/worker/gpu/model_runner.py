@@ -68,6 +68,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
+    KpoolTailSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -631,7 +632,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
-            slot_mapping_enabled.append(not isinstance(layer_spec, CircularBufferSpec))
+            # KpoolTailSpec has its own ring-buffer slot mapping
+            # (KpoolTailMetadataBuilder); feeding it into the generic
+            # position-indexed slot mapping reads far beyond its 1-block
+            # table row (e.g. pos 130559 // 4 = 32639 vs stride 32) and
+            # crashes with a CUDA illegal memory access on GLM-5.3-Flash.
+            slot_mapping_enabled.append(
+                not isinstance(layer_spec, (CircularBufferSpec, KpoolTailSpec))
+            )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(

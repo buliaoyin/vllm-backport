@@ -2,15 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the EAGLE speculator's draft attention metadata builder.
 
-These tests guard the regression where ``_build_draft_attn_metadata`` did
-not populate ``seq_lens_cpu_upper_bound`` on the per-step
-``CommonAttentionMetadata``. Several downstream attention backends and
-helpers (``split_decodes_prefills_and_extends``, the MLA indexer,
-flex-attention, cross-attention) assert this field is non-None, so
-omitting it caused crashes at the start of draft decode for certain
-backends (e.g. ``ROCM_AITER_FA`` with eagle/eagle3 spec decode):
-
-    AssertionError: assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+These tests guard regressions where ``_build_draft_attn_metadata`` did not
+populate fields needed by attention backends on the per-step
+``CommonAttentionMetadata``. Several downstream attention backends and helpers
+require ``seq_lens_cpu_upper_bound`` or ``positions``, so omitting either can
+cause crashes at the start of draft decode.
 """
 
 from types import SimpleNamespace
@@ -37,6 +33,7 @@ def _make_fake_speculator(
     fake_input_buffers = SimpleNamespace(
         query_start_loc=torch.zeros(max_num_reqs + 1, dtype=torch.int32),
         seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32),
+        positions=torch.arange(max_num_tokens, dtype=torch.int64),
     )
     fake_block_tables = SimpleNamespace(
         input_block_tables=[torch.zeros(max_num_reqs, 4, dtype=torch.int32)],
@@ -95,6 +92,23 @@ def test_build_draft_attn_metadata_sets_seq_lens_cpu_upper_bound():
     assert bound.dtype == torch.int32
     # base[:num_reqs] + step, padded tail zeroed.
     assert torch.equal(bound, torch.tensor([102, 202, 302, 0], dtype=torch.int32))
+
+
+def test_build_draft_attn_metadata_sets_positions():
+    fake = _make_fake_speculator()
+
+    captured = _run_build(
+        fake,
+        num_reqs=3,
+        num_reqs_padded=4,
+        num_tokens_padded=5,
+        base=torch.tensor([100, 200, 300, 0], dtype=torch.int32),
+        step=2,
+    )
+
+    positions = captured["positions"]
+    assert isinstance(positions, torch.Tensor)
+    assert torch.equal(positions, fake.input_buffers.positions[:5])
 
 
 def test_build_draft_attn_metadata_handles_zero_unpadded_reqs():
