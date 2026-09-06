@@ -207,3 +207,33 @@ def test_glm5next_loads_packed_attention_weights_in_any_order(symmetric):
 
     assert loaded == {"layers.0.self_attn.o_proj.weight"}
     torch.testing.assert_close(layer.self_attn.o_proj.weight, expected)
+
+
+def test_glm5next_awq_preserves_unquantized_fused_mlp():
+    from compressed_tensors.quantization import QuantizationArgs
+
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors,
+    )
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+
+    config = compressed_tensors.CompressedTensorsConfig(
+        target_scheme_map={"Linear": {"weights": QuantizationArgs(num_bits=4)}},
+        ignore=[
+            "model.language_model.layers.0.mlp.gate_proj",
+            "model.language_model.layers.0.mlp.up_proj",
+        ],
+        quant_format="pack-quantized",
+    )
+    configure_quant_config(config, glm5_model.Glm5NextForConditionalGeneration)
+    configure_quant_config(config, glm5_model.Glm5NextForCausalLM)
+    layer = nn.Linear(32, 64, bias=False)
+
+    assert (
+        config.get_scheme_dict(layer, "language_model.model.layers.0.mlp.gate_up_proj")
+        is None
+    )
+    assert (
+        config.get_scheme_dict(layer, "language_model.model.layers.1.mlp.gate_up_proj")
+        is not None
+    )

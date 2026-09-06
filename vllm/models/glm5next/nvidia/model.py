@@ -926,6 +926,8 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1027,6 +1029,11 @@ class Glm5NextForCausalLM(
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid
 ):
+    packed_modules_mapping = {
+        **Glm4vForConditionalGeneration.packed_modules_mapping,
+        **Glm5NextForCausalLM.packed_modules_mapping,
+    }
+
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
