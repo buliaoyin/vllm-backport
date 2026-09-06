@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -333,6 +334,14 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            if name == "model.embed_tokens.weight":
+                # PP drafts run on the last rank, where the target embedding
+                # cannot be shared from the first rank.
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -431,6 +440,14 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         if pending_awq:
             raise ValueError(f"Incomplete AWQ attention weights: {list(pending_awq)}")
+        if (
+            get_pp_group().world_size > 1
+            and "model.embed_tokens.weight" not in loaded_params
+        ):
+            raise ValueError(
+                "GLM MTP requires embedding weights in the checkpoint when "
+                "pipeline parallelism prevents sharing the target embedding."
+            )
         loaded_layers: set[int] = set()
         for param_name in loaded_params:
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)

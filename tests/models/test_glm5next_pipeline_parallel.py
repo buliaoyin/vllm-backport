@@ -271,3 +271,47 @@ def test_glm5next_awq_preserves_unquantized_mtp_layers(load_target_first):
         config.get_scheme_dict(layer, "model.layers.44.mlp.experts.0.gate_up_proj")
         is not None
     )
+
+
+@pytest.mark.parametrize("checkpoint_prefix", ["model.", "model.language_model."])
+@pytest.mark.parametrize("include_embedding", [True, False])
+def test_glm5next_mtp_requires_embedding_when_pp_cannot_share(
+    checkpoint_prefix, include_embedding, monkeypatch
+):
+    """The last PP rank must load the embedding from the target checkpoint."""
+    from vllm.models.glm5next.nvidia import mtp as glm5_mtp
+    from vllm.models.glm5next.nvidia.mtp import Glm5NextMTP
+
+    monkeypatch.setattr(glm5_mtp, "get_pp_group", lambda: SimpleNamespace(world_size=4))
+    model = Glm5NextMTP.__new__(Glm5NextMTP)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        n_routed_experts=0,
+        num_hidden_layers=45,
+        num_nextn_predict_layers=1,
+        mla_nope=False,
+    )
+    model.quant_config = None
+    model.model = nn.Module()
+    model.model.mtp_start_layer_idx = 45
+    model.model.num_mtp_layers = 1
+    model.model.embed_tokens = nn.Embedding(4, 2)
+    model.model.embed_tokens.weight.data.zero_()
+    layer = nn.Module()
+    layer.eh_proj = nn.Linear(4, 2, bias=False)
+    model.model.layers = nn.ModuleDict({"45": layer})
+    weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+
+    weights = [(checkpoint_prefix + "layers.45.eh_proj.weight", torch.ones(2, 4))]
+    if not include_embedding:
+        with pytest.raises(ValueError, match="requires embedding weights"):
+            model.load_weights(weights)
+        return
+
+    weights.insert(0, (checkpoint_prefix + "embed_tokens.weight", weight))
+    loaded = model.load_weights(weights)
+
+    torch.testing.assert_close(
+        model.model.embed_tokens(torch.tensor([1, 3])), weight[[1, 3]]
+    )
+    assert "model.embed_tokens.weight" in loaded
