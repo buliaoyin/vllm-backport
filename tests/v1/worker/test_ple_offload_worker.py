@@ -11,6 +11,7 @@ import torch
 import vllm.envs as envs
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.distributed.utils import get_pp_indices
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
@@ -272,6 +273,12 @@ def test_ple_offload_requires_ple_layers(
     worker.model_config = SimpleNamespace(  # type: ignore[assignment]
         hf_text_config=SimpleNamespace(ple_layer_ids=ple_layer_ids)
     )
+    worker.rank = 0
+    worker.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+    )
     monkeypatch.setattr(envs, "VLLM_PLE_CPU_OFFLOAD", True)
 
     assert worker._has_ple_layers() is expected
@@ -374,6 +381,8 @@ def test_offload_distributed_sets_config_only_for_model_parallel(
 
     # The Offload subprocess may inherit DP environment variables from a GPU
     # worker, but its isolated model-parallel world must always remain DP1.
+    monkeypatch.setattr(envs, "VLLM_PP_LAYER_PARTITION", "12,12,12,12")
+    assert get_pp_indices(48, 2, 4) == (24, 36)
     monkeypatch.setattr(envs, "VLLM_DP_SIZE", 2)
     monkeypatch.setattr(envs, "VLLM_DP_RANK", 1)
     monkeypatch.setattr(envs, "VLLM_DP_RANK_LOCAL", 1)
@@ -404,6 +413,7 @@ def test_offload_distributed_sets_config_only_for_model_parallel(
     )
 
     ple_offload_worker._init_offload_distributed()
+    assert get_pp_indices(48, 0, 1) == (0, 48)
 
     offload_config = calls[1][1]
     assert offload_config is not vllm_config

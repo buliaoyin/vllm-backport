@@ -155,6 +155,8 @@ def _init_offload_distributed() -> None:
             pipeline_model_parallel_size=1,
             backend="gloo",
         )
+    # This child owns all PLE weights in PP1, regardless of the GPU partition.
+    envs.VLLM_PP_LAYER_PARTITION = None
     logger.info(
         "Distributed environment initialized (backend=gloo, rank=0, world_size=1)."
     )

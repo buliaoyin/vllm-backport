@@ -443,7 +443,8 @@ def test_qwen4_exp_model_state_skips_ngram_state_without_ple() -> None:
         assert model_state.prepare_dummy_inputs(1, 1) is base_inputs
 
 
-def test_qwen4_exp_model_state_rejects_pp_with_ple() -> None:
+@pytest.mark.parametrize("is_first_rank", [False, True])
+def test_qwen4_exp_model_state_tracks_ple_only_on_first_pp_rank(is_first_rank) -> None:
     def init_base_state(
         state,
         vllm_config,
@@ -457,19 +458,30 @@ def test_qwen4_exp_model_state_rejects_pp_with_ple() -> None:
 
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+            hf_text_config=SimpleNamespace(
+                ple_layer_ids=[1], ngram_size=3, eos_token_id=2
+            ),
         ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
     )
     with (
         patch.object(MambaHybridModelState, "__init__", init_base_state),
-        pytest.raises(RuntimeError, match="pipeline_parallel_size=1"),
+        patch(
+            "vllm.models.qwen4_exp.nvidia.model_state.get_pp_group",
+            return_value=SimpleNamespace(is_first_rank=is_first_rank),
+        ),
     ):
-        Qwen4ExpModelState(
+        state = Qwen4ExpModelState(
             vllm_config,
             torch.nn.Identity(),
             None,
             torch.device("cpu"),
+        )
+    assert state.uses_ngram_embedding is is_first_rank
+    assert state.ngram_context_len == (2 if is_first_rank else 0)
+    if is_first_rank:
+        torch.testing.assert_close(
+            state.ngram_context, torch.full((4, 2), 2, dtype=torch.int32)
         )
 
 
