@@ -11,11 +11,13 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
     compute_ple_shard_overlap,
     copy_ple_embedding_shard_,
 )
+from vllm.models.qwen4_exp.config import Qwen4ExpTextConfig
 from vllm.models.qwen4_exp.nvidia import ple_layer as ple_layer_module
 from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpNGramEmbedding,
@@ -300,6 +302,71 @@ def test_ple_fp8_embedding_respects_checkpoint_shard_exclusions() -> None:
 
     quant_config.ignored_layers = [f"{prefix}.shard_0"]
     assert _get_ple_embedding_quant_method(quant_config, prefix) is None
+
+
+@pytest.mark.parametrize(
+    "main_quantization,ple_dtype,uses_fp8",
+    [
+        ("nvfp4", "float8_e4m3fn", True),
+        ("nvfp4", None, False),
+        ("fp8", "bfloat16", False),
+        ("fp8", None, True),
+    ],
+)
+def test_ple_storage_dtype_is_independent_of_main_quantization(
+    monkeypatch, main_quantization, ple_dtype, uses_fp8
+) -> None:
+    """Mixed-format PLE shards must retain their storage dtype and global scale."""
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "0")
+    for module in (embedding_module, parameter_module):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    config = Qwen4ExpTextConfig(
+        vocab_size=32,
+        eos_token_id=31,
+        ngram_size=2,
+        heads_per_ngram=1,
+        ngram_vocab_size_base=3,
+        make_ngram_vocab_size_divisible_by=4,
+        split_ngram_parts=2,
+        ple_embedding_dtype=ple_dtype,
+    )
+    quant_config = (
+        ModelOptNvFp4Config(
+            is_checkpoint_nvfp4_serialized=True, exclude_modules=["*.ple.*"]
+        )
+        if main_quantization == "nvfp4"
+        else Fp8Config(is_checkpoint_fp8_serialized=True)
+    )
+    module = Qwen4ExpNGramEmbedding(
+        config,
+        2,
+        0,
+        4,
+        1,
+        "model.layers.1.ple.ple_embedding",
+        quant_config=quant_config,
+        params_dtype=torch.bfloat16,
+    )
+    dtype = torch.float8_e4m3fn if uses_fp8 else torch.bfloat16
+    weights = torch.arange(1, 9).reshape(4, 2).to(dtype)
+    shards = [
+        ("ngram_embedding.shard_0.weight", weights[:2]),
+        ("ngram_embedding.shard_1.weight", weights[2:]),
+    ]
+    if uses_fp8:
+        shards.append(("ngram_embedding.weight_scale", torch.tensor([0.25])))
+    module.load_weights(shards)
+    ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(ple_layer)
+    ple_layer.ple_embedding = module
+    output = ple_layer._dequantize_embeddings(
+        module.ngram_embedding(torch.tensor([3, 0])), torch.bfloat16
+    )
+    expected = weights[[3, 0]].float() * (0.25 if uses_fp8 else 1.0)
+    assert module.ngram_embedding.weight.dtype == dtype
+    assert module.get_offload_output_dtype(torch.bfloat16) == dtype
+    torch.testing.assert_close(output, expected.bfloat16())
 
 
 def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(

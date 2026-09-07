@@ -187,9 +187,16 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
+    *,
+    storage_dtype: str | None = None,
 ) -> QuantizeMethodBase | None:
     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
 
+    # PLE can retain FP8 storage when the main model is quantized to NVFP4.
+    if storage_dtype is not None:
+        if storage_dtype == "float8_e4m3fn":
+            return Qwen4ExpPLEFp8EmbeddingMethod()
+        return None
     if not isinstance(quant_config, Fp8Config):
         return None
     if not quant_config.is_checkpoint_fp8_serialized:
@@ -286,7 +293,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
             quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
+                quant_config,
+                f"{prefix}.ngram_embedding",
+                storage_dtype=getattr(config, "ple_embedding_dtype", None),
             ),
         )
         self.register_buffer(
