@@ -67,8 +67,8 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
-    KVCacheConfig,
     KpoolTailSpec,
+    KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -1325,7 +1325,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             )
 
-
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
@@ -1696,7 +1695,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # boundary reset is visible to the attention metadata.
             self.model_state.preprocess_state(
                 input_batch,
-                block_tables,
+                tuple(bt.gpu for bt in self.block_tables.block_tables),
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )

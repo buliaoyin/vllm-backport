@@ -31,7 +31,11 @@ import torch
 from vllm.model_executor.layers.mamba import mamba_utils as layer_mamba_utils
 from vllm.platforms import current_platform
 from vllm.v1.worker import mamba_utils as worker_mamba_utils
-from vllm.v1.worker.mamba_utils import _TEMPORAL_TILES, precopy_mamba_align_fused_kernel
+from vllm.v1.worker.mamba_utils import (
+    _TEMPORAL_TILES,
+    postprocess_mamba_fused_kernel,
+    precopy_mamba_align_fused_kernel,
+)
 
 _parametrize: Callable[..., Callable[[Any], Any]]
 
@@ -416,6 +420,150 @@ def test_preprocess_fused_align_matches_scalar_bookkeeping(monkeypatch, token_bi
         if int(src) != -1 and int(src) != int(dst)
     ]
     assert fused_copy_calls == scalar_copy_calls
+
+
+# Batch order -> request-state slot, deliberately NOT the identity.
+_PERM = (2, 0, 3, 1)
+
+
+def _build_disjoint_block_table(num_reqs, device):
+    """[num_reqs, MAX_COLS] where every row owns ids no other row references."""
+    num_blocks = num_reqs * MAX_COLS + 1
+    bt = torch.empty(num_reqs, MAX_COLS, dtype=torch.int32, device=device)
+    for r in range(num_reqs):
+        bt[r] = torch.arange(
+            1 + r * MAX_COLS, 1 + (r + 1) * MAX_COLS, dtype=torch.int32, device=device
+        )
+    return bt, num_blocks
+
+
+def _assert_copies_landed(convs, ssms, conv_ref, ssm_ref):
+    for layer in range(NUM_LAYERS):
+        torch.testing.assert_close(convs[layer], conv_ref[layer], rtol=0, atol=0)
+        torch.testing.assert_close(ssms[layer], ssm_ref[layer], rtol=0, atol=0)
+
+
+@_parametrize("conv_state_dim_first", [False, True])
+@_cuda_required
+def test_precopy_indexes_block_tables_by_req_slot(conv_state_dim_first):
+    """Permuted batches must copy each request's own recurrent state."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_reqs = len(_PERM)
+    bt, num_blocks = _build_disjoint_block_table(num_reqs, device)
+
+    src_col = torch.tensor([1, 1, -1, 2], dtype=torch.int32, device=device)
+    dst_col = torch.tensor([0, 1, 0, 0], dtype=torch.int32, device=device)
+    bias = torch.tensor([0, 0, 0, 1], dtype=torch.int32, device=device)
+
+    convs, ssms = _build_state(num_blocks, device, conv_state_dim_first)
+    conv_ref, ssm_ref = _reference(
+        convs,
+        ssms,
+        bt.cpu(),
+        src_col.cpu(),
+        dst_col.cpu(),
+        bias.cpu(),
+        num_reqs,
+        conv_state_dim_first,
+    )
+    base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
+        convs, ssms, device, conv_state_dim_first
+    )
+    bt_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
+    idx_mapping = torch.tensor(_PERM, dtype=torch.int32, device=device)
+
+    precopy_mamba_align_fused_kernel[(num_reqs, NUM_LAYERS * 2, 1)](
+        dst_col,
+        src_col,
+        bias,
+        bt_ptrs,
+        bt.stride(0),
+        base,
+        blk_stride,
+        elem,
+        inner,
+        width,
+        group,
+        drc,
+        drs,
+        idx_mapping,
+        num_reqs,
+        COPY_BLOCK_SIZE=1024,
+        CONV_STATE_DIM_FIRST=conv_state_dim_first,
+        HAS_IDX_MAPPING=True,
+        TEMPORAL_TILES=1,
+    )
+    torch.accelerator.synchronize()
+    _assert_copies_landed(convs, ssms, conv_ref, ssm_ref)
+
+
+@_parametrize("conv_state_dim_first", [False, True])
+@_cuda_required
+def test_postprocess_indexes_block_tables_by_req_slot(conv_state_dim_first):
+    """Deferred postprocessing must retain the original request-slot mapping."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_reqs = len(_PERM)
+    block_size = 8
+    bt, num_blocks = _build_disjoint_block_table(num_reqs, device)
+
+    num_accepted = torch.tensor([1, 1, 1, 2], dtype=torch.int32, device=device)
+    state_idx = torch.tensor([1, 0, 1, 2], dtype=torch.int32, device=device)
+    num_scheduled = torch.ones(num_reqs, dtype=torch.int32, device=device)
+    num_computed = torch.tensor([8, 8, 5, 7], dtype=torch.int32, device=device)
+    num_draft = torch.ones(num_reqs, dtype=torch.int32, device=device)
+    num_accepted_out = num_accepted.clone()
+
+    ref_src = torch.tensor([1, 0, -1, 2], dtype=torch.int32)
+    ref_dst = torch.zeros(num_reqs, dtype=torch.int32)
+    ref_bias = torch.tensor([0, 0, 0, 1], dtype=torch.int32)
+
+    convs, ssms = _build_state(num_blocks, device, conv_state_dim_first)
+    conv_ref, ssm_ref = _reference(
+        convs,
+        ssms,
+        bt.cpu(),
+        ref_src,
+        ref_dst,
+        ref_bias,
+        num_reqs,
+        conv_state_dim_first,
+    )
+    base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
+        convs, ssms, device, conv_state_dim_first
+    )
+    bt_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
+    idx_mapping = torch.tensor(_PERM, dtype=torch.int32, device=device)
+
+    postprocess_mamba_fused_kernel[(num_reqs, NUM_LAYERS * 2, 1)](
+        num_accepted,
+        state_idx,
+        num_scheduled,
+        num_computed,
+        num_draft,
+        bt_ptrs,
+        bt.stride(0),
+        base,
+        blk_stride,
+        elem,
+        inner,
+        width,
+        group,
+        drc,
+        drs,
+        num_accepted_out,
+        idx_mapping,
+        num_reqs,
+        block_size=block_size,
+        COPY_BLOCK_SIZE=1024,
+        CONV_STATE_DIM_FIRST=conv_state_dim_first,
+        HAS_IDX_MAPPING=True,
+        PRECOMPUTED_NEW_COMPUTED=False,
+        TEMPORAL_TILES=1,
+    )
+    torch.accelerator.synchronize()
+    _assert_copies_landed(convs, ssms, conv_ref, ssm_ref)
 
 
 if __name__ == "__main__":
