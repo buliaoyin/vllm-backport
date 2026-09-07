@@ -916,6 +916,53 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
     manager.free(req1)
 
 
+@pytest.mark.parametrize("hash_block_size", [4, 16])
+@pytest.mark.parametrize("cached_state_tokens", [48, 64])
+def test_eagle_hybrid_preserves_replayable_mamba_state(
+    hash_block_size: int, cached_state_tokens: int
+):
+    """Reconcile a recurrent checkpoint without dropping the replay margin twice."""
+    config = make_kv_cache_config_hybrid_model(16, 40, 1, "mamba")
+    config.kv_cache_groups = config.kv_cache_groups[:2]
+    config.kv_cache_groups[0].kv_cache_spec = replace(
+        config.kv_cache_groups[0].kv_cache_spec, block_size=hash_block_size
+    )
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec, mamba_cache_mode="align"
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    request = make_request("replay", list(range(71)), hash_block_size, sha256)
+    pool = manager.block_pool
+    for i in range(64 // hash_block_size):
+        pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(request.block_hashes[i], 0),
+            pool.blocks[i + 1],
+        )
+    state = pool.blocks[20]
+    pool.cached_block_hash_to_block.insert(
+        make_block_hash_with_group_id(
+            request.block_hashes[cached_state_tokens // hash_block_size - 1], 1
+        ),
+        state,
+    )
+
+    blocks, hit_tokens, _ = manager.get_computed_blocks(request)
+
+    # The 64-token checkpoint cannot leave a full 16-token replay margin
+    # within this 70-token hit limit; the 48-token checkpoint can.
+    expected = 48 if cached_state_tokens == 48 else 0
+    assert hit_tokens == expected
+    if expected:
+        assert blocks.blocks[1][-1] is state
+        assert len(blocks.blocks[0]) == expected // hash_block_size
+
+
 # Test cases with eagle enabled: Only test a single simple case for now.
 # - 2 groups: 1 full + 1 other
 _EAGLE_HYBRID_MODEL_TEST_CASES = [
