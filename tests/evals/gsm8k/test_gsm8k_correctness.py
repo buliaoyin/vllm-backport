@@ -18,9 +18,19 @@ import yaml
 from tests.utils import RemoteOpenAIServer
 from vllm.platforms import current_platform
 
-from .gsm8k_eval import evaluate_gsm8k
+from .gsm8k_eval import evaluate_gsm8k, get_answer_value
 
 DEFAULT_STARTUP_MAX_WAIT_SECONDS = 1200
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "answer,expected",
+    [("#### -10", -10), ("The answer is -3.", -3), ("#### 1,234", 1234), ("42", 42)],
+)
+def test_gsm8k_answer_keeps_negative_sign(answer: str, expected: int) -> None:
+    """Negative official labels must not be scored as their positive counterparts."""
+    assert get_answer_value(answer) == expected
 
 
 def run_gsm8k_eval(eval_config: dict, server_url: str) -> dict:

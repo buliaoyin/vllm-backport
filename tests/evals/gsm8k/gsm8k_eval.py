@@ -67,9 +67,9 @@ def read_jsonl(filename: str) -> Generator[dict, None, None]:
 
 
 def get_answer_value(answer_str: str) -> int:
-    """Extract the numerical answer from the response."""
+    """Extract the final signed integer from the response."""
     answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
+    numbers = re.findall(r"[-+]?\d+", answer_str)
     if len(numbers) < 1:
         return INVALID
     try:
