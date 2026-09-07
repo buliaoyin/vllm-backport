@@ -34,6 +34,7 @@ from vllm.lora.layers import LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.ple_offload_layer import CpuGpuSemaphore
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
@@ -87,27 +88,36 @@ def _restore_default_dtype():
     torch.set_default_dtype(old)
 
 
-def test_ple_offload_h2h_uses_bound_input_buffers() -> None:
-    """Stage MRV1 inputs from allocations bound during connector setup."""
+def test_ple_offload_h2h_preserves_queued_input_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later CPU input preparation must not overwrite a queued PLE batch."""
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_: None)
     source_input_ids = torch.tensor([7, -1, 11, -1], dtype=torch.int32)
     source_query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+    source_ngram = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
     socket = Mock()
     connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.device = torch.device("cuda:0")
     connector.tp_rank = 0
     connector.dp_rank = 0
     connector._input_ids_buf = torch.full((4,), -99, dtype=torch.int32)
     connector._query_start_loc_buf = torch.full((3,), -99, dtype=torch.int32)
-    connector._ngram_context_buf = None
+    connector._ngram_context_buf = torch.full((2, 3), -99, dtype=torch.int32)
     connector._input_ids_source = source_input_ids
     connector._query_start_loc_source = source_query_start_loc
-    connector._ngram_context_source = None
+    connector._ngram_context_source = source_ngram
     connector._uses_cuda_inputs = False
     connector._validate_input_sources()
     connector._request_queue = queue.Queue(maxsize=1)
 
     connector._launch(num_reqs=2, num_tokens=4)
 
-    # launch only queues MRV1 work; the notifier thread performs the H2H copy.
+    source_input_ids.fill_(99)
+    source_query_start_loc.fill_(99)
+    source_ngram.fill_(99)
+    # Shared staging stays untouched until this batch reaches the notifier.
     assert connector._input_ids_buf.tolist() == [-99, -99, -99, -99]
     request = connector._request_queue.get_nowait()
     assert request is not None
@@ -115,13 +125,19 @@ def test_ple_offload_h2h_uses_bound_input_buffers() -> None:
 
     assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
     assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
-    assert source_input_ids.tolist() == [7, -1, 11, -1]
+    assert connector._ngram_context_buf.tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert source_input_ids.tolist() == [99, 99, 99, 99]
     socket.send.assert_called_once()
 
 
-def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
+def test_ple_offload_request_thread_copies_mrv1_and_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Keep MRV1 H2H and request publication off the model thread."""
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_: None)
     connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.device = torch.device("cuda:0")
     connector.tp_rank = 0
     connector.dp_rank = 0
     connector._input_ids_buf = torch.empty(4, dtype=torch.int32)
@@ -133,7 +149,6 @@ def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
     connector._uses_cuda_inputs = False
     connector._pinned_input_buffers = []
     connector._d2h_stream = None
-    connector._input_ready_event = None
     connector._d2h_done_event = None
     connector._request_queue = queue.Queue(maxsize=1)
     connector._request_thread = None
@@ -237,7 +252,6 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
             == final_ptrs
         )
         connector._d2h_stream = torch.cuda.Stream(device=connector.device)
-        connector._input_ready_event = torch.cuda.Event()
         connector._d2h_done_event = torch.cuda.Event()
         try:
             connector._launch(num_reqs=2, num_tokens=4)
@@ -258,6 +272,85 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
         finally:
             torch.accelerator.synchronize(connector.device)
             connector._unpin_input_buffers()
+
+
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU is required")
+def test_ple_offload_queued_forward_does_not_wait_for_a_later_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PP can enqueue a future forward before the notifier stages this one."""
+    device = torch.device("cuda:0")
+    monkeypatch.setattr(
+        ple_offload_connector_module,
+        "get_dp_group",
+        lambda: SimpleNamespace(rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        ple_offload_connector_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=0),
+    )
+    monkeypatch.setattr(PleOffloadConnector, "_setup_layers", lambda *_: {})
+    monkeypatch.setattr(
+        PleOffloadConnector, "_register_with_offload_worker", lambda *_: None
+    )
+    monkeypatch.setattr(PleOffloadConnector, "_start_request_thread", lambda *_: None)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4, max_num_seqs=1),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(ngram_size=1)),
+    )
+    source = torch.full((4,), 7, dtype=torch.int32, device=device)
+    starts = torch.tensor([0, 4], dtype=torch.int32, device=device)
+    gate = CpuGpuSemaphore(device)
+    control_stream = torch.cuda.Stream(device=device)
+    future_stream = torch.cuda.Stream(device=device)
+    torch.accelerator.synchronize(device)
+    gate.signal(control_stream)
+    control_stream.synchronize()
+    connector = PleOffloadConnector(
+        config,
+        Mock(),
+        device,
+        "inproc://queued-ple",
+        input_ids_source=source,
+        query_start_loc_source=starts,
+        ngram_context_source=None,
+    )
+    done = threading.Event()
+    errors = []
+    worker = None
+    try:
+        connector.prepare_forward(1, 4, False)
+        with torch.cuda.stream(future_stream):
+            gate.wait_reset(future_stream)
+            source.fill_(9)
+            connector.prepare_forward(1, 4, False)
+
+        def stage_first():
+            try:
+                connector._process_request(
+                    connector._request_queue.get_nowait(), Mock()
+                )
+            except Exception as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=stage_first)
+        worker.start()
+        assert done.wait(5), "Earlier PLE request waited on a future batch's event"
+        assert not errors
+        assert connector._input_ids_buf.tolist() == [7, 7, 7, 7]
+        gate.reset(control_stream)
+        future_stream.synchronize()
+        connector._process_request(connector._request_queue.get_nowait(), Mock())
+        assert connector._input_ids_buf.tolist() == [9, 9, 9, 9]
+    finally:
+        gate.reset(control_stream)
+        future_stream.synchronize()
+        if worker is not None:
+            worker.join(timeout=5)
+        connector.close()
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
