@@ -1544,6 +1544,9 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         assert dcp_world_size == 1, "DCP not support mamba now."
         assert pcp_world_size == 1, "PCP not support mamba now."
+        if drop_eagle_block:
+            # Replay needs a state that precedes the final cached Mamba block.
+            max_length = max(0, max_length - kv_cache_spec.block_size)
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,

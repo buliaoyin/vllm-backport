@@ -16,6 +16,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     CircularBufferManager,
     FullAttentionManager,
+    MambaManager,
     RSWAManager,
     SlidingWindowManager,
 )
@@ -23,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
     FullAttentionSpec,
+    MambaSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
@@ -708,3 +710,34 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+@pytest.mark.parametrize("alignment", [4, 16])
+@pytest.mark.parametrize("max_length", [0, 15, 16, 20, 32, 48])
+@pytest.mark.parametrize("drop_eagle_block", [False, True])
+def test_mamba_prefix_hit_leaves_a_block_for_speculative_replay(
+    alignment, max_length, drop_eagle_block
+):
+    """A cached recurrent state cannot replay tokens that precede that state."""
+    block_size = 16
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    pool = BlockPool(num_gpu_blocks=20, enable_caching=True, hash_block_size=alignment)
+    hashes = [BlockHash(str(i).encode()) for i in range(48 // alignment)]
+    for i, block_hash in enumerate(hashes):
+        pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(block_hash, 0), pool.blocks[i + 1]
+        )
+    (blocks,), hit_length = MambaManager.find_longest_cache_hit(
+        hashes, max_length, [0], pool, spec, drop_eagle_block, alignment
+    )
+    expected = max(0, max_length - (block_size if drop_eagle_block else 0))
+    expected = expected // alignment * alignment
+    assert hit_length == expected
+    assert len(blocks) == (expected + block_size - 1) // block_size
+    if expected:
+        assert blocks[-1] is pool.blocks[expected // alignment]
