@@ -619,3 +619,50 @@ def test_marlin_gemm_with_bias(size_m):
     max_diff = compute_max_diff(output, output_ref)
 
     assert max_diff < 0.04
+
+
+@pytest.mark.parametrize("globals_", [[1.0, 2.0], [4.0, 1.0]])
+@torch.inference_mode()
+def test_marlin_nvfp4_reconciled_gate_up_matches_dequantized_matmul(globals_):
+    """Reconciled gate/up weights retain their values through Marlin repacking."""
+    from tests.kernels.quantization.nvfp4_utils import break_fp4_bytes
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        apply_fp4_marlin_linear,
+        prepare_fp4_layer_for_marlin,
+    )
+    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+        reconcile_nvfp4_moe_w13_scales,
+    )
+
+    torch.manual_seed(42)
+    n, k = 256, 128
+    payload = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
+    scales = torch.randint(1, 8, (1, n, k // 16), device="cuda").to(torch.float8_e4m3fn)
+    global_scales = torch.tensor([globals_], device="cuda")
+    effective = scales.float() * global_scales.repeat_interleave(n // 2, 1)[:, :, None]
+    weight = break_fp4_bytes(payload, torch.float32)
+    weight *= effective[0].repeat_interleave(16, 1)
+    reconciled, common = reconcile_nvfp4_moe_w13_scales(scales, global_scales)
+    layer = torch.nn.Module()
+    layer.output_size_per_partition = n
+    layer.input_size_per_partition = k
+    layer.params_dtype = torch.bfloat16
+    for name, value in {
+        "weight": payload,
+        "weight_scale": reconciled[0],
+        "weight_global_scale": common[0],
+    }.items():
+        layer.register_parameter(name, torch.nn.Parameter(value, requires_grad=False))
+    prepare_fp4_layer_for_marlin(layer)
+    x = torch.randn((8, k), device="cuda", dtype=torch.bfloat16)
+    actual = apply_fp4_marlin_linear(
+        x,
+        layer.weight,
+        layer.weight_scale,
+        layer.weight_global_scale,
+        layer.workspace,
+        n,
+        k,
+    )
+    expected = (x.float() @ weight.T).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.5)

@@ -30,6 +30,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4LinearMethod,
     ModelOptNvFp4W4A16LinearMethod,
 )
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    reconcile_nvfp4_moe_w13_scales,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -41,6 +44,77 @@ from vllm.platforms import current_platform
 def enable_pickle(monkeypatch):
     """`LLM.apply_model` requires pickling a function."""
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+
+def test_nvfp4_moe_matching_w13_global_scales_are_unchanged():
+    block_scales = torch.tensor(
+        [[[0.5], [1.0], [1.5], [2.0]]], dtype=torch.float8_e4m3fn
+    )
+    global_scales = torch.tensor([[2.0, 2.0]])
+
+    reconciled_block_scales, reconciled_global_scales = reconcile_nvfp4_moe_w13_scales(
+        block_scales, global_scales
+    )
+
+    assert reconciled_block_scales is block_scales
+    torch.testing.assert_close(reconciled_global_scales, global_scales[:, 0])
+
+
+@pytest.mark.parametrize(
+    ("global_scales", "expected_block_scales", "expected_global_scale"),
+    [
+        ([[1.0, 2.0]], [0.5, 0.5, 1.0, 1.0], [2.0]),
+        ([[4.0, 1.0]], [1.0, 1.0, 0.25, 0.25], [4.0]),
+    ],
+)
+def test_nvfp4_moe_reconciles_each_w13_half(
+    global_scales, expected_block_scales, expected_global_scale
+):
+    block_scales = torch.ones((1, 4, 1), dtype=torch.float8_e4m3fn)
+
+    reconciled_block_scales, reconciled_global_scales = reconcile_nvfp4_moe_w13_scales(
+        block_scales, torch.tensor(global_scales)
+    )
+
+    torch.testing.assert_close(
+        reconciled_block_scales.float().flatten(),
+        torch.tensor(expected_block_scales),
+    )
+    torch.testing.assert_close(
+        reconciled_global_scales, torch.tensor(expected_global_scale)
+    )
+
+
+def test_nvfp4_moe_reconciles_mismatched_w13_global_scales_per_expert():
+    block_scales = torch.tensor(
+        [
+            [[0.5], [1.0], [1.5], [2.0]],
+            [[1.0], [1.5], [2.0], [2.5]],
+            [[0.5], [1.5], [2.5], [3.5]],
+        ],
+        dtype=torch.float8_e4m3fn,
+    )
+    global_scales = torch.tensor([[2.0, 2.0], [4.0, 1.0], [1.0, 3.0]])
+    shard_scales = global_scales[:, :, None, None]
+    effective_scales_before = block_scales.reshape(3, 2, 2, 1).float() * shard_scales
+
+    reconciled_block_scales, reconciled_global_scales = reconcile_nvfp4_moe_w13_scales(
+        block_scales, global_scales
+    )
+    effective_scales_after = reconciled_block_scales.reshape(3, 2, 2, 1).float()
+    effective_scales_after *= reconciled_global_scales[:, None, None, None]
+
+    torch.testing.assert_close(reconciled_global_scales, torch.tensor([2.0, 4.0, 3.0]))
+    assert not torch.allclose(
+        effective_scales_before[2, 1],
+        block_scales.reshape(3, 2, 2, 1)[2, 1].float() * global_scales[2, 0],
+    )
+    torch.testing.assert_close(
+        effective_scales_after,
+        effective_scales_before,
+        rtol=2**-4,
+        atol=0,
+    )
 
 
 def _skip(msg: str) -> NoReturn:
@@ -768,3 +842,94 @@ def test_modelopt_mixed_precision_builds_w4a16_sibling_config():
     assert config.nvfp4_config.LinearMethodCls is m.ModelOptNvFp4LinearMethod
     assert config.w4a16_nvfp4_config.quant_method == "W4A16_NVFP4"
     assert config.w4a16_nvfp4_config.LinearMethodCls is m.ModelOptNvFp4W4A16LinearMethod
+
+
+@pytest.mark.parametrize("rows", [2, 32])
+@pytest.mark.parametrize("global_unit", [1.0, 1e-9])
+def test_nvfp4_reconciliation_preserves_small_scales_and_tp_shards(rows, global_unit):
+    scales = torch.tensor([0, 2**-9, 2**-8, 1, 448]).repeat(3, rows, 1)
+    scales = scales.to(torch.float8_e4m3fn)
+    globals_ = torch.tensor([[1, 2], [4, 1], [3, 3]]) * global_unit
+    original = scales.clone()
+    result, common = reconcile_nvfp4_moe_w13_scales(scales, globals_)
+    expected = scales.unflatten(1, (2, rows // 2)).float()
+    expected *= globals_[:, :, None, None]
+    actual = result.unflatten(1, (2, rows // 2)).float()
+    actual *= common[:, None, None, None]
+    # E4M3 subnormals use an absolute half-ULP bound, including underflow to zero.
+    assert torch.all(
+        (actual - expected).abs()
+        <= expected.abs() * 2**-4 + common[:, None, None, None] * 2**-10
+    )
+    assert torch.equal(scales.view(torch.uint8), original.view(torch.uint8))
+
+
+@pytest.mark.parametrize("format_", ["modelopt", "quark", "compressed_tensors"])
+@pytest.mark.parametrize("backend_name", ["MARLIN", "HUMMING"])
+def test_nvfp4_frontend_preserves_checkpoint_scales(format_, backend_name, monkeypatch):
+    """Preserve effective scales at conversion, including CT's divisor convention."""
+    import importlib
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+
+    modules = {
+        "modelopt": ("modelopt", "ModelOptNvFp4FusedMoE"),
+        "quark": ("quark.quark_moe", "QuarkNvfp4MoEMethod"),
+        "compressed_tensors": (
+            "compressed_tensors.compressed_tensors_moe."
+            "compressed_tensors_moe_w4a4_nvfp4",
+            "CompressedTensorsW4A4Nvfp4MoEMethod",
+        ),
+    }
+    module_name, cls_name = modules[format_]
+    module = importlib.import_module(
+        "vllm.model_executor.layers.quantization." + module_name
+    )
+    method = SimpleNamespace(
+        moe=SimpleNamespace(is_act_and_mul=True),
+        nvfp4_backend=NvFp4MoeBackend[backend_name],
+        use_a16=False,
+    )
+    layer = torch.nn.Module()
+    payload = torch.full((2, 4, 8), 0x21, dtype=torch.uint8)
+    for name, value in {
+        "w13_weight": payload,
+        "w13_weight_packed": payload,
+        "w13_weight_scale": torch.ones((2, 4, 1), dtype=torch.float8_e4m3fn),
+        "w13_weight_scale_2": torch.tensor([[1.0, 2.0], [4.0, 1.0]]),
+        "w13_weight_global_scale": torch.tensor([[1.0, 0.5], [0.25, 1.0]]),
+        "w13_input_scale": torch.ones(2),
+        "w13_input_scale_2": torch.ones(2),
+        "w13_input_global_scale": torch.ones(2),
+        "w2_weight": payload,
+        "w2_weight_packed": payload,
+        "w2_weight_scale": torch.ones((2, 4, 1), dtype=torch.float8_e4m3fn),
+        "w2_weight_scale_2": torch.ones(2),
+        "w2_weight_global_scale": torch.ones(2),
+        "w2_input_scale": torch.ones(2),
+        "w2_input_scale_2": torch.ones(2),
+        "w2_input_global_scale": torch.ones(2),
+    }.items():
+        layer.register_parameter(name, torch.nn.Parameter(value, requires_grad=False))
+
+    def check_conversion(**kwargs):
+        assert torch.equal(kwargs["w13"], payload)
+        if backend_name == "HUMMING":
+            assert kwargs["w13_scale"] is layer.w13_weight_scale
+            torch.testing.assert_close(
+                layer.w13_weight_scale_2, torch.tensor([[1.0, 2.0], [4.0, 1.0]])
+            )
+        else:
+            effective = (
+                kwargs["w13_scale"].float() * kwargs["w13_scale_2"][:, None, None]
+            )
+            torch.testing.assert_close(
+                effective.flatten(1),
+                torch.tensor([[1.0, 1.0, 2.0, 2.0], [4.0, 4.0, 1.0, 1.0]]),
+            )
+        raise RuntimeError("conversion checked")
+
+    monkeypatch.setattr(module, "convert_to_nvfp4_moe_kernel_format", check_conversion)
+    with pytest.raises(RuntimeError, match="conversion checked"):
+        getattr(module, cls_name).process_weights_after_loading(method, layer)
