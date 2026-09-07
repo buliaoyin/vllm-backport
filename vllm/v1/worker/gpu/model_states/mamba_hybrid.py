@@ -118,8 +118,13 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
+            block_size = (
+                self._mamba_spec.block_size
+                if self._mamba_spec is not None
+                else self.cache_config.block_size
+            )
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1) // block_size
             )
 
     def _get_mamba_group_info(
@@ -169,9 +174,8 @@ class MambaHybridModelState(DefaultModelState):
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
             forward_context = self.vllm_config.compilation_config.static_forward_context
-            # block_tables are batch-order slices of the persistent
-            # input_block_tables (stable data_ptr), so the metadata is captured
-            # once here and reused across steps.
+            # Capture persistent request-slot tables, whose addresses remain stable
+            # when later batches are reordered or PP postprocessing is deferred.
             ctx.initialize_from_forward_context(
                 kv_cache_config,
                 forward_context,

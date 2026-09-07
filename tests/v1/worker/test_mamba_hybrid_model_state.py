@@ -94,3 +94,25 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+@pytest.mark.parametrize("computed_tokens", [0, 15, 16, 17, 64, 65])
+@pytest.mark.parametrize("mamba_block_size", [None, 16])
+def test_resumed_request_seeds_its_mamba_block(computed_tokens, mamba_block_size):
+    """Resume/slot reuse must use the recurrent-state block size, not KV pages."""
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state.cache_config = SimpleNamespace(block_size=4)
+    state._mamba_spec = (
+        SimpleNamespace(block_size=mamba_block_size) if mamba_block_size else None
+    )
+    state.num_accepted_tokens_gpu = torch.full((3,), 7, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.full((3,), 99, dtype=torch.int32)
+    request = SimpleNamespace(num_computed_tokens=computed_tokens)
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.add_request(1, request)
+
+    expected = (computed_tokens - 1) // (mamba_block_size or 4)
+    assert state._mamba_state_idx_gpu.tolist() == [99, expected, 99]
+    assert state.num_accepted_tokens_gpu.tolist() == [7, 1, 7]
