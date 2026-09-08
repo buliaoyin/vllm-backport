@@ -1,58 +1,58 @@
-# GLM / Qwen correctness and performance validation
+# GLM / Qwen 正确性与性能验证报告
 
-Status: planned implementation, validation and the subsequent four-case Qwen Flash NVFP4 full-test supplement completed on 2026-09-07. Confirmed code defects are fixed; documented model-output failures remain unresolved.
+状态：计划内的实现、验证，以及后续补充的四组 Qwen Flash NVFP4 全量测试均已于 2026-09-07 完成。已确认的代码缺陷已修复；报告中记录的部分模型输出问题仍未解决。
 
-## Environment and protocol
+## 环境与测试协议
 
-- Repository baseline: `a191da902315aa21e853958ab94c49bdb0f1ad62` (includes the existing GLM AWQ and PP MTP embedding fixes).
-- Python: conda `vllm-backport`, accessed through `.venv/bin/python`.
-- GPU 0–2: CMP 170HX, 64 GiB, SM80. GPU 3: RTX PRO 6000 Blackwell, 96 GiB, SM120. Host RAM: 503 GiB.
-- GLM: PP4 / TP1, layer partition `11,11,11,12`. Qwen Flash: PP4 / TP1, partition `12,12,12,12`, PLE CPU offload. Qwen 27B: PP1 on GPU 3.
-- Validation context: 32,768 tokens; maximum 16 sequences; maximum 8,192 batched tokens. `NCCL_P2P_DISABLE=1`.
-- GSM8K: official **test** split; 32-question initial compatibility screens for Qwen 27B and the first Radix baseline, 128-question GLM/Flash screens, and 1,319-question full comparisons for GLM AWQ, GLM NVFP4 and Qwen Flash FP8, plus both Flash NVFP4 checkpoints (RadixArk and Inferact). Five fixed training examples provide the prompt, using the repository's `_build_gsm8k_prompts` helper. Temperature 0, seed 42, request concurrency 4 for screening and 16 for full evaluation (the same for each full MTP0/3 pair). GLM uses its template with reasoning effort `max`, 4,096 output tokens; Qwen uses thinking enabled, 8,192 output tokens.
-- Test data SHA256: `3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`.
-- Timing probes: Chinese explanation, Python implementation, and English design, each with 512 actual output tokens. TTFT and throughput use response usage and wall time, not the number of SSE events.
-- State probes: a 16–18K-token shared prefix, distinct request keys, concurrent requests of different lengths, cancellation, and subsequent slot reuse. Prefix-cache counters must demonstrate actual hits. Request-key correctness and exact output formatting are recorded separately. The strengthened protocol used from the AWQ screening onward waits for generated text before cancelling and adds four longer Chinese continuations with distinct keys; speculative cases must show both accepted and rejected drafts. Earlier Qwen short key-only probes accepted all drafts; full pairs repeat the strengthened checks. Full pairs additionally prime two different private keys followed by long neutral tails, reuse the prefixes in reverse order, and require per-request cache-hit boundaries to lie beyond the key positions before accepting the retrieval result.
+- 仓库基线：`a191da902315aa21e853958ab94c49bdb0f1ad62`，包含已有的 GLM AWQ 和 PP MTP embedding 修复。
+- Python：使用 conda 环境 `vllm-backport`，通过 `.venv/bin/python` 调用。
+- GPU 0–2：CMP 170HX，64 GiB，SM80。GPU 3：RTX PRO 6000 Blackwell，96 GiB，SM120。主机内存：503 GiB。
+- GLM：PP4 / TP1，层分区为 `11,11,11,12`。Qwen Flash：PP4 / TP1，层分区为 `12,12,12,12`，PLE 卸载到 CPU。Qwen 27B：在 GPU 3 上使用 PP1。
+- 验证配置：上下文长度 32,768 token，最多 16 条序列，每批最多 8,192 token。设置 `NCCL_P2P_DISABLE=1`。
+- GSM8K：使用官方**测试集**。Qwen 27B 和首次 Radix 基线先进行 32 题兼容性初筛；GLM/Flash 进行 128 题初筛；GLM AWQ、GLM NVFP4、Qwen Flash FP8，以及两版 Flash NVFP4 权重（RadixArk 和 Inferact）均进行 1,319 题全量对比。使用仓库的 `_build_gsm8k_prompts` 辅助函数，将五道固定训练样例放入提示词。温度为 0，随机种子为 42；初筛请求并发为 4，全量测试并发为 16，各组全量 MTP0/3 对比保持一致。GLM 使用自身模板，推理强度为 `max`，输出上限为 4,096 token；Qwen 开启思考，输出上限为 8,192 token。
+- 测试数据 SHA256：`3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`。
+- 测速探针：中文解释、Python 实现、英文设计，各实际输出 512 token。首 token 延迟（TTFT）和吞吐率根据响应中的用量统计及实际耗时计算，不按 SSE 事件数量计算。
+- 状态探针：使用 16–18K token 的共享前缀、不同请求编号、不同长度的并发请求、取消请求及随后的槽位复用。前缀缓存计数器必须显示实际命中。请求编号是否正确与输出格式是否完全匹配分别记录。从 AWQ 初筛开始采用加强协议：等待实际生成文本后再取消，并增加四条携带不同编号的较长中文续写；推测解码用例必须同时出现草稿接受与拒绝。早期 Qwen 的短编号探针接受了全部草稿；全量对比重新执行加强检查。全量测试还会先缓存两个不同的私有编号及其后的长段中性文本，再按相反顺序复用前缀；只有每条请求的缓存命中边界都超过编号位置，才认可编号恢复结果。
 
-Commands, checkpoint audits, responses, metrics, traces and per-case commit/diff records are saved in `/tmp/vllm-code-fixes-20260907/`. Model checkpoints are unchanged. Startup durations are recorded for reproducibility, but page-cache state is not controlled and they are not used as a loading-speed comparison. The checkpoints reside on a local ext4 RAID; process I/O confirms substantial cold reads in some PP ranks while others load from cache. Full-set runs use an identical concurrency-16 short warmup with distinct cache salts before timed evaluation.
+命令、权重核查、响应、指标、性能轨迹及各用例的提交和差异记录保存在 `/tmp/vllm-code-fixes-20260907/`。模型权重未改动。为便于复现，记录了启动耗时；由于未控制文件页缓存状态，不将其用于加载速度对比。权重位于本地 ext4 RAID；进程 I/O 记录证实，部分 PP rank 有大量冷读，另一些则从缓存加载。全量计时开始前，各组均以并发 16、不同缓存盐值执行相同的短请求预热。
 
-## Implemented changes
+## 已实现的改动
 
-| Commit | Change | Validation |
+| 提交 | 改动 | 验证 |
 | --- | --- | --- |
-| `033d90297` | Reconcile unequal NVFP4 gate/up global scales before fused MoE repacking, for ModelOpt, Quark and compressed-tensors. Preserve Humming's separate conversion and equal-scale no-op. Bound FP32 temporaries by expert chunks. | Numerical/frontend regressions; actual Marlin repack and matmul on SM80 and SM120. |
-| `dc2d6a86a` | Use persistent request-slot block tables and `req_idx` in both Mamba state-copy kernels. | All four new permuted-row cases fail before the fix and pass after it. |
-| `c7fb9e3d8` | Seed resumed recurrent-state positions using the Mamba group's block size. | Boundary and slot-reuse cases, including the pre-discovery fallback. |
-| `10a73fd1c` | Reserve a Mamba state interval for speculative prefix replay. | Full-block and fine-grained lookup cases. |
-| `577be2dd4` | Give the hybrid coordinator a matching Mamba replay margin. Its old assumption that Mamba never dropped a block became invalid after the replay change. | Two integration regressions fail before the fix; all 132 prefix/manager tests pass after it. Real GLM MTP cache hits restored. |
-| `10596ecf5` | Clear the inherited GPU PP layer partition in the isolated PLE CPU worker. | Full-layer CPU ownership and existing PLE behavior tests. |
-| `139777a13` | Preserve per-batch PLE readiness under asynchronous PP; queue pending forwards and snapshot MRV1 CPU inputs before their reuse. | Both original regressions fail; retaining a shared event with an unbounded queue still deadlocks in the gated GPU test. Fixed: 5 PLE tests pass on SM80, 22 connector/worker tests on SM120; lint/mypy pass. |
-| `94d6a06de` | Preserve signed integers in GSM8K label parsing. The old helper read the two negative official test labels as positive. | Two old failures; four signed/positive regression cases pass. All 1,319 labels audited. The first 128 are unaffected. |
-| `6d03d7ae7` | Honor the explicit Qwen PLE storage dtype independently of the main quantizer. This supports retained FP8 PLE tables inside an NVFP4 checkpoint. | Two constructor/loading regressions fail before the fix; 65 PLE/offload/loading tests, pre-commit and mypy pass. RadixArk MTP0 rerun completes: 31/32 GSM8K, all functional and strengthened state checks pass. |
-| `3c9efa290` | Update stale Qwen proposer fixtures to the current QSA state-sizing fields. | Six proposer tests pass; no proposer implementation change. |
+| `033d90297` | 在融合 MoE 重排前，对 ModelOpt、Quark 和 compressed-tensors 中不相等的 NVFP4 gate/up 全局缩放因子进行协调。保留 Humming 的独立转换流程，缩放相等时不做转换。按专家分块，限制 FP32 临时内存。 | 数值及前端回归；在 SM80、SM120 上执行真实 Marlin 重排和矩阵乘法。 |
+| `dc2d6a86a` | 两个 Mamba 状态复制内核均改用持久请求槽位的块表和 `req_idx`。 | 新增的四个行顺序置换用例在修复前全部失败，修复后全部通过。 |
+| `c7fb9e3d8` | 使用 Mamba 组的块大小初始化恢复请求的循环状态位置。 | 边界和槽位复用用例，包括尚未发现 Mamba 组时的回退路径。 |
+| `10a73fd1c` | 为推测解码的前缀重放预留一个 Mamba 状态区间。 | 整块及细粒度查找用例。 |
+| `577be2dd4` | 在混合缓存协调器中加入配套的 Mamba 重放余量。引入重放后，原先“Mamba 不会丢弃块”的假设已不成立。 | 两个集成回归在修复前失败；修复后全部 132 项前缀/管理器测试通过。实际 GLM MTP 缓存命中恢复。 |
+| `10596ecf5` | 清除独立 PLE CPU worker 继承的 GPU PP 层分区。 | 验证 CPU 拥有全部层，以及已有 PLE 行为。 |
+| `139777a13` | 异步 PP 下按批次保留 PLE 就绪状态；待处理的前向计算排队，并在 MRV1 CPU 输入被复用前保存快照。 | 原始两个回归均失败；仅改成无界队列但保留共享事件，在通过门控复现时序的 GPU 测试中仍会死锁。修复后：SM80 上 5 项 PLE 测试通过，SM120 上 22 项连接器/worker 测试通过；lint/mypy 通过。 |
+| `94d6a06de` | GSM8K 标签解析保留整数符号。旧辅助函数会将官方测试集中的两个负数标签读成正数。 | 两个原始失败用例得到修复；四个带符号/正数回归用例通过。已核查全部 1,319 个标签，前 128 题不受影响。 |
+| `6d03d7ae7` | Qwen PLE 的显式存储 dtype 独立于主模型量化器生效，支持 NVFP4 权重中保留 FP8 PLE 表。 | 两个构造/加载回归在修复前失败；65 项 PLE/卸载/加载测试、pre-commit 和 mypy 通过。RadixArk MTP0 重跑完成：GSM8K 为 31/32，全部功能与加强状态检查通过。 |
+| `3c9efa290` | 将过时的 Qwen 草稿生成器测试夹具更新为当前 QSA 状态大小字段。 | 六项草稿生成器测试通过；未改动草稿生成器实现。 |
 
-Relevant pre-commit checks and mypy passed. State-copy tests also passed on both GPU architectures. Existing GLM and Qwen weight-mapping, quantization and PLE tests were exercised; obsolete fixtures were updated to their current implementation contracts.
+相关 pre-commit 检查和 mypy 均通过。状态复制测试也在两种 GPU 架构上通过。已执行现有 GLM、Qwen 权重映射、量化和 PLE 测试，并按当前实现约定更新过时的测试夹具。
 
-For the GLM-sized NVFP4 scale tensor `(288, 4096, 256)`, reconciliation's extra peak GPU allocation is **352 MiB**, compared with **1,440 MiB** for the unchunked reference, with numerically identical output. The retained output is 288 MiB in both correct implementations. This compares chunked and unchunked reconciliation; the original incorrect gate-only path did not allocate this reconciliation output. A single cold timing observation is not used as a loading-speed claim.
+对于 GLM 规模的 NVFP4 缩放张量 `(288, 4096, 256)`，协调过程的额外 GPU 分配峰值为 **352 MiB**，未分块参考实现为 **1,440 MiB**，两者数值输出完全一致。两个正确实现最终保留的输出均为 288 MiB。这里比较的是分块与未分块的缩放协调；原先错误的仅使用 gate 缩放因子的路径并不会分配该协调输出。单次冷运行计时不作为加载提速的依据。
 
-## Serving settings to reproduce the validated paths
+## 复现已验证路径的服务配置
 
-All cases use `/home/bul/miniconda3/envs/vllm-backport/bin/vllm` from the existing environment. The exact per-case command and environment are in `command-inventory.json`.
+所有用例均使用现有环境中的 `/home/bul/miniconda3/envs/vllm-backport/bin/vllm`。各用例的完整命令和环境变量见 `command-inventory.json`。
 
-| Model path | GPUs / partition | Additional settings |
+| 模型路径 | GPU / 层分区 | 附加配置 |
 | --- | --- | --- |
-| `/home/bul/dev/models1/zai/LibertAIDAI/GLM-5.3-Flash-NVFP4` | `0,1,2,3`, PP4, `11,11,11,12` | Memory utilization 0.95; `glm47` reasoning and tool parsers. |
-| `/home/bul/dev/models1/zai/cyankiwi/GLM-5.3-Flash-AWQ-INT4` | Same GLM layout | Same GLM settings. |
-| `/home/bul/dev/models1/Qwen/Qwen3.8-Flash-Next-FP8` | `0,1,2,3`, PP4, `12,12,12,12` | `VLLM_PLE_CPU_OFFLOAD=1`, `VLLM_TEST_FORCE_FP8_MARLIN=1`, `--moe-backend marlin`. |
-| `/home/bul/dev/models1/Qwen/RadixArk/Qwen3.8-Flash-Next-NVFP4` | Same Flash layout | Same PLE/FP8 environment; keep automatic MoE backend selection so the BF16 draft experts can use an unquantized backend. |
-| `/home/bul/dev/models1/Qwen/Inferact/Qwen3.8-Flash-Next-NVFP4` | Same Flash layout | Same PLE/FP8 environment; `--moe-backend marlin`. |
-| `/home/bul/dev/models1/Qwen/Qwen3.8-27B` and its `-FP8` sibling | GPU `3`, PP1 | No PLE offload or PP partition override. |
+| `/home/bul/dev/models1/zai/LibertAIDAI/GLM-5.3-Flash-NVFP4` | `0,1,2,3`，PP4，`11,11,11,12` | 显存利用率 0.95；推理和工具调用解析器均为 `glm47`。 |
+| `/home/bul/dev/models1/zai/cyankiwi/GLM-5.3-Flash-AWQ-INT4` | 同上方 GLM 布局 | 同上方 GLM 配置。 |
+| `/home/bul/dev/models1/Qwen/Qwen3.8-Flash-Next-FP8` | `0,1,2,3`，PP4，`12,12,12,12` | `VLLM_PLE_CPU_OFFLOAD=1`、`VLLM_TEST_FORCE_FP8_MARLIN=1`、`--moe-backend marlin`。 |
+| `/home/bul/dev/models1/Qwen/RadixArk/Qwen3.8-Flash-Next-NVFP4` | 同上方 Flash 布局 | 相同 PLE/FP8 环境变量；保持自动选择 MoE 后端，使 BF16 草稿专家能够使用非量化后端。 |
+| `/home/bul/dev/models1/Qwen/Inferact/Qwen3.8-Flash-Next-NVFP4` | 同上方 Flash 布局 | 相同 PLE/FP8 环境变量；`--moe-backend marlin`。 |
+| `/home/bul/dev/models1/Qwen/Qwen3.8-27B` 及其 `-FP8` 版本 | GPU `3`，PP1 | 不使用 PLE 卸载，不覆盖 PP 层分区。 |
 
-Qwen uses memory utilization 0.90, reasoning parser `qwen3`, and tool parser `qwen3_xml`. All models enable automatic tool choice. MTP3 adds `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`; MTP0 omits this argument. These results cover 32K context and 16 maximum sequences. They do not validate the earlier `--max-model-len auto --max-num-seqs 64` configuration or multimodal requests.
+Qwen 的显存利用率为 0.90，推理解析器为 `qwen3`，工具调用解析器为 `qwen3_xml`。所有模型均开启自动工具选择。MTP3 增加 `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`；MTP0 不传该参数。本次结果覆盖 32K 上下文和最多 16 条序列，未验证此前的 `--max-model-len auto --max-num-seqs 64` 配置或多模态请求。
 
-## Targeted regression commands
+## 定向回归测试命令
 
-The following use the existing conda environment through `.venv/bin/python`. GPU selections are isolated; each GPU suite was repeated with `CUDA_VISIBLE_DEVICES=0` (SM80) and `CUDA_VISIBLE_DEVICES=3` (SM120) where noted above.
+以下命令通过 `.venv/bin/python` 使用现有 conda 环境。各 GPU 测试分别选择设备；上文注明覆盖两种架构的测试套件，均使用 `CUDA_VISIBLE_DEVICES=0`（SM80）和 `CUDA_VISIBLE_DEVICES=3`（SM120）分别执行。
 
 ```bash
 .venv/bin/python -m pytest tests/v1/core/test_prefix_caching.py tests/v1/core/test_single_type_kv_cache_manager.py -q
@@ -63,116 +63,116 @@ CUDA_VISIBLE_DEVICES=3 .venv/bin/python -m pytest tests/v1/worker/test_gpu_model
 .venv/bin/python -m pytest tests/evals/gsm8k/test_gsm8k_correctness.py -k answer_keeps_negative_sign -q
 ```
 
-The raw `*-red.log` and `*-green*.log` files retain pre-fix failures and post-fix results. Some early combined logs include stale fixture failures despite their `green` filename; `test-results-summary.json` identifies these intermediate runs and the later passing PLE/config/proposer regressions that resolve them. Counts across these overlapping suites are not summed as unique tests. Separate model-loading and quantization suites, pre-commit and mypy logs are in the artifact directory. The report's short/full model commands are recorded exactly per case in `command-inventory.json`; these are custom diagnostics using the existing GSM8K prompt helper, not the B200/H200 EvalScope protocol or its thresholds.
+原始 `*-red.log` 和 `*-green*.log` 文件保留修复前的失败与修复后的结果。部分早期合并日志虽然文件名含 `green`，仍包含过时测试夹具导致的失败；`test-results-summary.json` 标明了这些中间运行，以及后来解决问题并通过的 PLE/config/草稿生成器回归。存在重叠的测试套件不合并计为独立测试总数。独立的模型加载、量化测试，以及 pre-commit 和 mypy 日志保存在结果目录。报告中各短测/全量测试的完整模型命令逐项记录于 `command-inventory.json`；这是使用现有 GSM8K 提示词辅助函数的自定义诊断，不采用 B200/H200 EvalScope 协议及其阈值。
 
-## Checkpoint audit
+## 模型权重核查
 
-Both Qwen Flash NVFP4 checkpoints have equal gate/up global scales: 24,576 main-model pairs for RadixArk, and 25,088 main-plus-draft pairs for Inferact. Reconciliation is therefore a no-op for these pairs.
+两版 Qwen Flash NVFP4 权重的 gate/up 全局缩放因子均相等：RadixArk 主模型共 24,576 对，Inferact 主模型加草稿模型共 25,088 对。因此，缩放协调对这些参数对不做转换。
 
-The three Flash checkpoints have identical chat-template files and generation configurations (template SHA256 `c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041`). Their other layouts differ: RadixArk has fused BF16 MTP experts and FP8 PLE tables; Inferact has NVFP4 MTP experts and BF16 PLE tables. The latter's PLE weights are approximately 95.4 GiB, versus 47.7 GiB for the FP8 tables. Each layout is validated separately.
+三个 Flash 权重版本的聊天模板文件和生成配置相同，模板 SHA256 为 `c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041`。其他布局有所不同：RadixArk 使用融合的 BF16 MTP 专家和 FP8 PLE 表；Inferact 使用 NVFP4 MTP 专家和 BF16 PLE 表。后者 PLE 权重约为 95.4 GiB，而 FP8 表约为 47.7 GiB。两种布局分别验证。
 
-The sampled rows of GLM's draft embedding match the checkpoint. After the serving loader installs the shared output head, the draft head is the target head and its sampled BF16 checkpoint rows match. The temporary head before this sharing step is not a valid runtime comparison point.
+GLM 草稿 embedding 的抽样行与权重文件一致。服务加载器安装共享输出头后，草稿输出头与目标模型输出头为同一对象，其抽样 BF16 权重行也一致。共享步骤之前的临时输出头不能用于有效的运行时对比。
 
-## Initial GLM NVFP4 results
+## GLM NVFP4 初测结果
 
-| Case | GSM8K test 128 | Previous train-distance outlier | State keys | Exact key-only format | Prefix hit tokens |
+| 用例 | GSM8K 测试集前 128 题 | 此前火车行程异常题 | 状态编号正确数 | 仅输出编号的格式完全匹配数 | 前缀命中 token 数 |
 | --- | --- | --- | --- | --- | --- |
-| MTP0, corrected scales | 126/128 | Correct in screening | 14/14 | 14/14 | 182,784 |
-| MTP3, corrected scales, coordinator margin fixed | 126/128 before the coordinator-only change | 3/3 diagnostic repeats correct | 14/14, reproduced | 13/14 | 125,440 |
-| MTP3, prefix caching disabled | State control only | — | 14/14 | 13/14 | 0 |
+| MTP0，已修正缩放 | 126/128 | 初筛答对 | 14/14 | 14/14 | 182,784 |
+| MTP3，已修正缩放及协调器余量 | 126/128，取得该分数时尚未单独修改协调器 | 三次诊断复测均正确（3/3） | 14/14，已复现 | 13/14 | 125,440 |
+| MTP3，关闭前缀缓存 | 仅进行状态对照 | — | 14/14 | 13/14 | 0 |
 
-The initial MTP0 repeat-control list had an indexing error and repeated unrelated items; those repetitions are not counted as train-distance repetitions. The screening itself included the correct question. Subsequent repetitions use zero-based index 16.
+最初 MTP0 的复测对照列表存在索引错误，重复了无关题目；这些重复不计为火车行程题的复测。初筛本身包含了正确题目。后续复测使用从零开始的索引 16。
 
-The two screening errors are the same with MTP0 and MTP3: zero-based index 12 (the model gives the 12-year break-even point; the label requires positive profit in year 13) and 119 (reasoning repetition hitting the 4,096-token limit). The official solution for item 119 also treats “A is 30% higher than B” as “B is 30% lower than A”; all reported scores still use the official labels. Screening elapsed time was 299.5 s and 197.3 s respectively. MTP3 accepted 80.4% of proposed GSM8K tokens. These are screening observations, not full-set scores or an attribution of all improvement to the scale change.
+MTP0 和 MTP3 初筛的两道错误相同：从零开始的索引 12（模型给出第 12 年收支平衡，官方标签要求第 13 年开始产生正利润）和 119（推理重复，达到 4,096 token 上限）。第 119 题的官方解答还把“A 比 B 高 30%”当成了“B 比 A 低 30%”；报告仍统一按官方标签评分。两组初筛耗时分别为 299.5 s、197.3 s。MTP3 接受了 80.4% 的 GSM8K 草稿 token。这些是初筛观察结果，不能作为全量分数，也不能将全部改善归因于缩放改动。
 
-The early `glm-nvfp4-mtp3-state-margin` artifact records `correct=13` using the original exact-string check: its exceptional output starts with the right `583004` key, then adds reasoning and repeats that same key. Later cases record key correctness and exact formatting separately; the original failed artifact is unchanged. The key-format anomaly includes a generated extra assistant role after the correct answer. It occurs with prefix caching both enabled and disabled, without another request's key appearing. Raw token evidence and forced-prefix next-token comparisons are preserved. This is not scored as perfect formatting. The completed full NVFP4 MTP0 run also reproduces the natural format anomaly (14 correct keys, 13 exact outputs). In the fixed 16,149-token context, this corrected target selects `<|assistant|>` with log probability −0.064216, approximately 93.8%. Together with the old-scale target control, this establishes that neither MTP nor reconciliation is required to predict the extra role in that context; it does not establish a parser fix.
+早期 `glm-nvfp4-mtp3-state-margin` 结果使用原来的字符串完全匹配检查，记录为 `correct=13`：异常输出以正确编号 `583004` 开头，随后添加推理并再次输出同一编号。后续用例分别记录编号正确性和格式完全匹配情况，原始失败记录保持不变。该格式异常包含在正确答案后额外生成 assistant 角色；开启和关闭前缀缓存时均会出现，且未出现其他请求的编号。已保留原始 token 证据及强制给定前缀后的下一 token 对照。此类输出不计为格式完全正确。完成的全量 NVFP4 MTP0 也自然复现了该格式异常：14 个编号正确，13 个输出格式完全匹配。在固定的 16,149 token 上下文中，修正后的目标模型选择 `<|assistant|>`，对数概率为 −0.064216，约合 93.8%。结合旧缩放目标模型对照，可以确定在该上下文中预测额外角色既不要求开启 MTP，也不要求进行缩放协调；这并不能确立解析器修复方案。
 
-## GLM AWQ screening
+## GLM AWQ 初筛
 
-The AWQ MTP0 baseline scores **126/128**, with the same failed indices 12 and 119 as corrected NVFP4. All five functional probes pass. Both the 14 short-key and four longer continuation checks preserve the correct request-specific keys; the short keys also meet exact formatting. These phases record 182,784 and 52,224 prefix-hit tokens respectively, and cancellation was observed after actual generated text.
+AWQ MTP0 基线为 **126/128**，错误索引同修正后的 NVFP4，均为 12、119。五项功能探针全部通过。14 个短编号和四条较长续写均保留正确的请求专属编号，短编号的格式也完全匹配。两个阶段分别记录 182,784、52,224 个前缀命中 token，且确认取消操作发生在实际生成文本之后。
 
-AWQ MTP3 also scores **126/128**, with 24,057 output tokens in 160.1 s and 81.9% draft acceptance. All functional probes pass. It returns all 14 short keys with exact formatting (125,440 prefix-hit tokens). The four longer continuations also retain their correct keys, record 35,840 prefix-hit tokens and accept 310 of 723 proposed tokens (42.9%), exercising substantial rejection and continued generation. Unlike MTP0, item 119 finishes with 99,076.92, consistent with the stated salary relationship but still incorrect against the official label.
+AWQ MTP3 同样为 **126/128**，160.1 s 内生成 24,057 token，草稿接受率为 81.9%。全部功能探针通过。14 个短编号格式完全匹配，前缀命中为 125,440 token。四条较长续写也保留正确编号，命中 35,840 token，并接受 723 个草稿 token 中的 310 个（42.9%），覆盖了大量拒绝后继续生成的情况。与 MTP0 不同，第 119 题完成输出，答案为 99,076.92，符合题目所述工资关系，但仍不符合官方标签。
 
-For the fixed 16,149-token context ending immediately before the previously observed extra assistant token, AWQ MTP0 also chooses `<|assistant|>` with log probability −0.11683 (approximately 88.97%). This shows that the continuation can be predicted by a target model without MTP. The corrected NVFP4 MTP0 full run now provides the matching target control described above. These are conditional-context comparisons, not evidence that AWQ and NVFP4 naturally generate identical preceding contexts.
+在固定的 16,149 token 上下文中，截取到此前观察到的额外 assistant token 之前，AWQ MTP0 同样选择 `<|assistant|>`，对数概率为 −0.11683，约合 88.97%。这表明目标模型在未开启 MTP 时也会预测该续写。上文修正后的 NVFP4 MTP0 全量运行提供了相应目标模型对照。这里比较的是给定同一条件上下文后的预测，不能据此认为 AWQ 和 NVFP4 会自然生成相同的前文。
 
-## Qwen integration finding
+## Qwen 集成中发现的问题
 
-The first FP8 PP4 run loaded its PLE weights correctly and answered six GSM8K questions, then failed with `queue.Full` in the PLE connector. PP host execution can enqueue several forwards before the background notifier runs. Re-recording a shared readiness event can also make an earlier request wait behind a later forward's unsatisfied PLE semaphore. This was reproduced separately from queue capacity.
+首次 FP8 PP4 运行正确加载了 PLE 权重，回答六道 GSM8K 题目后，在 PLE 连接器中触发 `queue.Full`。PP 的主机端执行可能在后台通知线程运行前，将多次前向计算加入队列。重复记录同一个就绪事件，还可能使较早请求等待较晚前向计算尚未满足的 PLE 信号量。该问题已独立于队列容量问题复现。
 
-Commit `139777a13` fixes both lifecycle issues. The successful FP8 MTP0 rerun scores **125/128**, with 526.6 s for 68,159 generated tokens. Its three errors are indices 12, 100 and 119; the last reaches the 8,192-token limit. All five functional probes pass. The 18,084-token state probe returns all 14 keys with exact formatting and records **241,472 prefix-hit tokens**. Chinese/code/English decode rates are 52.2/52.5/52.2 tokens/s. The failed attempt remains in `ple-queue-full-attempt/`; its six answers are not a completed evaluation.
+提交 `139777a13` 修复了这两个生命周期问题。FP8 MTP0 重跑成功，得分 **125/128**，526.6 s 内生成 68,159 token。三道错误的索引为 12、100、119，最后一题达到 8,192 token 上限。五项功能探针全部通过。18,084 token 的状态探针返回全部 14 个编号且格式完全匹配，记录 **241,472 个前缀命中 token**。中文/代码/英文解码速度为 52.2/52.5/52.2 token/s。失败尝试保存在 `ple-queue-full-attempt/`，其六道回答不算一次完整评测。
 
-FP8 MTP1 also completes: **126/128**, 405.1 s, 61,716 output tokens, 86.0% draft acceptance. Its errors are indices 12 and 119. All functional probes pass; all 14 state keys have exact formatting, with 221,760 prefix-hit tokens. The target-shared output head and sampled draft embedding rows match the BF16 checkpoint values. Chinese/code/English decode rates are 57.6/67.7/66.0 tokens/s. These fixed-length probes are more suitable for comparing decoding rates than total GSM8K duration, since the generated reasoning lengths differ.
+FP8 MTP1 也完成测试：**126/128**，405.1 s，输出 61,716 token，草稿接受率 86.0%。错误索引为 12、119。功能探针全部通过；14 个状态编号格式完全匹配，前缀命中为 221,760 token。与目标模型共享的输出头、草稿 embedding 抽样行均与 BF16 权重值一致。中文/代码/英文解码速度为 57.6/67.7/66.0 token/s。由于生成的推理长度不同，固定长度探针比 GSM8K 总耗时更适合比较解码速度。
 
-FP8 MTP3 completes with **125/128**, the same failed indices as MTP0, in 285.9 s for 64,470 tokens. Draft acceptance is 71.6% overall (mean accepted length 3.147). All functional probes and all 14 exact-format state checks pass, with 224,000 prefix-hit tokens.
+FP8 MTP3 得分 **125/128**，错误索引与 MTP0 相同，285.9 s 内生成 64,470 token。总体草稿接受率为 71.6%，平均接受长度为 3.147。全部功能探针和 14 个格式完全匹配的状态检查通过，前缀命中为 224,000 token。
 
-| Qwen Flash FP8 | GSM8K 128 | Chinese tok/s | Code tok/s | English tok/s | State keys / exact format |
+| Qwen Flash FP8 | GSM8K 前 128 题 | 中文 token/s | 代码 token/s | 英文 token/s | 状态编号正确数 / 格式完全匹配数 |
 | --- | --- | --- | --- | --- | --- |
 | MTP0 | 125/128 | 52.17 | 52.52 | 52.16 | 14/14, 14/14 |
 | MTP1 | 126/128 | 57.64 | 67.66 | 66.01 | 14/14, 14/14 |
 | MTP3 | 125/128 | 67.51 | 107.62 | 90.18 | 14/14, 14/14 |
 
-Torch profiling returned `CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED` on this mixed CMP configuration. The generated traces contain CPU activity only; they are not evidence of GPU kernel costs. Separate CUDA-event stage timing and CPU PLE timing were successfully collected in all four GPU workers and the CPU worker. In the initial MTP3 decode sample, draft proposal averages 3.48 ms per step and CPU PLE computation averages 0.78 ms per step. A narrower graph-replay interval is included in the full-pair profile to distinguish execution from preceding PP readiness waits. Stage timings include stream waits and host launch gaps and are not isolated kernel timings.
+在这套混合 CMP 配置中，Torch 性能分析返回 `CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED`。生成的轨迹只包含 CPU 活动，不能用于证明 GPU 内核耗时。四个 GPU worker 和 CPU worker 均成功采集了独立的 CUDA event 阶段计时及 CPU PLE 计时。在最初的 MTP3 解码采样中，草稿生成平均每步 3.48 ms，CPU PLE 计算平均每步 0.78 ms。全量配对分析增加了范围更窄的计算图重放计时，以区分实际执行与之前的 PP 就绪等待。阶段计时包含流等待和主机启动间隙，不是独立内核计时。
 
-## Mixed Qwen NVFP4 / FP8 PLE finding
+## Qwen NVFP4 与 FP8 PLE 混合存储问题
 
-RadixArk's first startup failed when the PLE worker loaded `ngram_embedding.weight_scale`: the selector only recognized a main-model `Fp8Config`, so its NVFP4 main configuration caused the explicitly FP8 PLE table to be allocated as BF16 without a scale parameter. The checkpoint declares `ple_embedding_dtype="float8_e4m3fn"` while excluding PLE from its NVFP4 conversion.
+RadixArk 首次启动在 PLE worker 加载 `ngram_embedding.weight_scale` 时失败：选择逻辑只识别主模型的 `Fp8Config`，因此其 NVFP4 主模型配置使显式声明为 FP8 的 PLE 表被分配为 BF16，且缺少 scale 参数。该权重声明 `ple_embedding_dtype="float8_e4m3fn"`，同时将 PLE 排除在 NVFP4 转换之外。
 
-Commit `6d03d7ae7` gives that explicit storage declaration priority, preserving the previous quantizer-based selection when no PLE dtype is declared. CPU tests construct the real embedding, load small checkpoint shards and scales, and compare lookup/dequantization values. They cover NVFP4 with FP8 PLE, NVFP4 with implicit BF16 PLE, FP8 with explicitly BF16 PLE, and legacy FP8 PLE. The GPU placeholder already retains the checkpoint scale and selects FP8 IPC output accordingly. Failed startup artifacts are preserved in `ple-storage-mismatch-attempt/`. The rerun successfully loads 132 checkpoint tensors, verifies both PLE parameters, and scores **31/32** on GSM8K with no truncations. Its only failed label is index 12. All five functional probes and strengthened state checks pass. RadixArk MTP3 starts with its BF16 fused draft experts and verified embedding/head rows. It scores **125/128**, with failed indices 12, 87 and 119 (the latter two reach 8,192 tokens). Its first 32 match the MTP0 score of 31/32. All functional and strengthened state checks pass: 14/14 exact short keys with 224,000 prefix-hit tokens, and 4/4 long keys with 64,000 hit tokens and 44.1% draft acceptance. The matching MTP0 128-question run scores **124/128**, with failed indices 12, 85, 100 and 119, one truncation, and 70,169 output tokens in 537.8 s. Item 87 is correct both in this screen and its sequential repeat. MTP3 therefore introduces one observed failure while correcting two baseline failures; its overall score alone cannot establish equivalence. The final serial MTP3 diagnostic repeats item 87 twice: both reach 8,192 tokens with identical complete token sequences and no final answer. Their metrics record zero prefix hits. The following item-16 control answers 230 correctly in 321 tokens. Item 87 repeatedly debates whether the employee receives three or four raises. These serial MTP3 truncations remain reproducible observations for that run. The subsequent full comparison below also observes an MTP0 truncation on item 87, followed by correct MTP0 repeats, while full MTP3 answers it correctly. The combined evidence does not support an MTP-exclusive failure or isolate a checkpoint/inference root cause; original scores and serial reproductions remain unchanged.
+提交 `6d03d7ae7` 使显式存储声明优先生效；未声明 PLE dtype 时，保留此前按量化器选择的逻辑。CPU 测试构造真实 embedding，加载小型权重分片与缩放参数，并比较查表/反量化数值。覆盖 NVFP4 配合 FP8 PLE、NVFP4 配合隐式 BF16 PLE、FP8 配合显式 BF16 PLE，以及原有 FP8 PLE 情况。GPU 占位对象原本就保留权重中的缩放参数，并据此选择 FP8 IPC 输出。失败启动记录保存在 `ple-storage-mismatch-attempt/`。重跑成功加载 132 个权重张量，验证两个 PLE 参数，GSM8K 得分 **31/32**，无截断。唯一错误标签为索引 12。五项功能探针和加强状态检查全部通过。RadixArk MTP3 使用 BF16 融合草稿专家启动，embedding/输出头抽样行已验证，得分 **125/128**，错误索引为 12、87、119，后两题达到 8,192 token 上限。前 32 题与 MTP0 一致，为 31/32。全部功能和加强状态检查通过：短编号 14/14 格式完全匹配，前缀命中 224,000 token；长编号 4/4 正确，命中 64,000 token，草稿接受率 44.1%。配套 MTP0 的 128 题测试得分 **124/128**，错误索引为 12、85、100、119，一题截断，537.8 s 内输出 70,169 token。第 87 题在该初筛及其顺序复测中均答对。因此，MTP3 新增一道观察到的错误，同时修正两道基线错误，不能仅凭总分认定两者等价。最后的串行 MTP3 诊断将第 87 题重复两次：两次均达到 8,192 token，完整 token 序列完全相同，均无最终答案，指标显示前缀命中为零。随后的第 16 题对照用 321 token 正确回答 230。第 87 题反复纠结员工应获得三次还是四次加薪。这些串行 MTP3 截断仍是该次运行中可复现的观察。下文后续全量对比也观察到 MTP0 在第 87 题截断，随后 MTP0 复测答对，而全量 MTP3 答对。综合证据不支持将其视为 MTP 独有失败，也尚未确定是权重还是推理实现导致；原始分数和串行复现记录均保留。
 
-## Inferact NVFP4 baseline and long-context key replacement
+## Inferact NVFP4 基线与长上下文编号替换
 
-Inferact MTP0 loads successfully, including 131 PLE checkpoint tensors and its single BF16 table parameter. It scores **125/128** in 532.6 s for 69,639 output tokens; failed indices are 12, 100 and 119, with the last truncated at 8,192 tokens. All five functional probes pass. The short state probe returns all 14 keys with exact formatting and records 241,472 prefix-hit tokens.
+Inferact MTP0 成功加载，包括 131 个 PLE 权重张量及其单个 BF16 表参数。得分 **125/128**，532.6 s 内输出 69,639 token；错误索引为 12、100、119，最后一题在 8,192 token 处截断。五项功能探针全部通过。短状态探针返回全部 14 个编号且格式完全匹配，记录 241,472 个前缀命中 token。
 
-The longer continuation probe fails one of four key checks: the final request outputs the shared archive's old key `582731` instead of its requested replacement `684004`, followed by an otherwise coherent explanation. This is retained as a failed model-output check; the original case ended at that assertion and is not reported as a fully passing run.
+较长续写探针的四个编号检查中有一个失败：最后一条请求输出共享档案中的旧编号 `582731`，而不是要求替换的新编号 `684004`，随后解释内容本身仍连贯。该情况保留为模型输出检查失败；原始用例在此断言处结束，不计为全部通过。
 
-A separate MTP0 server with prefix caching disabled reproduces the same failure. More decisively, its **first user request**, sent alone with the exact failing long prompt, generates the same token sequence and text as the cache-on failure, with zero prefix hits. Its first-token probabilities favor the old key's initial `5` (60.4%) over the new key's `6` (25.2%). Reducing the neutral archive from 2,000 lines to four produces the correct new key. The normal cache-off state suite again gets 14/14 short keys and 3/4 long keys, with zero hits.
+另起一个关闭前缀缓存的 MTP0 服务，也复现了相同失败。更直接的证据是：将完全相同的失败长提示词作为该服务的**第一条用户请求**单独发送，得到与开启缓存时失败响应完全相同的 token 序列和文本，前缀命中为零。首 token 概率更偏向旧编号开头的 `5`（60.4%），而不是新编号的 `6`（25.2%）。将中性档案从 2,000 行缩为四行后，能够输出正确新编号。常规关闭缓存状态测试同样为短编号 14/14、长编号 3/4，命中均为零。
 
-This failure therefore does not require MTP, prefix reuse, prior user requests or concurrency. It remains a long-context instruction-following failure under this checkpoint and inference configuration; this control does not prove that every underlying kernel or quantization operation is correct. No state-code change is justified by this finding alone. The original failing artifacts and `inferact-state-failure-assessment.json` preserve the evidence. The matching fresh-prompt FP8 MTP0 control now passes both the 2,000-line prompt and its four-line control, with zero prefix hits. On the long prompt, its first-token distribution prefers the new key's `6` (log probability −0.64528) over the old key's `5` (−0.89528); Inferact prefers the old key as described above. The long prompt therefore exposes checkpoint-dependent output differences, but this comparison alone does not isolate which quantized component is responsible. The matching FP8 MTP3 control is also included in the full pair.
+因此，该失败不以 MTP、前缀复用、此前用户请求或并发为必要条件。它仍是该权重及推理配置下的长上下文指令遵循失败；该对照不能证明所有底层内核或量化运算都正确。仅凭这一发现，尚无依据修改状态代码。原始失败记录及 `inferact-state-failure-assessment.json` 保留了证据。同阶段使用新鲜提示词的 FP8 MTP0 配套对照，在 2,000 行长提示词和四行短对照上均通过，前缀命中为零。长提示词的首 token 分布更偏向新编号的 `6`，对数概率 −0.64528，而旧编号的 `5` 为 −0.89528；Inferact 则如上所述更偏向旧编号。因此，该长提示词暴露出不同权重版本间的输出差异，但仅凭这一对比不能确定是哪个量化组件导致。配套的 FP8 MTP3 对照也纳入全量配对测试。
 
-Inferact MTP3 scores **126/128** with no truncations, correcting baseline item 100 and introducing no new failed indices. It produces 69,573 tokens in 260.2 s with 71.3% draft acceptance. All functional probes pass; Chinese/code/English decoding reaches 68.7/112.5/88.1 tokens/s. Short state checks remain 14/14 exact with 224,000 prefix-hit tokens. The long continuation again fails only the fourth key replacement, while recording 64,000 hit tokens and 268/639 accepted draft tokens (41.9%). The same failure is retained for MTP0 and MTP3. Runtime audit confirms both target and draft use NVFP4 Marlin, with the correct shared BF16 output head.
+Inferact MTP3 得分 **126/128**，无截断，修正基线第 100 题且未新增错误。260.2 s 内生成 69,573 token，草稿接受率为 71.3%。全部功能探针通过；中文/代码/英文解码速度为 68.7/112.5/88.1 token/s。短状态检查仍为 14/14 格式完全匹配，前缀命中 224,000 token。较长续写仍仅在第四个编号替换上失败，记录 64,000 个命中 token，接受草稿 268/639（41.9%）。MTP0 和 MTP3 的这一相同失败均保留。运行时核查确认目标模型和草稿模型均使用 NVFP4 Marlin，且共享的 BF16 输出头正确。
 
-## Qwen 27B BF16 and FP8 compatibility regression
+## Qwen 27B BF16 与 FP8 兼容性回归
 
-On GPU 3 with PP1, Qwen 27B BF16 MTP0 and MTP3 both score **31/32**, with only index 12 failing the official label. MTP0 produces 14,722 tokens in 149.1 s; MTP3 produces 15,119 in 59.4 s and accepts 74.6% of proposed tokens. This is a short compatibility screen, not a full accuracy evaluation of the 27B model.
+在 GPU 3 上使用 PP1，Qwen 27B BF16 的 MTP0 和 MTP3 均为 **31/32**，只有索引 12 不符合官方标签。MTP0 在 149.1 s 内生成 14,722 token；MTP3 在 59.4 s 内生成 15,119 token，接受 74.6% 的草稿 token。这是短样本兼容性初筛，不是 27B 模型的全量准确率评测。
 
-| BF16 configuration | Chinese tok/s | Code tok/s | English tok/s | Short keys / exact format | Long keys |
+| BF16 配置 | 中文 token/s | 代码 token/s | 英文 token/s | 短编号正确数 / 格式完全匹配数 | 长编号正确数 |
 | --- | --- | --- | --- | --- | --- |
 | MTP0 | 28.78 | 28.78 | 28.78 | 14/14, 14/14 | 4/4 |
 | MTP3 | 52.16 | 83.89 | 66.66 | 14/14, 14/14 | 4/4 |
 
-All five functional probes pass in both cases. Short-key prefix hits are 233,632 and 235,200 tokens respectively; the long MTP3 probe records 67,200 hit tokens and accepts 246/531 proposed tokens (46.3%). Cancellation follows generated text and is followed by slot reuse. The actual draft is `Qwen3_5MTP`; its sampled BF16 embedding and head rows match the checkpoint, and runtime head sharing is verified. No Qwen3_5 model-loading implementation changes were needed.
+两组的五项功能探针全部通过。短编号前缀命中分别为 233,632、235,200 token；MTP3 长探针记录 67,200 个命中 token，接受草稿 246/531（46.3%）。在生成文本后取消请求，再复用槽位。实际草稿模型为 `Qwen3_5MTP`；其 BF16 embedding 和输出头抽样行与权重文件一致，运行时输出头共享也已验证。未修改 Qwen3_5 模型加载实现。
 
-Qwen 27B FP8 MTP0/3 also both score **31/32**, again failing only index 12, with no truncations. The baseline generates 14,116 tokens in 85.5 s; MTP3 generates 14,070 in 35.6 s with 74.7% draft acceptance. All functional probes, all 14 exact short keys and all four long keys pass. MTP3's long probe records 67,200 prefix-hit tokens and accepts 258/642 proposed tokens (40.2%).
+Qwen 27B FP8 的 MTP0/3 也均为 **31/32**，同样只有索引 12 错误，无截断。基线在 85.5 s 内生成 14,116 token；MTP3 在 35.6 s 内生成 14,070 token，草稿接受率为 74.7%。全部功能探针、14 个格式完全匹配的短编号及四个长编号均通过。MTP3 长探针记录 67,200 个前缀命中 token，接受草稿 258/642（40.2%）。
 
-| FP8 configuration | Chinese tok/s | Code tok/s | English tok/s |
+| FP8 配置 | 中文 token/s | 代码 token/s | 英文 token/s |
 | --- | --- | --- | --- |
 | MTP0 | 50.21 | 50.21 | 50.21 |
 | MTP3 | 83.36 | 125.85 | 110.34 |
 
-The FP8 draft audit confirms its MLP is stored in E4M3 FP8 with FP32 block scales, while the embedding, FC, normalization and shared head retain BF16. Sampled embedding/head values and runtime sharing match the checkpoint. These four 27B cases cover text-only PP1 compatibility; they do not establish multimodal or full-test-set accuracy for 27B.
+FP8 草稿核查确认，其 MLP 采用 E4M3 FP8 存储和 FP32 块缩放参数，embedding、FC、归一化及共享输出头保留 BF16。embedding/输出头抽样值和运行时共享情况均与权重一致。这四组 27B 用例覆盖纯文本 PP1 兼容性，不能据此确定 27B 的多模态或全测试集准确率。
 
-## Same-checkpoint GLM NVFP4 scale control
+## 同一 GLM NVFP4 权重的缩放对照
 
-The diagnostic process restores only the old gate-only fused global-scale selection; the source tree retains the fix and all other current changes. A fresh-interpreter binding check verifies that ModelOpt, Quark and compressed-tensors import this override. The control script and its check log are preserved in the artifact directory.
+诊断进程仅恢复旧的“融合全局缩放只取 gate”选择逻辑，源码仍保留修复及其他当前改动。通过新解释器中的绑定检查，确认 ModelOpt、Quark 和 compressed-tensors 导入了该覆盖实现。对照脚本和检查日志保存在结果目录。
 
-| Scale handling | MTP | GSM8K 128 | Failed indices | Truncated | Draft acceptance |
+| 缩放处理 | MTP | GSM8K 前 128 题 | 错误索引 | 截断数 | 草稿接受率 |
 | --- | --- | --- | --- | --- | --- |
-| Old gate-only global scale | 0 | 125/128 | 12, 107, 119 | 2 | — |
-| Reconciled scales | 0 | 126/128 | 12, 119 | 1 | — |
-| Old gate-only global scale | 3 | 126/128 | 12, 119 | 1 | 79.3% |
-| Reconciled scales | 3 | 126/128 | 12, 119 | 1 | 80.4% |
+| 旧逻辑，仅使用 gate 全局缩放 | 0 | 125/128 | 12, 107, 119 | 2 | — |
+| 已协调缩放 | 0 | 126/128 | 12, 119 | 1 | — |
+| 旧逻辑，仅使用 gate 全局缩放 | 3 | 126/128 | 12, 119 | 1 | 79.3% |
+| 已协调缩放 | 3 | 126/128 | 12, 119 | 1 | 80.4% |
 
-Old MTP0 generates 30,139 tokens in 289.1 s; old MTP3 generates 26,261 in 196.5 s. Both old-scale controls pass all five functional probes, all 14 exact short keys and all four long keys, with actual cache hits. Their fixed-output rates are 45.4/45.3/45.3 tokens/s for MTP0 and 55.2/69.2/57.5 for MTP3 (Chinese/code/English).
+旧逻辑 MTP0 在 289.1 s 内生成 30,139 token；旧逻辑 MTP3 在 196.5 s 内生成 26,261 token。两组旧缩放对照的五项功能探针、14 个格式完全匹配的短编号及四个长编号全部通过，且有实际缓存命中。固定输出速度为 MTP0 45.4/45.3/45.3 token/s、MTP3 55.2/69.2/57.5 token/s，顺序为中文/代码/英文。
 
-Index 107 reaches the limit only in the old MTP0 screen; old MTP3 answers it correctly both in screening and a repeat, and both corrected screens answer it correctly. The old MTP0 failure was observed once and was not repeated in that already-running case. Index 16 is correct in both old screens and all six old-control repetitions. Thus these model screens do not establish that scale handling alone caused the earlier MTP outlier or imply a universal throughput gain from reconciliation. The numerical regression establishes the scale error independently; reconciliation preserves effective scales within E4M3 rounding, with bounded temporary memory.
+索引 107 只在旧逻辑 MTP0 初筛中达到上限；旧逻辑 MTP3 在初筛及一次复测中均答对，两组修正后初筛也均答对。旧逻辑 MTP0 的该失败仅观察到一次，未在当时已运行的用例中复测。索引 16 在两组旧逻辑初筛及旧逻辑对照的全部六次复测中均答对。因此，这些模型初筛不能确定仅由缩放处理导致了此前的 MTP 异常题，也不能据此推断缩放协调普遍提升吞吐率。数值回归独立证明了缩放错误；协调在 E4M3 舍入精度范围内保留有效缩放，同时限制临时内存。
 
-Both old NVFP4 controls also select the extra assistant token in the fixed role-boundary context without requiring speculative generation for the MTP0 control. The completed corrected-NVFP4 target comparison also chooses that token, as described above.
+两组旧 NVFP4 对照在固定角色边界上下文中也选择额外的 assistant token，其中 MTP0 不需要推测生成。已完成的修正后 NVFP4 目标模型对照也选择该 token，详见上文。
 
-## Full GSM8K test-set evaluation
+## GSM8K 全量测试集评测
 
-The following use all 1,319 official test questions at concurrency 16. Scores retain the official labels, including ambiguous or inconsistent items; diagnostic repetitions do not replace first-pass answers. All ten full GSM8K evaluations are complete. The requested four-case Flash NVFP4 supplement uses the same scoring, sampling, warmup, concurrency and output limits as the FP8 full pair. Source HEAD for all four supplemental cases is `7c8b65d60f58ceb460089b59dfc3deeeec9de0d8`; no inference code was changed for the supplement. FP8 and Inferact full cases retain failed long-key checks separately from their completed accuracy and functional results.
+以下使用全部 1,319 道官方测试题，请求并发为 16。评分保留官方标签，包括存在歧义或不一致的题目；诊断复测不替换首次答案。十组全量 GSM8K 评测均已完成。后续要求补充的四组 Flash NVFP4 使用与 FP8 全量配对测试相同的评分、采样、预热、并发和输出上限。四组补测的源码 HEAD 均为 `7c8b65d60f58ceb460089b59dfc3deeeec9de0d8`，补测期间未修改推理代码。FP8 和 Inferact 全量用例的长编号检查失败单独保留，不与已完成的准确率和功能结果混为一谈。
 
-| Model | MTP | Correct / total | Accuracy | Output-limit cases | GSM8K seconds | Generated tokens |
+| 模型 | MTP | 正确数 / 总数 | 准确率 | 达到输出上限的题数 | GSM8K 耗时（秒） | 生成 token 数 |
 | --- | --- | --- | --- | --- | --- | --- |
 | GLM NVFP4 | 0 | 1,282/1,319 | 97.19% | 5 | 1,498.2 | 289,161 |
 | GLM NVFP4 | 3 | 1,280/1,319 | 97.04% | 1 | 1,034.0 | 278,323 |
@@ -185,84 +185,84 @@ The following use all 1,319 official test questions at concurrency 16. Scores re
 | Qwen Flash Inferact NVFP4 | 0 | 1,294/1,319 | 98.10% | 2 | 1,577.6 | 681,721 |
 | Qwen Flash Inferact NVFP4 | 3 | 1,290/1,319 | 97.80% | 3 | 1,058.4 | 686,213 |
 
-GLM NVFP4 MTP0 completes all five functional probes, all 14 request-key checks (13 exact formats), four longer continuations, and the private-prefix check. The two private keys occur before token 16,032; reverse-order reuse records 21,760 prefix-hit tokens per request and retrieves the correct key, exercising a cache boundary beyond the distinguishing information. The first-pass five truncations are indices 119, 450, 943, 1176 and 1265. Repeating failed cases recovers 252, 267, 450, 806 and 1265; the score remains the original 1,282. The signed labels at indices 489 and 1113 are both handled correctly.
+GLM NVFP4 MTP0 完成了五项功能探针、14 个请求编号检查（13 个格式完全匹配）、四条较长续写及私有前缀检查。两个私有编号均位于第 16,032 个 token 之前；逆序复用时，每条请求记录 21,760 个前缀命中 token，并恢复正确编号，验证了缓存边界超过区分信息所在位置的情况。首次截断的五题索引为 119、450、943、1176、1265。错误题复测中，252、267、450、806、1265 答对；分数仍为首次的 1,282。索引 489、1113 的带符号标签均正确处理。
 
-Inspection confirms the completed numerical failures use the explicit final-answer marker rather than a parser fallback. Some are ordinary reasoning errors, while some reflect inconsistent labels: item 403 asks for energy saved by reducing a 900 W air conditioner from eight to three hours daily for 30 days; the model returns 135 kWh, while the label is 81 kWh (remaining usage). This example is retained as incorrect under official scoring.
+检查确认，已完成但数值错误的回答使用明确的最终答案标记解析，没有走解析器回退路径。其中既有普通推理错误，也有标签不一致：第 403 题询问 900 W 空调每天从八小时减至三小时、持续 30 天所节省的电量；模型回答 135 kWh，标签却是 81 kWh，即剩余用电量。按官方评分，该题仍记为错误。
 
-GLM NVFP4 MTP3 introduces nine failed indices (255, 322, 340, 406, 425, 439, 583, 901, 967) and corrects seven baseline failures (252, 357, 450, 806, 1059, 1176, 1265), a net difference of two questions or −0.15 percentage points. Each new failure is repeated twice. Seven answer correctly at least once; 255 and 967 remain incorrect in both repetitions. Item 255 has conflicting ten/twenty-stall wording; item 967 changes the referent used for the sister's age. These are retained as observed failures, without claiming that MTP and baseline outputs are equivalent. Only 326/1,319 complete token sequences match exactly. Baseline repetitions also changed some answers, so a one-pass disagreement alone does not identify an implementation defect.
+GLM NVFP4 MTP3 新增九道错误，索引为 255、322、340、406、425、439、583、901、967，同时修正七道基线错误，索引为 252、357、450、806、1059、1176、1265，净少答对两题，即 −0.15 个百分点。每道新增错误复测两次，其中七道至少一次答对；255、967 两次仍错。第 255 题的十/二十个摊位表述相互冲突；第 967 题改变了妹妹年龄所对应的指代对象。这些仍保留为观察到的失败，不宣称 MTP 与基线输出等价。只有 326/1,319 条完整 token 序列完全相同。基线复测也改变了部分答案，因此仅凭一次回答不同，不能确定存在实现缺陷。
 
-The MTP3 truncation is item 814, which loops while questioning `20/2 = 10`. Its repeat finishes with 17, matching the baseline answer but differing from the official label 11 (the label omits one of the two worse players). The repeated output remains a failed first-pass case. MTP3 accepts 82.07% of draft tokens; the fractions of draft iterations accepting through positions 1/2/3 are 93.99%/82.94%/69.28% (not conditional probabilities). Aggregate generated output rises from 193.00 to 269.16 tokens/s at concurrency 16, while fixed 512-token Chinese/code/English decoding rises from 45.36/45.29/45.29 to 53.08/74.74/65.08 tokens/s (1.17×/1.65×/1.44×).
+MTP3 截断题为索引 814，模型在质疑 `20/2 = 10` 时陷入循环。复测完成，答案为 17，与基线相同，但不同于官方标签 11；标签漏掉了两名较差球员中的一名。首次失败评分不因复测而改变。MTP3 接受率为 82.07%；草稿迭代中连续接受到位置 1/2/3 的比例分别为 93.99%/82.94%/69.28%，这些不是条件概率。并发 16 时，生成总吞吐率从 193.00 升至 269.16 token/s；固定 512 token 的中文/代码/英文解码速度从 45.36/45.29/45.29 升至 53.08/74.74/65.08 token/s，分别为 1.17×/1.65×/1.44×。
 
-All five MTP3 functional probes pass. The full run returns 14/14 exact short keys and 4/4 long keys, with 125,440 and 35,840 prefix-hit tokens respectively. The long probe accepts 358/867 draft tokens (41.29%), exercising rejection. Both reverse-order private-key reuses are correct and record 17,920 hit tokens each, beyond the key positions at 16,032. Earlier runs' occasional extra-role formatting remains a documented limitation despite this particular MTP3 run's exact outputs.
+MTP3 五项功能探针全部通过。全量运行的短编号为 14/14 格式完全匹配，长编号为 4/4 正确，分别命中 125,440、35,840 token。长探针接受草稿 358/867（41.29%），覆盖了拒绝路径。两个私有编号的逆序复用均正确，每条命中 17,920 token，超过编号所在的第 16,032 个 token。尽管本次 MTP3 输出格式完全匹配，此前运行中偶发的额外角色格式问题仍作为已知限制保留。
 
-AWQ MTP0 scores 1,282/1,319 with one truncated response (901), which answers correctly on repeat. Other recovered first-pass failures are 252, 255, 439, 587, 1124 and 1265; all original answers remain scored. All five functional probes, all 14 exact short keys, four long continuations and two private-key reuses pass. Short/long phases record 182,784/52,224 cache-hit tokens; each private-key reuse hits 21,760 tokens, beyond the key at 16,032. Chinese/code/English fixed-length decoding is 45.83/45.75/45.75 tokens/s. The AWQ baseline also changes its interpretation of the conflicting ten/twenty-stall question between the first pass and its repeat; this observation does not require MTP.
+AWQ MTP0 得分 1,282/1,319，一条回答截断，索引为 901，复测答对。其他首次错误后复测答对的题目为 252、255、439、587、1124、1265；评分均保留首次答案。五项功能探针、14 个格式完全匹配的短编号、四条长续写和两次私有编号复用全部通过。短/长阶段分别命中 182,784/52,224 token；每次私有编号复用命中 21,760 token，超过第 16,032 个 token 的编号位置。中文/代码/英文固定长度解码速度为 45.83/45.75/45.75 token/s。AWQ 基线在首次回答和复测之间，也改变了对十/二十个摊位冲突题的理解，该现象不要求开启 MTP。
 
-AWQ MTP3 scores 1,283/1,319, introducing six failures (340, 357, 406, 425, 640, 1176) while correcting seven baseline failures (252, 255, 439, 587, 901, 1198, 1265). Five of the six new failures answer correctly at least once in two repeats; 406 remains at 240 rather than 200 because it uses the total cannoli count instead of the newly purchased count as the comparison quantity. Truncated indices are 943 and 1176; both repetitions of 1176 finish, with one correct and one incorrect answer. The net improvement is one question (+0.08 percentage points), not evidence of a general accuracy improvement. Complete token sequences match for 393/1,319 questions.
+AWQ MTP3 得分 1,283/1,319，新增六道错误：340、357、406、425、640、1176，同时修正七道基线错误：252、255、439、587、901、1198、1265。六道新增错误中，五道在两次复测里至少答对一次；406 仍回答 240 而不是 200，因为它使用奶油卷总数，而不是新购数量作为比较基数。截断索引为 943、1176；1176 的两次复测均完成，一次正确、一次错误。净增加一道正确答案，即 +0.08 个百分点，不能据此认定准确率普遍提升。完整 token 序列相同的题目为 393/1,319。
 
-MTP3 accepts 81.94% of proposed GSM8K tokens; acceptance-through-position fractions are 94.22%/82.75%/68.85%. Chinese/code/English fixed-length decoding reaches 51.09/68.49/56.79 tokens/s, or 1.11×/1.50×/1.24× the matching baseline. All five functional probes, all 14 exact short keys, all four long keys and both private-cache reuses pass. Short/long phases record 125,440/35,840 hit tokens, with 303/678 accepted drafts (44.69%) in the long continuations. Private-key reuses each hit 17,920 tokens, beyond the distinguishing key position.
+MTP3 接受了 81.94% 的 GSM8K 草稿 token；连续接受到各位置的比例为 94.22%/82.75%/68.85%。中文/代码/英文固定长度解码速度为 51.09/68.49/56.79 token/s，分别是对应基线的 1.11×/1.50×/1.24×。五项功能探针、14 个格式完全匹配的短编号、四个长编号及两次私有缓存复用全部通过。短/长阶段命中 125,440/35,840 token，长续写接受草稿 303/678（44.69%）。每次私有编号复用命中 17,920 token，超过区分编号的位置。
 
-Qwen Flash FP8 MTP0 scores 1,291/1,319 with truncations at 119, 835 and 858. Repetitions recover 45, 675, 830, 835, 858 and 988, while 119 still truncates. The fixed control at 87 is correct on the first pass but returns 10,080 on repetition after 4,922 tokens, choosing four raises instead of three; this interpretation change occurs without MTP. All five functional probes pass. Fixed-length Chinese/code/English decoding is 52.20/52.19/52.19 tokens/s.
+Qwen Flash FP8 MTP0 得分 1,291/1,319，截断索引为 119、835、858。复测中 45、675、830、835、858、988 答对，119 仍截断。固定对照题 87 首次答对，复测则在生成 4,922 token 后回答 10,080，将三次加薪理解成四次；该理解变化发生在未开启 MTP 的情况下。五项功能探针全部通过。中文/代码/英文固定长度解码速度为 52.20/52.19/52.19 token/s。
 
-Its later long-key state check fails: 14/14 short keys have exact formatting and 258,720 prefix-hit tokens, but two of four longer answers return the public prefix's old `582731` instead of `684001` or `684004`. The long phase records 68,992 hit tokens. The isolated first-user-request `684004` control had passed on this same server with zero hits, which motivated the cache/batch controls below; FP8 must not be described as universally passing this prompt. The original run stops at this assertion and retains its complete GSM8K/functional/benchmark results, but has no passing completion marker. Separate cache-off/cache-on state diagnostics collect independent private-key and CUDA-event checks even when a model-output assertion fails. Such diagnostic runs retain a failure status rather than converting an assertion into a pass.
+后续长编号状态检查失败：14/14 短编号格式完全匹配，前缀命中 258,720 token，但四条较长回答中有两条返回公共前缀中的旧编号 `582731`，而不是 `684001` 或 `684004`。长阶段命中 68,992 token。同一服务上，单独作为首条用户请求发送的 `684004` 对照此前曾通过，命中为零，因此进一步进行了下文的缓存/批次对照；不能声称 FP8 总能通过该提示词。原始运行在此断言处停止，保留完整 GSM8K、功能及测速结果，但没有通过的完成标记。独立的缓存开/关状态诊断即使遇到模型输出断言失败，也继续收集私有编号和 CUDA event 检查证据。这些诊断运行保留失败状态，不将断言失败改为通过。
 
-The FP8 MTP0 cache-off control also fails the *first single long request* (zero hits): the old key's initial `5` has log probability −0.50048, versus −1.12548 for the new `6`. Its four-line control passes; all 14 short keys pass, while the four mixed long answers pass 3/4 (key 684001 fails). This eliminates MTP, prefix reuse and concurrent requests as requirements for the long-key failure, but does not prove all single-request kernels or numerical paths correct. Cache-off and align mode also change the recurrent-state execution configuration, so a second control keeps align mode fixed and bypasses reuse using unique cache salts.
+FP8 MTP0 关闭缓存的对照也在**第一条单独发送的长请求**上失败，命中为零：旧编号开头 `5` 的对数概率为 −0.50048，新编号 `6` 为 −1.12548。四行短对照通过；14 个短编号全部通过，四条混合长回答为 3/4，失败编号为 684001。这说明长编号失败不以 MTP、前缀复用或并发请求为必要条件，但不能证明所有单请求内核及数值路径正确。关闭缓存和 align 模式还会改变循环状态的执行配置，因此第二组对照保持 align 模式不变，通过不同缓存盐值绕过复用。
 
-| FP8 MTP0, same align-mode server | Correct long keys | Prefix-hit tokens |
+| FP8 MTP0，同一 align 模式服务 | 长编号正确数 | 前缀命中 token 数 |
 | --- | --- | --- |
-| Serial, unique salts (bypass) | 3/4 | 0 |
-| Concurrent four, unique salts | 3/4 | 0 |
-| Serial, reused prefix | 3/4 | 68,992 |
-| Concurrent four, reused prefix | 2/4 | 68,992 |
+| 串行，不同盐值（绕过复用） | 3/4 | 0 |
+| 四条并发，不同盐值 | 3/4 | 0 |
+| 串行，复用前缀 | 3/4 | 68,992 |
+| 四条并发，复用前缀 | 2/4 | 68,992 |
 
-All four serial bypass/reuse pairs produce **identical complete token sequences** and identical first-token log probabilities. Key 684001 favors the old key in all four modes. Key 684004 flips only in the concurrent reused-prefix phase: bypass favors `6` over `5` by 0.625 logit units; reuse favors `5` over `6` by 0.125. This is evidence of sensitivity to batched execution/cache layout, not proof of a particular quantization or state-corruption cause. The reported public-key failures remain failed checks. Separately, both private keys are recovered in reverse order with 26,656 hit tokens each, beyond their position at 18,074. The MTP3 full run also successfully checks simultaneous restoration of these distinct private prefixes.
+四组串行绕过/复用配对均生成**完全相同的完整 token 序列**，首 token 对数概率也相同。编号 684001 在四种模式下均偏向旧编号。编号 684004 只在并发复用前缀阶段发生翻转：绕过复用时，`6` 比 `5` 高 0.625 个 logit 单位；复用时，`5` 比 `6` 高 0.125。这说明输出对批次执行/缓存布局敏感，但不能据此确定某个量化或状态损坏根因。公共编号失败仍保留为检查失败。另行检查时，两个私有编号均可逆序恢复，每条请求命中 26,656 token，超过编号所在的第 18,074 个 token。MTP3 全量运行还成功验证了同时恢复这两个不同私有前缀。
 
-The aligned MTP0 diagnostic collects 127 decode steps from all four GPU workers and the CPU PLE worker despite the retained output failure. CPU PLE forward averages 0.787 ms. Target graph intervals on GPU 0/1/2/3 average 7.08/3.97/3.99/2.90 ms; outer target-execute intervals are 18.28–19.44 ms and include PP waits. These intervals are not isolated kernel costs and must not be added as independent rank work. The cache-off profile is retained as a separate configuration, not substituted for the aligned MTP0/MTP3 comparison.
+尽管保留了输出失败，align 模式 MTP0 诊断仍从四个 GPU worker 和 CPU PLE worker 采集了 127 个解码步骤。CPU PLE 前向计算平均为 0.787 ms。GPU 0/1/2/3 的目标模型计算图区间平均为 7.08/3.97/3.99/2.90 ms；外层目标模型执行区间为 18.28–19.44 ms，包含 PP 等待。这些区间不是独立内核耗时，不能当作各 rank 的独立工作量相加。关闭缓存的分析作为独立配置保留，不替代 align 模式的 MTP0/MTP3 对比。
 
-Qwen Flash FP8 MTP3 scores 1,290/1,319, introducing six failed indices (100, 549, 752, 782, 1019, 1176) while correcting five baseline failures (45, 590, 830, 835, 988). Each new failure is repeated twice. Five answer correctly at least once; 100 remains incorrect in both repetitions (155 and 685 versus the official 175). That same question had already failed in the MTP0 128-question screen, so it is not an MTP-only failure. Both repetitions of 752 and 782 pass; 549, 1019 and 1176 each pass once. The 1176 chalk question reaches the output limit in its first pass and one repetition. Other first-pass truncations are 119 and 675. These original failures remain scored.
+Qwen Flash FP8 MTP3 得分 1,290/1,319，新增六道错误：100、549、752、782、1019、1176，同时修正五道基线错误：45、590、830、835、988。每道新增错误复测两次，其中五道至少一次答对；100 两次仍错，分别为 155、685，官方答案为 175。同一题在 MTP0 的 128 题初筛中已经失败，因此不是 MTP 独有失败。752、782 两次复测均通过；549、1019、1176 各通过一次。第 1176 道粉笔题在首次及一次复测中达到输出上限。其他首次截断题为 119、675。评分保留这些首次错误。
 
-Only 45/1,319 complete Qwen token sequences match across MTP0/3. Together with baseline repeat variability, this prevents treating the similar scores as proof of identical output distributions. MTP3 accepts 71.60% of proposed GSM8K tokens, with acceptance-through-position fractions of 83.33%/71.33%/60.13%. It generates 665,329 tokens in 1,140.0 s (583.62 aggregate output tokens/s versus 385.35 for MTP0). All five functional probes pass. Fixed-length Chinese/code/English decoding reaches 67.28/106.91/89.87 tokens/s, or 1.29×/2.05×/1.72× the baseline. The long-key check again passes 2/4, while all 14 short keys have exact formatting. Short/long phases record 240,000/64,000 hit tokens; long continuations accept 254/642 proposed tokens (39.56%), exercising substantial rejection. The failed long-key assertion remains a failure while independent diagnostics continue.
+MTP0/3 之间仅有 45/1,319 条完整 Qwen token 序列相同。结合基线复测也会变化，不能将接近的分数视为输出分布完全相同的证明。MTP3 接受了 71.60% 的 GSM8K 草稿 token，连续接受到各位置的比例为 83.33%/71.33%/60.13%。1,140.0 s 内生成 665,329 token，总输出吞吐率为 583.62 token/s，MTP0 则为 385.35 token/s。五项功能探针全部通过。中文/代码/英文固定长度解码速度为 67.28/106.91/89.87 token/s，即基线的 1.29×/2.05×/1.72×。长编号检查仍为 2/4，14 个短编号格式全部完全匹配。短/长阶段前缀命中为 240,000/64,000 token；长续写接受草稿 254/642（39.56%），覆盖了大量拒绝。独立诊断继续执行，长编号断言仍保留为失败。
 
-The MTP3 same-align-mode matrix reproduces the baseline pattern: serial bypass 3/4, concurrent bypass 3/4, serial reuse 3/4, and concurrent reuse 2/4. Bypass phases have zero hits; reuse phases have 64,000. All four serial bypass/reuse pairs again produce identical complete token sequences. Both private keys are recovered in reverse order, with 25,600 hits per request beyond their token-18,074 positions. Concurrent private reuse also returns both correct keys and records 51,200 hits; even the conservative per-request lower bound (51,200 minus the other request's 28,051 prompt tokens) exceeds the key position. These passes do not erase the separate public-key instruction failures.
+MTP3 在同一 align 模式下的矩阵复现基线模式：串行绕过为 3/4，并发绕过为 3/4，串行复用为 3/4，并发复用为 2/4。绕过阶段命中为零，复用阶段命中 64,000 token。四组串行绕过/复用的完整 token 序列再次全部相同。两个私有编号均逆序恢复，每条请求命中 25,600 token，超过其第 18,074 个 token 的位置。并发私有前缀复用也返回两个正确编号，命中 51,200 token；即使按每条请求的保守下界计算，用 51,200 减去另一条请求的 28,051 个提示 token，也超过编号位置。这些通过结果不会抵消独立的公共编号指令失败。
 
-The MTP3 cache-off control also fails its first isolated long request, with the same first-token log probabilities as MTP0 cache-off (`5`: −0.50048; `6`: −1.12548), and passes the four-line control. The identical first-token distribution does not imply identical full continuations. All 14 short keys are exact with zero hits; the mixed long probe passes 2/4, versus 3/4 for MTP0 cache-off, again returning the old key for requests 1 and 4. It accepts 37.64% of proposed continuation tokens. The failed assertion and all five event files are retained. This completes the MTP/cache-on/off controls without establishing universal numerical equivalence or a checkpoint-level root cause.
+MTP3 关闭缓存的对照也在首条独立长请求上失败，首 token 对数概率与关闭缓存的 MTP0 相同：`5` 为 −0.50048，`6` 为 −1.12548；四行短对照通过。首 token 分布相同不意味着完整续写相同。14 个短编号格式完全匹配，命中为零；混合长探针为 2/4，而 MTP0 关闭缓存时为 3/4，同样在请求 1、4 中返回旧编号。续写草稿接受率为 37.64%。失败断言及全部五个事件文件均保留。至此，MTP 与缓存开/关对照已完成，但未确立普遍的数值等价性或权重层面的根因。
 
-### Supplemental Qwen Flash NVFP4 full comparisons
+### Qwen Flash NVFP4 全量补测对比
 
-The supplemental repetitions retain the request settings and concurrency limit of 16, while their request set and resulting batch composition differ from the full first pass. They diagnose repeat variability rather than establish a deterministic equivalence test.
+补测中的重复请求保留首次测试的请求参数和并发上限 16，但请求集合及由此形成的批次组成不同。它们用于诊断重复运行的波动，不构成确定性等价测试。
 
-RadixArk MTP0 scores 1,289/1,319, with output-limit cases 87, 119, 675, 796, 984 and 1176. Repetitions recover first-pass failures 87, 406, 590, 752, 835 and 1071; the original score is unchanged. MTP3 scores 1,291/1,319, introducing five failures (255, 782, 1019, 1038, 1288) and correcting seven (87, 182, 234, 406, 590, 752, 1071). Each new failure is repeated twice: all five answer correctly at least once, but one repetition of 782 still reaches 8,192 tokens. MTP3 truncates on 119, 675, 1038 and 1176; 1038 contains unfinished answer text, whose last-number fallback parses the trailing `200` as incorrect. Thus four responses reach the limit, while three have empty final-content fields (the harness's `missing_final` counter); the fourth is also incomplete. Only 56/1,319 complete output token sequences are identical across MTP0/3. The net two-question gain (+0.15 percentage points) does not establish a general accuracy gain or output equivalence.
+RadixArk MTP0 得分 1,289/1,319，达到输出上限的题目为 87、119、675、796、984、1176。首次错误中的 87、406、590、752、835、1071 在复测中答对，原始评分不变。MTP3 得分 1,291/1,319，新增五道错误：255、782、1019、1038、1288，同时修正七道：87、182、234、406、590、752、1071。每道新增错误复测两次，五道均至少一次答对，但 782 的一次复测仍达到 8,192 token。MTP3 截断题为 119、675、1038、1176；1038 含未完成的答案文本，最后数字回退解析将末尾的 `200` 解析为错误答案。因此，共四条响应达到上限，其中三条最终内容字段为空，对应测试脚本的 `missing_final` 计数；第四条同样没有完成。MTP0/3 仅有 56/1,319 条完整输出 token 序列相同。净增加两道正确答案，即 +0.15 个百分点，不能证明准确率普遍提升或输出等价。
 
-Item 87 revises the earlier RadixArk assessment. MTP0's full concurrency-16 first pass reaches 8,192 tokens without a final answer, while both subsequent repeats return the official 9,360 in 1,237 and 985 tokens. Full MTP3 returns 9,360 in 3,027 tokens and again on repetition in 2,150 tokens. Earlier MTP3 serial repetitions still contain identical 8,192-token loops. Truncation therefore occurs without MTP too, and changes with repeat/batch conditions; these observations do not isolate its numerical or checkpoint-level cause.
+第 87 题修正了此前对 RadixArk 的判断。MTP0 全量测试在并发 16 的首次回答中达到 8,192 token，未给出最终答案；随后两次复测均返回官方答案 9,360，分别使用 1,237、985 token。全量 MTP3 用 3,027 token 返回 9,360，复测又用 2,150 token 答对。此前的 MTP3 串行复测仍保留完全相同的 8,192 token 循环。因此，未开启 MTP 也会发生截断，且会随复测/批次条件变化；这些观察尚不能确定数值实现或权重层面的原因。
 
-Both RadixArk full cases pass all five functional probes, all 14 exact short keys, all four long continuations, and every mode of the serial/concurrent cache-bypass/reuse matrix. MTP0/3 short phases record 241,472/224,000 prefix-hit tokens and long phases 68,992/64,000. MTP3 long continuations accept 267/606 proposed tokens (44.06%), exercising rejection. Both private keys are recovered in reverse order and concurrently: MTP0 hits 26,656 tokens per serial request and 53,312 combined, versus 25,600 and 51,200 for MTP3. All per-request cache boundaries are beyond the key positions at token 18,074. MTP3's GSM8K draft acceptance is 71.85%; fixed-output Chinese/code/English speed changes from 52.18/52.19/52.19 to 67.80/108.66/102.02 tokens/s (1.30×/2.08×/1.95×).
+RadixArk 两组全量测试的五项功能探针、14 个格式完全匹配的短编号、四条长续写，以及串行/并发、绕过/复用缓存矩阵的所有模式均通过。MTP0/3 短阶段分别命中 241,472/224,000 token，长阶段为 68,992/64,000。MTP3 长续写接受草稿 267/606（44.06%），覆盖拒绝路径。两个私有编号均可逆序及并发恢复：MTP0 每条串行请求命中 26,656 token，并发合计 53,312；MTP3 分别为 25,600、51,200。所有请求的缓存边界均超过编号所在的第 18,074 个 token。MTP3 的 GSM8K 草稿接受率为 71.85%；固定输出的中文/代码/英文速度从 52.18/52.19/52.19 升至 67.80/108.66/102.02 token/s，即 1.30×/2.08×/1.95×。
 
-Inferact MTP0 scores 1,294/1,319, with truncations at 119 and 984. Repetitions recover 100, 234, 782 and 830 without replacing first-pass scores. All five functional probes and all 14 exact short keys pass, with 241,472 short-phase prefix-hit tokens. The long continuation check passes 3/4, returning the old public key instead of 684004; the failure remains recorded and the process exits with a failed assertion after independent diagnostics finish. In the same align-mode matrix, serial bypass, concurrent bypass and serial reuse all pass 4/4, while concurrent reuse passes 3/4. Bypass phases record zero hits and reuse phases 68,992. Both private keys are nevertheless recovered in reverse order (26,656 hits each) and concurrently (53,312 hits combined), with boundaries beyond the keys. This new matrix supplements the earlier fresh cache-off single-request failure; it does not erase it or prove a cache-only cause. Fixed-output Chinese/code/English rates are 52.19/52.18/52.23 tokens/s.
+Inferact MTP0 得分 1,294/1,319，截断题为 119、984。复测中 100、234、782、830 答对，但不替换首次评分。五项功能探针和 14 个格式完全匹配的短编号均通过，短阶段前缀命中为 241,472 token。长续写检查为 3/4，返回旧公共编号而非 684004；该失败被保留，进程在完成独立诊断后以断言失败退出。同一 align 模式矩阵中，串行绕过、并发绕过、串行复用均为 4/4，并发复用为 3/4。绕过阶段命中为零，复用阶段为 68,992。两个私有编号仍能逆序恢复，每条命中 26,656 token，并发恢复合计命中 53,312，缓存边界均超过编号位置。这组新矩阵补充了此前新启动服务、关闭缓存、单请求也失败的证据，不会抵消该证据，也不能证明问题仅由缓存导致。固定输出的中文/代码/英文速度为 52.19/52.18/52.23 token/s。
 
-Inferact MTP3 scores 1,290/1,319, introducing seven failures (182, 406, 675, 796, 988, 1019, 1288) and correcting three baseline failures (119, 590, 830), a net difference of −4 questions (−0.30 percentage points). Only 61/1,319 complete token sequences match MTP0. The three truncated first-pass responses are 406, 675 and 796. Each new failure is repeated twice: five answer correctly at least once; 675 returns 21 in both repeats versus the official 33, and 796 returns 2,640,000 in both versus 2,880,000. Item 675's official solution changes from 24 dogs to 36 toys before subtracting three; the repeated model answer uses 24 − 3. Item 796's repeats apply the first new hires after the first month's salary, whereas the official answer includes them in that month. Both remain incorrect under unchanged official scoring. Similar aggregate accuracy and partial recovery on repetition do not establish output equivalence.
+Inferact MTP3 得分 1,290/1,319，新增七道错误：182、406、675、796、988、1019、1288，同时修正三道基线错误：119、590、830，净变化为 −4 题，即 −0.30 个百分点。与 MTP0 相同的完整 token 序列仅有 61/1,319 条。首次截断的三条响应为 406、675、796。每道新增错误复测两次，其中五道至少一次答对；675 两次均返回 21，官方为 33；796 两次均返回 2,640,000，官方为 2,880,000。第 675 题的官方解答从 24 只狗跳到 36 个玩具，再减去三，模型复测则使用 24 − 3。第 796 题的复测将首次新增员工放在首月发薪之后，而官方答案将其计入该月。按不变的官方评分，两题仍为错误。总准确率接近、部分题目复测答对，均不能证明输出等价。
 
-Inferact MTP3 accepts 72.06% of GSM8K draft tokens, with mean accepted length 3.162. Fixed-output Chinese/code/English decoding reaches 68.09/112.42/87.87 tokens/s, or 1.30×/2.15×/1.68× its baseline. All five functional probes and all 14 exact short keys pass (224,000 hits). The long continuation again passes 3/4, failing key 684004 with 64,000 hits and 41.94% draft acceptance. The same-align-mode matrix matches full MTP0: 4/4 serial bypass, 4/4 concurrent bypass, 4/4 serial reuse and 3/4 concurrent reuse, with zero bypass hits and 64,000 reuse hits. Both private keys are recovered in reverse order (25,600 hits each) and concurrently (51,200 combined), with all cache boundaries beyond the keys at token 18,074. The original failed state assertion remains a failure after these independent diagnostics complete. All four NVFP4 full cases retain event records from the four GPU workers and the CPU PLE worker in `cuda-event-summary.json`; those measurements have the same serving-interval limitations as the FP8 profiles below.
+Inferact MTP3 的 GSM8K 草稿接受率为 72.06%，平均接受长度为 3.162。固定输出的中文/代码/英文解码速度为 68.09/112.42/87.87 token/s，即基线的 1.30×/2.15×/1.68×。五项功能探针和 14 个格式完全匹配的短编号均通过，命中 224,000 token。长续写仍为 3/4，编号 684004 失败，命中 64,000 token，草稿接受率 41.94%。同一 align 模式矩阵与全量 MTP0 一致：串行绕过 4/4、并发绕过 4/4、串行复用 4/4、并发复用 3/4；绕过命中为零，复用命中 64,000 token。两个私有编号均逆序恢复，每条命中 25,600 token；并发恢复合计命中 51,200。所有缓存边界均超过编号所在的第 18,074 个 token。独立诊断完成后，原始状态断言仍保留失败。四组 NVFP4 全量用例均保留四个 GPU worker 和 CPU PLE worker 的事件记录，汇总见 `cuda-event-summary.json`；其测量具有与下文 FP8 分析相同的服务阶段计时限制。
 
-## Serving-stage measurements and optimization decision
+## 服务阶段测量与优化判断
 
-For Qwen Flash FP8, the same isolated 128-output-token code prompt supplies the aligned MTP0/MTP3 event profiles below. MTP0 uses 127 recorded decode steps and MTP3 uses 41; per-step costs therefore are not costs per output token.
+以下 Qwen Flash FP8 的 align 模式 MTP0/MTP3 事件分析使用同一条独立代码提示词，输出 128 token。MTP0 记录 127 个解码步骤，MTP3 记录 41 个；因此，每步耗时不能直接当作每个输出 token 的耗时。
 
-| Mean interval per decode step | MTP0 | MTP3 |
+| 每个解码步骤的平均区间耗时 | MTP0 | MTP3 |
 | --- | --- | --- |
-| CPU PLE forward | 0.787 ms | 0.784 ms |
-| GPU 0 target graph | 7.077 ms | 7.861 ms |
-| GPU 1 target graph | 3.972 ms | 4.882 ms |
-| GPU 2 target graph | 3.991 ms | 4.950 ms |
-| GPU 3 target graph | 2.900 ms | 3.741 ms |
-| GPU 3 draft proposal | — | 3.480 ms |
-| GPU 3 sample/postprocess, including draft if enabled | 0.877 ms | 4.342 ms |
+| CPU PLE 前向计算 | 0.787 ms | 0.784 ms |
+| GPU 0 目标模型计算图 | 7.077 ms | 7.861 ms |
+| GPU 1 目标模型计算图 | 3.972 ms | 4.882 ms |
+| GPU 2 目标模型计算图 | 3.991 ms | 4.950 ms |
+| GPU 3 目标模型计算图 | 2.900 ms | 3.741 ms |
+| GPU 3 草稿生成 | — | 3.480 ms |
+| GPU 3 采样/后处理，开启草稿时包含草稿生成 | 0.877 ms | 4.342 ms |
 
-GPU 0's outer target interval is 19.44 ms for MTP0 and 33.11 ms for MTP3; its narrower graph interval is much smaller because the outer interval includes PP readiness waits and host scheduling. CPU PLE timing excludes transfer and waiting, so it cannot establish that the whole offload path is negligible. CMP does not support the attempted CUPTI collection; these are CUDA-event serving intervals, not a kernel-level attribution. The demonstrated performance change is bounded-memory scale reconciliation plus measured MTP acceleration. No additional PLE/QSA kernel rewrite is justified by this profile while output-quality differences remain unresolved.
+GPU 0 的外层目标模型区间在 MTP0 下为 19.44 ms，在 MTP3 下为 33.11 ms；范围更窄的计算图区间明显更短，因为外层区间包含 PP 就绪等待和主机调度。CPU PLE 计时不包含传输和等待，不能据此认定整条卸载路径的开销可以忽略。CMP 不支持此次尝试的 CUPTI 采集；这些是 CUDA event 记录的服务阶段区间，不能用于内核级归因。已证实的性能改进是限制缩放协调的内存占用，以及实测的 MTP 加速。在输出质量差异尚未解决时，这份分析不足以支持进一步重写 PLE/QSA 内核。
 
-## Observed full-run GPU memory
+## 全量运行的 GPU 显存观测
 
-Values are `nvidia-smi` total device-used MiB sampled once per second, in GPU 0/1/2/3 order. Startup includes weight loading, profiling, graph capture and cache allocation before API readiness. Evaluation includes GSM8K and subsequent probes. These sampled peaks can miss brief allocations; they are distinct from the allocator-measured reconciliation microtest.
+下表为每秒采样一次的 `nvidia-smi` 设备总已用显存，单位 MiB，按 GPU 0/1/2/3 排列。启动阶段包含 API 就绪前的权重加载、资源分析、计算图捕获及缓存分配；评测阶段包含 GSM8K 及后续探针。这些采样峰值可能遗漏短暂分配，与通过分配器测得的缩放协调微测试峰值不同。
 
-| Full case | Startup peak MiB, GPU 0/1/2/3 | Evaluation peak MiB, GPU 0/1/2/3 |
+| 全量用例 | 启动峰值 MiB，GPU 0/1/2/3 | 评测峰值 MiB，GPU 0/1/2/3 |
 | --- | --- | --- |
 | GLM NVFP4 MTP0 | 46044 / 57022 / 57034 / 62959 | 53388 / 64628 / 63964 / 72089 |
 | GLM NVFP4 MTP3 | 45892 / 57402 / 57396 / 72978 | 52146 / 63410 / 64386 / 79138 |
@@ -275,14 +275,14 @@ Values are `nvidia-smi` total device-used MiB sampled once per second, in GPU 0/
 | Qwen Flash Inferact NVFP4 MTP0 | 58139 / 57810 / 57810 / 58310 | 61857 / 60248 / 60248 / 60718 |
 | Qwen Flash Inferact NVFP4 MTP3 | 58331 / 57980 / 57980 / 73274 | 61683 / 60590 / 60590 / 75590 |
 
-AWQ MTP3 reaches about 95 GiB on GPU 3 at the validated 32K/16-sequence setting. Larger context or sequence limits need their own memory and state validation. Startup times and cold/warm file-cache differences are recorded in the artifact inventory, without claiming a controlled loading-speed improvement.
+在已验证的 32K/16 条序列配置下，AWQ MTP3 在 GPU 3 上约达到 95 GiB。更大的上下文或序列上限需要单独验证显存与状态行为。启动耗时及冷/热文件缓存差异已记录在结果索引中，不将其宣称为受控实验下的加载提速。
 
-## Outcome and limits
+## 结论与覆盖范围
 
-The implementation defects demonstrated by failing regressions are fixed: NVFP4 fused gate/up scales, recurrent-state request-slot ownership and replay boundaries, PLE PP initialization, queued readiness/CPU input lifetime, and mixed PLE storage selection. Existing GLM draft-loading and quantization exclusions are preserved. Qwen draft audits do not show a missing embedding or shared-head load in the tested checkpoints. No shared draft/model loader change was needed, so the conditional DeepSeek regression was not triggered.
+由失败回归证实的实现缺陷已修复：NVFP4 融合 gate/up 缩放、循环状态的请求槽位归属与重放边界、PLE 的 PP 初始化、排队就绪事件/CPU 输入生命周期，以及混合 PLE 存储类型选择。已有 GLM 草稿加载和量化排除逻辑均保留。对已测 Qwen 权重的草稿核查未发现 embedding 或共享输出头漏载。无需修改共享草稿/模型加载器，因此未触发以此类改动为前提的 DeepSeek 回归。
 
-Across the full GSM8K pairs, MTP3 changes the number of correct answers by −2 for GLM NVFP4, +1 for GLM AWQ, −1 for Qwen Flash FP8, +2 for RadixArk NVFP4 and −4 for Inferact NVFP4. Fixed-length decoding benefits depend on the prompt: 1.11×–1.65× across the two GLM formats, 1.29×–2.05× for Qwen FP8, and 1.30×–2.15× across the two Qwen NVFP4 layouts. These are MTP-on/off measurements of the corrected repository, not a throughput A/B against the pre-fix source. Both Flash NVFP4 layouts now have full official test-set coverage; Qwen 27B BF16/FP8 retain their 32-question compatibility screens.
+全量 GSM8K 配对中，MTP3 的答对数变化分别为：GLM NVFP4 −2、GLM AWQ +1、Qwen Flash FP8 −1、RadixArk NVFP4 +2、Inferact NVFP4 −4。固定长度解码收益随提示词变化：两种 GLM 格式为 1.11×–1.65×，Qwen FP8 为 1.29×–2.05×，两版 Qwen NVFP4 为 1.30×–2.15×。这些是修正后仓库中 MTP 开/关的测量，不是相对修复前源码的吞吐 A/B 对比。两版 Flash NVFP4 现已覆盖官方测试集全量评测；Qwen 27B BF16/FP8 仍为 32 题兼容性初筛。
 
-There are still observed output limitations: occasional GLM extra-role formatting, individual reasoning loops or interpretation changes (including Radix item-87 truncations observed with both MTP settings under different run conditions), and the Qwen long public-key instruction failure. The Qwen control can fail without MTP, cache reuse or preceding user requests, and its behavior changes with batch/cache layout. This narrows the conditions but does not isolate all numerical paths or establish that a quantized checkpoint is intrinsically defective. No full BF16 GLM/Flash reference was run. The recorded wrong answers and assertion failures remain intact.
+仍存在已观察到的输出限制：GLM 偶发额外角色格式、个别推理循环或理解变化，包括不同运行条件下两种 MTP 设置均出现的 Radix 第 87 题截断，以及 Qwen 长公共前缀中的编号指令失败。Qwen 对照在没有 MTP、缓存复用或此前用户请求时也可能失败，行为随批次/缓存布局变化。这缩小了问题发生条件的范围，但尚未隔离全部数值路径，也不能确定某个量化权重本身存在缺陷。未运行完整的 BF16 GLM/Flash 参考模型对照。已记录的错误答案及断言失败全部保留。
 
-Validated serving limits are 32K context and 16 maximum sequences, with text-only requests. The original auto-context/64-sequence configuration, Qwen 27B full-test accuracy, multimodal requests, and a complete cross-product of hardware/quantization settings are outside the completed coverage. Exact commands, per-case source hashes, original model responses, repetition outcomes, memory samples and profiling data are retained with the artifact inventory.
+已验证的服务范围为 32K 上下文、最多 16 条序列、纯文本请求。原先自动上下文/64 条序列配置、Qwen 27B 全测试集准确率、多模态请求，以及硬件/量化配置的完整组合均不在已完成覆盖范围内。完整命令、各用例源码哈希、原始模型响应、复测结果、显存采样和性能分析数据均保留在结果索引及对应文件中。
