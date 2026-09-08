@@ -219,9 +219,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # just that the flag is on. Only the ratio-4 layers carry the
             # merged input trio; every layer carries fused_wqa_wkv.
             n_layers = config.num_hidden_layers
-            n_trio = sum(
-                1 for r in config.compress_ratios[:n_layers] if max(1, r) == 4
-            )
+            n_trio = sum(1 for r in config.compress_ratios[:n_layers] if max(1, r) == 4)
             reached = n_layers if self._unreplicate_all_layers else n_trio
             logger.info_once(
                 "VLLM_UNREPLICATE_ATTN_GEMMS: token-sharding fused_wqa_wkv on "
@@ -246,6 +244,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
+        # Vision variant: image spans are visible bidirectionally, widening
+        # prefill SWA index rows by up to max_image_tokens columns.
+        self.max_image_tokens = (
+            getattr(config, "vision_max_n_token", 0)
+            if getattr(config, "vision_n_layers", 0) > 0
+            else 0
+        )
         # NOTE(zyongye) Compress ratio can't be 0
         # we do this for because MTP layer is not included
         # in the compress ratio list
@@ -738,8 +743,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.ln_events[0],
                 self.ln_events[1:4],
                 aux_streams,
-                enable=hidden_states.shape[0]
-                <= self._multi_stream_threshold,
+                enable=hidden_states.shape[0] <= self._multi_stream_threshold,
             )
             if sharded:
                 qr_kv = self._gather_tokens(qr_kv, rows)
@@ -795,8 +799,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.ln_events[0],
             self.ln_events[1:4],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= self._multi_stream_threshold,
+            enable=hidden_states.shape[0] <= self._multi_stream_threshold,
         )
         if sharded:
             qr_kv = self._gather_tokens(qr_kv, rows)

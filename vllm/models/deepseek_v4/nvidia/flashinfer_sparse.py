@@ -407,6 +407,10 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 decode_is_valid_token=decode_is_valid_token,
                 swa_block_span=swa_block_span,
                 compressed_block_span=compressed_block_span,
+                prefill_left_visible=swa_metadata.prefill_left_visible,
+                prefill_right_visible=swa_metadata.prefill_right_visible,
+                # getattr for tests that bypass __init__ via object.__new__.
+                max_image_tokens=getattr(self, "max_image_tokens", 0),
             )
             if cache_key != "c4a":
                 swa_metadata.flashinfer_sparse_index_cache[cache_key] = (
@@ -756,7 +760,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         q = self._prepare_query(q, output)
         # FlashInfer's SM120 sparse MLA TVM-FFI entry (0.6.18rc8, top-k 192/256
         # DSV4 decode specialisations) requires contiguous index tensors.
-        if extra_sparse_indices is not None and not extra_sparse_indices.is_contiguous():
+        if (
+            extra_sparse_indices is not None
+            and not extra_sparse_indices.is_contiguous()
+        ):
             extra_sparse_indices = extra_sparse_indices.contiguous()
         if not swa_indices.is_contiguous():
             swa_indices = swa_indices.contiguous()

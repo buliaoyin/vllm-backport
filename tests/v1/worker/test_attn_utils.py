@@ -326,3 +326,40 @@ def test_copy_kv_cache_blocks_with_virtual_block_splitting(
             torch.testing.assert_close(
                 cache[dst_start + physical_idx], expected[layer_idx][physical_idx]
             )
+
+
+@pytest.mark.parametrize("offset", range(4))
+def test_mm_prefix_ranges_include_image_sentinels_and_exclude_alignment_pad(offset):
+    """V4 images can exceed SWA and include non-embedding sentinel tokens."""
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+    from vllm.v1.worker.gpu.attn_utils import compute_mm_prefix_ranges
+
+    position = PlaceholderRange(
+        offset=offset,
+        length=20,
+        is_embed=torch.tensor([False] * 4 + [True] * 12 + [False] * 4),
+    )
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=position,
+    )
+    features = {"image_request": [feature]}
+    req_ids = ["text_request", "image_request"]
+    # Existing models retain embedding-only ranges and the SWA size check.
+    assert compute_mm_prefix_ranges(req_ids, features, sliding_window=8) == {
+        0: [],
+        1: [],
+    }
+    assert compute_mm_prefix_ranges(req_ids, features, sliding_window=32) == {
+        0: [],
+        1: [(offset + 4, offset + 15)],
+    }
+    assert compute_mm_prefix_ranges(
+        req_ids,
+        features,
+        sliding_window=8,
+        clamp_sliding_window=True,
+        span_leading_pad_modulus=4,
+    ) == {0: [], 1: [(3, offset + 19)]}
