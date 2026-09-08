@@ -67,7 +67,7 @@ GSM8K 使用官方测试集、5-shot、并发 4、temperature 0、seed 42、`thi
 | 图像尺寸 | 宽图、竖图、31×19 小图 | 正确识别左右颜色 |
 | 缓存复用 | 重复图片和问题、并发不同图片 | 未出现串图 |
 
-DSpark 另完成 4 个并发长前缀图片请求，正确 4/4，每条实际输入 5,635–5,635 token。前缀后交替放入红色和蓝色图片，均识别了对应图片颜色。
+DSpark 另完成 4 个并发长前缀图片请求，正确 4/4，每条实际输入 5,635 token。前缀后交替放入红色和蓝色图片，均识别了对应图片颜色。
 
 ## 速度与 MTP
 
@@ -103,6 +103,12 @@ DSpark 使用检查点自带的 3 层草稿权重，设置 `num_speculative_toke
 | 旧 DeepSeek 文本测试对照 | 原分支与移植分支均为 31 passed / 11 failed / 29 skipped；失败项完全相同 |
 
 旧测试失败包括调用已改名的注意力方法、测试桩缺少 `modules()`、缺少 `vllm.third_party.deep_gemm.utils`。这些失败已在未修改的 `bbf878805` 上复现。既有 DSpark 稀疏注意力测试还受硬件条件限制，在本机跳过；不将跳过计为通过。GLM/Qwen 之前的全量模型评测未在本次重复执行，原中文报告继续保留。
+
+## 当前工作区复核
+
+已将实现同步到 `/home/bul/dev/vllm-backport`，当前分支为 `codex/deepseek-v4-vision-tested`，代码提交为 `7337f1434`。原 `codex/glm5next-serving-fixes` 分支仍保留在 `bbf878805`。新版 MoE 扩展已安装，原二进制备份在原始记录目录的 `binary-backup/` 中。
+
+从当前工作区直接调用 `vllm-backport/bin/vllm`，启用 DSpark 3 后重新启动成功；四并发复核的 8 项图片、OCR、表格和图文混排请求全部通过。记录为 `serve-installed-dspark3.log` 和 `probes-installed-dspark3/summary.json`。复核后已停止测试服务并释放 GPU。
 
 ## 可复现启动命令
 
