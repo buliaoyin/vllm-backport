@@ -551,3 +551,209 @@ def test_ple_short_conv_uses_fallback_when_profile_metadata_is_omitted(
     output = module._short_conv(inputs)
 
     assert output is expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("storage_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_fused_ple_lookup_preserves_eos_context_padding_and_tp(
+    monkeypatch, storage_dtype, pinned
+):
+    """Fused hashing must preserve the CPU lookup across EOS and request boundaries."""
+    from vllm.models.qwen4_exp.nvidia.ple_lookup import fused_ple_lookup
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.ngram_size = 3
+    module.heads_per_ngram = 2
+    module.embedding_dim = 4 * 7
+    module.head_dim = 7
+    module.eos_token_id = 99
+    module.register_buffer("positions_buffer", torch.arange(16))
+    module.register_buffer("padded_buffer", torch.full((3, 16), 99))
+    module.register_buffer(
+        "layer_multipliers",
+        torch.tensor([42577301777264367, 7238921104330043, 9983112340814273]),
+    )
+    module.register_buffer(
+        "ngram_heads_vocab_sizes", torch.tensor([101, 103, 107, 109])
+    )
+    module.register_buffer("ngram_heads_offsets", torch.tensor([0, 101, 204, 311]))
+    module.ngram_embedding = nn.Embedding(420, 7)
+    weight = (torch.arange(420 * 7).reshape(420, 7) % 31 - 15).to(storage_dtype)
+    module.ngram_embedding.weight = nn.Parameter(weight, requires_grad=False)
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: True)
+    ids = torch.tensor([2, 7, 99, 5, 3, 888, 777, 666])
+    context = torch.tensor([[11, 13], [99, 17], [19, 99]])
+    multipliers = module.layer_multipliers.cuda()
+    sizes = module.ngram_heads_vocab_sizes.cuda()
+    offsets = module.ngram_heads_offsets.cuda()
+    for boundaries in ([0, 4, 5, 5], [0, 1, 3, 5], [0, 0, 0, 5]):
+        qsl = torch.tensor(boundaries, dtype=torch.int32)
+        expected = module.forward_impl(torch.empty(8, 1), ids, qsl, context)
+        parts = []
+        for start, end in ((0, 210), (210, 420)):
+            host = weight[start:end].pin_memory() if pinned else weight[start:end]
+            table = (
+                get_accelerator_view_from_cpu_tensor(host) if pinned else host.cuda()
+            )
+            actual = fused_ple_lookup(
+                ids.cuda(),
+                qsl.cuda(),
+                context.cuda(),
+                multipliers,
+                sizes,
+                offsets,
+                table,
+                eos_token_id=99,
+                heads_per_ngram=2,
+                tp_start=start,
+                tp_end=end,
+            )
+            parts.append(actual.float().cpu())
+        combined = parts[0] + parts[1]
+        torch.testing.assert_close(combined[:5], expected[:5].float(), rtol=0, atol=0)
+        assert not combined[5:].count_nonzero()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_ple_lookup_graph_replay_reads_current_boundaries():
+    """Replaying one graph must not reuse the capture-time request partition."""
+    from vllm.models.qwen4_exp.nvidia.ple_lookup import fused_ple_lookup
+
+    device = "cuda"
+    args = [
+        torch.tensor([2, 3, 5, 7, 11, 13, 17, 19], device=device),
+        torch.tensor([0, 4, 8], dtype=torch.int32, device=device),
+        torch.tensor([[23, 29], [31, 37]], device=device),
+        torch.tensor([101, 103, 107], device=device),
+        torch.tensor([41, 43], device=device),
+        torch.tensor([0, 41], device=device),
+        torch.arange(84 * 7, dtype=torch.float32, device=device).reshape(84, 7),
+    ]
+    kwargs = dict(eos_token_id=99, heads_per_ngram=1, tp_start=0, tp_end=84)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fused_ple_lookup(*args, **kwargs)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = fused_ple_lookup(*args, **kwargs)
+    for boundaries in ([0, 1, 8], [0, 0, 5], [0, 7, 8]):
+        args[1].copy_(torch.tensor(boundaries, device=device))
+        expected = fused_ple_lookup(*args, **kwargs)
+        graph.replay()
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_dummy_offload_initializes_fp8_scale(fp8):
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._offload_quant_method = Qwen4ExpPLEFp8EmbeddingMethod() if fp8 else None
+    module.initialize_dummy_offload_metadata(torch.device("cpu"))
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embedding = module
+    dtype = module.get_offload_output_dtype(torch.bfloat16)
+    assert dtype == (torch.float8_e4m3fn if fp8 else torch.bfloat16)
+    result = layer._dequantize_embeddings(torch.ones(2, 3).to(dtype), torch.bfloat16)
+    torch.testing.assert_close(result, torch.ones(2, 3, dtype=torch.bfloat16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("storage_dtype", ["bfloat16", "float8_e4m3fn"])
+def test_uva_ple_loads_shards_without_staging_weights_on_gpu(
+    monkeypatch, storage_dtype
+):
+    """Pinned checkpoint storage must feed the normal forward and scale path."""
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "0")
+    for mod in (embedding_module, parameter_module):
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    config = Qwen4ExpTextConfig(
+        vocab_size=32,
+        eos_token_id=31,
+        ngram_size=2,
+        heads_per_ngram=1,
+        ngram_vocab_size_base=3,
+        make_ngram_vocab_size_divisible_by=4,
+        split_ngram_parts=2,
+        ple_embedding_dtype=storage_dtype,
+    )
+    dtype = getattr(torch, storage_dtype)
+    weights = torch.arange(1, 33).reshape(4, 8).to(dtype)
+    shards = [
+        ("ngram_embedding.shard_0.weight", weights[:2]),
+        ("ngram_embedding.shard_1.weight", weights[2:]),
+    ]
+    if dtype == torch.float8_e4m3fn:
+        shards.append(("ngram_embedding.weight_scale", torch.tensor([0.25])))
+    outputs = []
+    for uva in (False, True):
+        monkeypatch.setenv("VLLM_PLE_USE_UVA", str(int(uva)))
+        with torch.device("cuda" if uva else "cpu"):
+            module = Qwen4ExpNGramEmbedding(
+                config, 8, 0, 8, 2, "test.ple_embedding", params_dtype=torch.bfloat16
+            )
+        module.load_weights(shards)
+        layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+        nn.Module.__init__(layer)
+        layer.ple_embedding = module
+        monkeypatch.setattr(
+            ple_layer_module,
+            "get_forward_context",
+            lambda layer=layer: SimpleNamespace(no_compile_layers={"test": layer}),
+        )
+        device = "cuda" if uva else "cpu"
+        result = module.forward_impl(
+            torch.empty(4, 1, device=device, dtype=torch.bfloat16),
+            torch.tensor([2, 7, 31, 5], device=device),
+            torch.tensor([0, 1, 4], device=device),
+            torch.tensor([[11], [31]], device=device),
+        )
+        outputs.append(layer._dequantize_embeddings(result, torch.bfloat16).cpu())
+        if uva:
+            embedding = module.ngram_embedding
+            assert embedding.weight.device.type == "cpu"
+            assert embedding.weight.is_pinned()
+            assert embedding.uva_weight.device.type == "cuda"
+            torch.testing.assert_close(embedding.weight.float(), weights.float())
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fused_ple_dequantizes_all_fp8_codes(output_dtype):
+    """SM80's byte conversion must preserve subnormals, signed zero, NaNs and scale."""
+    from vllm.models.qwen4_exp.nvidia.ple_lookup import fused_ple_lookup
+
+    weight = torch.arange(256, dtype=torch.uint8, device="cuda").view(
+        torch.float8_e4m3fn
+    )
+    scale = torch.tensor([0.37123], device="cuda")
+    output = torch.empty((2, 256), dtype=output_dtype, device="cuda")
+    fused_ple_lookup(
+        torch.tensor([2, 777], device="cuda"),
+        torch.tensor([0, 1], device="cuda"),
+        torch.tensor([[99]], device="cuda"),
+        torch.tensor([101, 107], device="cuda"),
+        torch.tensor([1], device="cuda"),
+        torch.tensor([0], device="cuda"),
+        weight.reshape(1, 256),
+        eos_token_id=99,
+        heads_per_ngram=1,
+        tp_start=0,
+        tp_end=1,
+        output=output,
+        weight_scale=scale,
+    )
+    expected = weight.to(output_dtype) * scale.to(output_dtype)
+    torch.testing.assert_close(output[0], expected, rtol=0, atol=0, equal_nan=True)
+    finite = ~expected.isnan()
+    assert torch.equal(
+        torch.signbit(output[0][finite]), torch.signbit(expected[finite])
+    )
+    assert not output[1].count_nonzero()

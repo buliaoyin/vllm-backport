@@ -582,3 +582,115 @@ if __name__ == "__main__":
             f"OK num_reqs={nr} token_bias={tb} has_idx_mapping={mapping} "
             f"conv_dim_first={dim_first} temporal_tiles={tt}"
         )
+
+
+def _run_precopy_kernel(
+    convs,
+    ssms,
+    block_table,
+    src_col,
+    dst_col,
+    token_bias,
+    conv_state_dim_first,
+):
+    device = block_table.device
+    num_reqs = src_col.numel()
+    base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
+        convs, ssms, device, conv_state_dim_first
+    )
+    block_table_ptrs = torch.tensor(
+        [block_table.data_ptr()], dtype=torch.int64, device=device
+    )
+    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+    grid = (num_reqs, NUM_LAYERS * 2, 1)
+    precopy_mamba_align_fused_kernel[grid](
+        dst_col,
+        src_col,
+        token_bias,
+        block_table_ptrs,
+        block_table.stride(0),
+        base,
+        blk_stride,
+        elem,
+        inner,
+        width,
+        group,
+        drc,
+        drs,
+        idx_mapping,
+        num_reqs,
+        COPY_BLOCK_SIZE=1024,
+        CONV_STATE_DIM_FIRST=conv_state_dim_first,
+        HAS_IDX_MAPPING=True,
+        TEMPORAL_TILES=1,
+    )
+    torch.accelerator.synchronize()
+
+
+@_parametrize("conv_state_dim_first", [False, True])
+@_parametrize(
+    "invalid_lookup",
+    [
+        "destination_oob",
+        "source_oob",
+        "temporal_oob",
+        "null_destination",
+        "null_source",
+    ],
+)
+@_cuda_required
+def test_precopy_invalid_block_lookup_is_fail_closed(
+    conv_state_dim_first, invalid_lookup
+):
+    device = torch.device("cuda")
+    torch.manual_seed(2027)
+    num_blocks = 5
+    convs, ssms = _build_state(num_blocks, device, conv_state_dim_first)
+    conv_before = [state.clone() for state in convs]
+    ssm_before = [state.clone() for state in ssms]
+
+    block_table_storage = torch.zeros(2, MAX_COLS, dtype=torch.int32, device=device)
+    block_table = block_table_storage[:1]
+    block_table[0, 0] = 2
+    block_table[0, 1] = 1
+    block_table[0, 2] = 3
+    src_col = torch.tensor([1], dtype=torch.int32, device=device)
+    dst_col = torch.tensor([0], dtype=torch.int32, device=device)
+    token_bias = torch.tensor([1], dtype=torch.int32, device=device)
+
+    if invalid_lookup == "destination_oob":
+        dst_col.fill_(MAX_COLS)
+        block_table_storage[1, 0] = 2
+    elif invalid_lookup == "source_oob":
+        src_col.fill_(MAX_COLS)
+        block_table_storage[1, 0] = 1
+    elif invalid_lookup == "temporal_oob":
+        src_col.fill_(MAX_COLS - 1)
+        block_table[0, MAX_COLS - 1] = 1
+        block_table_storage[1, 0] = 3
+    elif invalid_lookup == "null_destination":
+        block_table[0, 0] = 0
+    else:
+        block_table[0, 1] = 0
+        block_table[0, 2] = 0
+
+    _run_precopy_kernel(
+        convs,
+        ssms,
+        block_table,
+        src_col,
+        dst_col,
+        token_bias,
+        conv_state_dim_first,
+    )
+
+    for actual, before in zip(convs, conv_before):
+        expected = before.clone()
+        if invalid_lookup == "temporal_oob":
+            if conv_state_dim_first:
+                expected[2, :, : CONV_WIDTH - 1] = before[1, :, 1:]
+            else:
+                expected[2, : CONV_WIDTH - 1] = before[1, 1:]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual, before in zip(ssms, ssm_before):
+        torch.testing.assert_close(actual, before, rtol=0, atol=0)

@@ -148,8 +148,6 @@ def test_ple_offload_request_thread_copies_mrv1_and_stops(
     connector._ngram_context_source = None
     connector._uses_cuda_inputs = False
     connector._pinned_input_buffers = []
-    connector._d2h_stream = None
-    connector._d2h_done_event = None
     connector._request_queue = queue.Queue(maxsize=1)
     connector._request_thread = None
     connector._request_thread_ready = threading.Event()
@@ -194,7 +192,7 @@ def test_ple_offload_request_thread_failure_exits_worker(
 
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU is required")
 def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
-    """Keep MRV2 D2H asynchronous without a second CPU staging buffer."""
+    """Snapshot MRV2 inputs before later PP forwards overwrite their sources."""
     socket = Mock()
     connector = PleOffloadConnector.__new__(PleOffloadConnector)
     connector.device = torch.device("cuda:0")
@@ -251,13 +249,16 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
             tuple(buffer.data_ptr() for buffer in connector._pinned_input_buffers)
             == final_ptrs
         )
-        connector._d2h_stream = torch.cuda.Stream(device=connector.device)
-        connector._d2h_done_event = torch.cuda.Event()
         try:
             connector._launch(num_reqs=2, num_tokens=4)
 
-            # The model thread only records input readiness and queues metadata.
-            assert connector._input_ids_buf.tolist() == [-99, -99, -99, -99]
+            # D2H is already queued on the producer stream, even when the
+            # notifier has not run. Later input preparation must not race it.
+            input_ids.fill_(99)
+            query_start_loc.fill_(99)
+            ngram_context.fill_(99)
+            torch.cuda.current_stream(connector.device).synchronize()
+            assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
             request = connector._request_queue.get_nowait()
             assert request is not None
             connector._process_request(request, socket)
@@ -351,6 +352,37 @@ def test_ple_offload_queued_forward_does_not_wait_for_a_later_batch(
         if worker is not None:
             worker.join(timeout=5)
         connector.close()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA PLE required")
+def test_ple_offload_finishes_outputs_before_runtime_kernel_loading() -> None:
+    """An uncaptured forward must not load CUDA modules with PLE work pending."""
+    device = torch.device("cuda:0")
+    semaphore = CpuGpuSemaphore(device)
+    output = torch.zeros(4, device=device)
+    copy_stream = torch.cuda.Stream(device=device)
+    copied = torch.cuda.Event()
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.device = device
+    connector._launch = Mock()
+    connector._layers = {
+        "ple": SimpleNamespace(_sem=semaphore, _gpu_output_buffer=output)
+    }
+    torch.accelerator.synchronize(device)
+    try:
+        # Represent delayed publication by the CPU worker on another stream.
+        with torch.cuda.stream(copy_stream):
+            torch.cuda._sleep(100_000_000)
+            output.fill_(7)
+            copied.record(copy_stream)
+            semaphore.signal(copy_stream)
+
+        connector.prepare_forward(1, 4, False, synchronize=True)
+
+        assert copied.query(), "Returned with a PLE producer still pending"
+        assert output.tolist() == [7, 7, 7, 7]
+    finally:
+        copy_stream.synchronize()
 
 
 def initialize_kv_cache(runner: GPUModelRunner):

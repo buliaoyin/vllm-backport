@@ -242,6 +242,12 @@ class EncoderCacheManager:
         # The mm_hash not in cache or the req_id set is empty
         if not self.cached.get(mm_hash, None):
             return
+        # Keep the request's shared reference until its last occurrence is freed.
+        if any(
+            request.mm_features[other_id].identifier == mm_hash
+            for other_id in self.request_cached_ids.get(req_id, ())
+        ):
+            return
         self.cached[mm_hash].discard(req_id)
         if not self.cached[mm_hash]:
             num_encoder_embeds = request.get_num_encoder_embeds(input_id)

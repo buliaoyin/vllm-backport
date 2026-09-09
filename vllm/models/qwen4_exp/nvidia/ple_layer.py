@@ -11,6 +11,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -37,14 +38,20 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.model_executor.parameter import PerTensorScaleParameter
+from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.platform_utils import is_uva_available
+from vllm.utils.torch_utils import (
+    direct_register_custom_op,
+    get_accelerator_view_from_cpu_tensor,
+)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
@@ -53,6 +60,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import copy_ple_embedding_shard_
+from .ple_lookup import fused_ple_lookup
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -157,9 +165,23 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
     ) -> None:
         del input_size, output_size, params_dtype
         weight_loader = extra_weight_attrs.get("weight_loader")
-        weight = create_fp8_weight_parameter(
-            sum(output_partition_sizes), input_size_per_partition, weight_loader
-        )
+        if getattr(layer, "_use_uva", False):
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=torch.float8_e4m3fn,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+        else:
+            weight = create_fp8_weight_parameter(
+                sum(output_partition_sizes), input_size_per_partition, weight_loader
+            )
         layer.register_parameter("weight", weight)
 
         weight_scale = create_fp8_scale_parameter(
@@ -182,6 +204,49 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
+
+
+class _PinnedPLEEmbeddingMethod(UnquantizedEmbeddingMethod):
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        weight = nn.Parameter(
+            torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+                device="cpu",
+                pin_memory=True,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(weight, extra_weight_attrs)
+        layer.register_parameter("weight", weight)
+
+
+class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+    """Keep PLE storage in pinned RAM without staging the table on the GPU."""
+
+    def __init__(self, *args, quant_method=None, **kwargs) -> None:
+        if not is_uva_available():
+            raise RuntimeError("VLLM_PLE_USE_UVA requires UVA support")
+        self._use_uva = True
+        super().__init__(
+            *args,
+            quant_method=quant_method or _PinnedPLEEmbeddingMethod(),
+            **kwargs,
+        )
+        # Generic post-load quantization would move the whole table to CUDA.
+        del self.quant_method
+        self.uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
 
 
 def _get_ple_embedding_quant_method(
@@ -218,6 +283,8 @@ def _get_ple_embedding_quant_method(
 
 
 class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+    _offload_quant_method: QuantizeMethodBase | None = None
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -230,6 +297,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         params_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        self.layer_name = prefix.removesuffix(".ple_embedding")
         self.embedding_dim = embedding_dim
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
@@ -286,7 +354,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = VocabParallelEmbedding(
+        embedding_cls = (
+            Qwen4ExpPinnedHostEmbedding
+            if envs.VLLM_PLE_USE_UVA
+            else VocabParallelEmbedding
+        )
+        self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
             params_dtype=params_dtype,
@@ -356,6 +429,16 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         ngram_context: torch.Tensor,
         output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if input_ids.is_cuda:
+            output = torch.empty(
+                (input_ids.numel(), self.embedding_dim),
+                dtype=hidden_states.dtype,
+                device=input_ids.device,
+            )
+            torch.ops.vllm.qwen4_exp_ple_lookup(
+                input_ids, query_start_loc, ngram_context, output, self.layer_name
+            )
+            return output
         del hidden_states
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
@@ -372,9 +455,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 f"at most {self.padded_buffer.shape[0]}"
             )
 
-        # The CPU-offload subprocess is never captured by a CUDA Graph, so its
-        # pack workspace can narrow to the actual maximum sequence length. The
-        # regular GPU path retains the static maximum-width buffer for capture.
+        # The CPU worker can narrow its workspace to the actual sequence length.
         if is_offload_process():
             if num_reqs <= 0:
                 raise ValueError("PLE CPU offload requires at least one request")
@@ -455,6 +536,15 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if hasattr(self, "_offload_weight_scale"):
             return torch.float8_e4m3fn
         return default_dtype
+
+    def initialize_dummy_offload_metadata(self, device: torch.device) -> None:
+        """Dummy loaders skip the FP8 scale normally retained by GPU placeholders."""
+        if isinstance(self._offload_quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
+            self.register_buffer(
+                "_offload_weight_scale",
+                torch.ones((), dtype=torch.bfloat16, device=device),
+                persistent=False,
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -570,6 +660,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
+        if envs.VLLM_PLE_USE_UVA and envs.VLLM_PLE_CPU_OFFLOAD:
+            raise ValueError(
+                "VLLM_PLE_USE_UVA and VLLM_PLE_CPU_OFFLOAD are mutually exclusive"
+            )
         # The offload process builds the surrounding model on meta while
         # this subtree must own real CPU storage. GPU workers skip the
         # subclass constructor and retain only an empty IPC placeholder.
@@ -583,6 +677,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"{prefix}.ple_embedding",
                 quant_config=quant_config,
                 params_dtype=model_config.dtype,
+            )
+        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+            self.ple_embedding._offload_quant_method = _get_ple_embedding_quant_method(
+                quant_config,
+                f"{prefix}.ple_embedding.ngram_embedding",
+                storage_dtype=getattr(config, "ple_embedding_dtype", None),
             )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
@@ -1216,6 +1316,58 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             self.prefix,
         )
         return gated_value.flatten(-2) + conv_output
+
+
+def qwen4_exp_ple_lookup(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Use the current request layout outside piecewise CUDA graphs."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    ngram = layer.ple_embedding
+    embedding = ngram.ngram_embedding
+    fused_ple_lookup(
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        ngram.layer_multipliers,
+        ngram.ngram_heads_vocab_sizes,
+        ngram.ngram_heads_offsets,
+        (
+            embedding.uva_weight
+            if isinstance(embedding, Qwen4ExpPinnedHostEmbedding)
+            else embedding.weight
+        ),
+        eos_token_id=ngram.eos_token_id,
+        heads_per_ngram=ngram.heads_per_ngram,
+        tp_start=embedding.shard_indices.org_vocab_start_index,
+        tp_end=embedding.shard_indices.org_vocab_end_index,
+        output=output,
+        weight_scale=layer._get_embedding_weight_scale(),
+    )
+    if embedding.tp_size > 1:
+        output.copy_(tensor_model_parallel_all_reduce(output))
+
+
+def qwen4_exp_ple_lookup_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    pass
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_lookup",
+    op_func=qwen4_exp_ple_lookup,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_lookup_fake,
+)
 
 
 def qwen4_exp_ple_short_conv(

@@ -329,6 +329,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_USE_UVA: bool = False
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -2354,8 +2355,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
-    # Run n-gram PLE lookup in a dedicated CPU offload worker. The initial
-    # implementation supports ModelRunner V1 and single-node TP only.
+    # Read pinned PLE tables from CUDA; mutually exclusive with CPU offload.
+    "VLLM_PLE_USE_UVA": lambda: bool(int(os.getenv("VLLM_PLE_USE_UVA", "0"))),
+    # Run n-gram PLE lookup in a dedicated CPU offload worker.
     "VLLM_PLE_CPU_OFFLOAD": lambda: (
         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
     ),
