@@ -1217,8 +1217,8 @@ class KpoolTailManager(FullAttentionManager):
     """Fixed 1-block-per-request circular buffer for ``KpoolTailSpec``.
 
     The GLM-5.3-Flash kpool indexer tail cache holds the incomplete
-    pool's raw K + gate score: exactly one block of ``kpool`` slots per request,
-    overwritten in place by ``pos % kpool`` as decode/spec-decode advances.
+    pool's raw K + gate score: one block per request, with extra ring slots
+    to preserve committed tokens when speculative lookahead is rejected.
     Prefill seeds it; the connector transfers it across PD; decode reads it to
     compress the boundary pool correctly.
 
@@ -1228,8 +1228,7 @@ class KpoolTailManager(FullAttentionManager):
     ``SlidingWindowManager.remove_skipped_blocks`` would evict the in-progress
     pool's earlier tokens mid-pool (before completion, before PD transfer),
     which is fatal. Because the block is circularly reused, allocation is
-    independent of sequence length and of MTP size (MTP > kpool still fits in
-    one block: completed pools flush mid-step).
+    independent of sequence length. The block capacity includes MTP lookahead.
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False

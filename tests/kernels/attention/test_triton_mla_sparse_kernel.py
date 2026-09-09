@@ -114,3 +114,41 @@ def test_short_prefill_no_nan(num_kv_splits, kv_cache):
     )
     assert not torch.isnan(out).any()
     assert not torch.isinf(out).any()
+
+
+@pytest.mark.parametrize("head_dim", [512, 576])
+@pytest.mark.parametrize("splits", [1, 4])
+def test_padding_patterns_match_attention_after_graph_replay(head_dim, splits):
+    """Padding density may change between replays of the same captured graph."""
+    torch.manual_seed(42)
+    q = torch.randn(3, 16, head_dim, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(1024, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    indices = torch.full((3, 1, 2176), -1, dtype=torch.int32, device="cuda")
+    patterns = indices.clone()
+    patterns[0, 0, :600] = torch.arange(600, device="cuda")
+    patterns[1, 0, :32] = torch.arange(32, device="cuda")
+    patterns[1, 0, 2048:2051] = torch.tensor([63, 64, 65], device="cuda")
+    patterns[1, 0, 511] = kv.shape[0]  # invalid positive probe, like other padding
+    indices.copy_(patterns)
+    triton_mla_sparse_attention(q, kv, indices, 0.0625, num_kv_splits=splits)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = triton_mla_sparse_attention(
+            q, kv, indices, 0.0625, num_kv_splits=splits
+        )
+    for shift in range(3):
+        indices.copy_(patterns.roll(shift, dims=0))
+        graph.replay()
+        for row in range(3):
+            selected = indices[row, 0]
+            selected = selected[(selected >= 0) & (selected < kv.shape[0])].long()
+            if selected.numel() == 0:
+                assert torch.count_nonzero(output[row]).item() == 0
+                continue
+            keys = kv[selected, 0].float()
+            probabilities = torch.softmax((q[row].float() @ keys.T) * 0.0625, dim=-1)
+            expected = probabilities @ keys[:, :512]
+            torch.testing.assert_close(
+                output[row].float(), expected, rtol=0.02, atol=0.01
+            )

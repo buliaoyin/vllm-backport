@@ -139,6 +139,7 @@ from vllm.v1.worker.gpu.pp_utils import (
     PPHandler,
     PPRecvBufferGuard,
     PPRecvBufferState,
+    scatter_draft_tokens,
 )
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
@@ -1162,10 +1163,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 idx_mapping = outputs["idx_mapping"]
                 self.postprocess_sampled(**outputs)
                 if draft_tokens is not None:
-                    valid = idx_mapping >= 0
-                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
-                        valid
-                    ]
+                    scatter_draft_tokens(
+                        self.req_states.draft_tokens, draft_tokens, idx_mapping
+                    )
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:

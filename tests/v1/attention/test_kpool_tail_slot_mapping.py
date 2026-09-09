@@ -358,3 +358,36 @@ def test_interleaved_decode_pollution_legacy_vs_circular():
 
     # The circular mapping keeps the rings isolated under interleaving.
     torch.testing.assert_close(circular, ground_truth)
+
+
+@pytest.mark.parametrize("num_spec,capacity", [(0, 4), (1, 8), (3, 8), (4, 8), (7, 12)])
+def test_tail_capacity_retains_the_pool_before_rejected_lookahead(num_spec, capacity):
+    from vllm.models.glm5next.nvidia.attention import Glm5NextTailCache
+
+    spec = Glm5NextTailCache.get_kv_cache_spec(
+        SimpleNamespace(_index_kpool=4, head_dim=128),
+        SimpleNamespace(num_speculative_tokens=num_spec),
+    )
+    assert spec.block_size == spec.sliding_window == capacity
+    positions, qsl, slots, num_actual, num_reqs = make_batch(
+        [[9, 10, 11, 12], [16, 17]], padded_len=8
+    )
+    out = torch.empty_like(slots)
+    actual = compute_kpool_tail_slot_mapping(
+        slots,
+        make_tail_block_table([3, 7]),
+        qsl,
+        positions,
+        num_actual,
+        num_reqs,
+        spec.block_size,
+        out_full=out,
+    )
+    expected = torch.cat(
+        [
+            3 * capacity + positions[:4] % capacity,
+            7 * capacity + positions[4:] % capacity,
+            torch.full((2,), -1, dtype=slots.dtype),
+        ]
+    )
+    torch.testing.assert_close(actual, expected)

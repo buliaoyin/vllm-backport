@@ -293,8 +293,10 @@ def _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos):
 
 
 @pytest.mark.parametrize("pool_size", [4, 16])
-def test_decode_writer_matches_prefill_writer(pool_size):
+@pytest.mark.parametrize("ring_pools", [1, 2, 3])
+def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
     """Compare production decode and prefill writers for pool sizes 4 and 16."""
+    ring = pool_size * ring_pools
     n_pools, page, nblk = 8, 64, 4
     n_tok = n_pools * pool_size
     dev = "cuda"
@@ -317,14 +319,14 @@ def test_decode_writer_matches_prefill_writer(pool_size):
 
     # One request owning tail block 0, fed one token per decode step.
     kv_decode = torch.zeros_like(kv_prefill)
-    tail = torch.zeros(nblk, 2, pool_size, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    tail = torch.zeros(nblk, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device=dev)
     for t in range(n_tok):
         completes = t % pool_size == pool_size - 1
         kpool_decode_update_and_maybe_write_cache_batched(
             kv_decode,
             tail,
             # token-granular: every token has a valid tail slot
-            torch.tensor([[t % pool_size]], dtype=torch.int32, device=dev),
+            torch.tensor([[t % ring]], dtype=torch.int32, device=dev),
             k[t].view(1, 1, HEAD_DIM),
             score[t].view(1, 1, HEAD_DIM),
             ape,
@@ -338,17 +340,7 @@ def test_decode_writer_matches_prefill_writer(pool_size):
             round_scale=ROUND_SCALE,
         )
 
-    differing = [
-        p
-        for p in range(n_pools)
-        if not torch.equal(
-            kv_prefill[p // page, p % page], kv_decode[p // page, p % page]
-        )
-    ]
-    assert not differing, (
-        f"decode-written pools differ from prefill-written pools: "
-        f"{len(differing)}/{n_pools} (pool_size={pool_size}, first={differing[:5]})"
-    )
+    torch.testing.assert_close(kv_decode, kv_prefill, rtol=0, atol=0)
 
 
 def test_leading_invalid_tail_slot():
@@ -384,12 +376,12 @@ def test_leading_invalid_tail_slot():
     _assert_eq(r_ref, r_kern)
 
 
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm required")
-def test_amd_prefill_seed_honors_padded_tail_block_stride():
+@pytest.mark.parametrize("ring", [4, 8, 12])
+def test_prefill_seed_honors_padded_tail_block_stride(ring):
     """The tail shares a padded indexer allocation in production."""
     kpool = 4
     num_blocks = 6
-    logical_block_elems = 2 * kpool * HEAD_DIM
+    logical_block_elems = 2 * ring * HEAD_DIM
     padded_block_elems = logical_block_elems + 256
     sentinel = -123.0
     backing = torch.full(
@@ -400,16 +392,16 @@ def test_amd_prefill_seed_honors_padded_tail_block_stride():
     )
     tail = torch.as_strided(
         backing,
-        size=(num_blocks, 2, kpool, HEAD_DIM),
-        stride=(padded_block_elems, kpool * HEAD_DIM, HEAD_DIM, 1),
+        size=(num_blocks, 2, ring, HEAD_DIM),
+        stride=(padded_block_elems, ring * HEAD_DIM, HEAD_DIM, 1),
     )
 
     block = 3
-    ring_slot = 2
+    ring_slot = ring - 2
     key = torch.arange(HEAD_DIM, dtype=torch.bfloat16, device="cuda").unsqueeze(0)
     score = (key + 256).to(torch.bfloat16)
     tail_slot = torch.tensor(
-        [block * kpool + ring_slot], dtype=torch.int32, device="cuda"
+        [block * ring + ring_slot], dtype=torch.int32, device="cuda"
     )
 
     kpool_seed_tail_cache(tail, key, score, tail_slot, kpool, HEAD_DIM)
@@ -418,7 +410,7 @@ def test_amd_prefill_seed_honors_padded_tail_block_stride():
     assert torch.equal(tail[block, 0, ring_slot], key[0])
     assert torch.equal(tail[block, 1, ring_slot], score[0])
 
-    compact_offset = (block * 2 * kpool + ring_slot) * HEAD_DIM
+    compact_offset = (block * 2 * ring + ring_slot) * HEAD_DIM
     assert torch.all(backing[compact_offset : compact_offset + HEAD_DIM] == sentinel)
 
 
@@ -547,3 +539,68 @@ def test_batched_matches_reference_fuzz(seed):
     r_ref = _torch_reference(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     r_kern = _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     _assert_eq(r_ref, r_kern)
+
+
+@pytest.mark.parametrize("num_spec", [1, 3, 7])
+@pytest.mark.parametrize("start_offset", [0, 1, 2, 3])
+@pytest.mark.parametrize("seed_prefill", [False, True])
+def test_rejected_drafts_preserve_committed_pool_tail(
+    num_spec, start_offset, seed_prefill
+):
+    """Replaying rejected drafts must match compression of the true tokens."""
+    pool, page, nblk = 4, 64, 3
+    ring = pool * math.ceil((pool + num_spec) / pool)
+    start = 2 * ring + start_offset
+    n_tok = ((start + num_spec + pool) // pool) * pool
+    torch.manual_seed(1)
+    key = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    score = torch.randn_like(key)
+    ape = torch.randn(pool, HEAD_DIM, dtype=torch.float32, device="cuda")
+    reference = torch.zeros(nblk, page, HEAD_DIM + 4, dtype=torch.uint8, device="cuda")
+    kpool_compress_and_write_cache(
+        reference,
+        key.view(-1, pool, HEAD_DIM),
+        score.view(-1, pool, HEAD_DIM),
+        ape,
+        torch.arange(n_tok // pool, device="cuda"),
+        pool_size=pool,
+        head_dim=HEAD_DIM,
+        round_scale=ROUND_SCALE,
+    )
+    cache = torch.zeros_like(reference)
+    tail = torch.zeros(nblk, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+
+    def step(positions, keys, scores):
+        pos = torch.tensor([positions], dtype=torch.int32, device="cuda")
+        slots = torch.where(pos % pool == pool - 1, pos // pool, -1)
+        kpool_decode_update_and_maybe_write_cache_batched(
+            cache,
+            tail,
+            ring + pos % ring,
+            keys.view(1, -1, HEAD_DIM),
+            scores.view(1, -1, HEAD_DIM),
+            ape,
+            slots,
+            pos,
+            pool,
+            HEAD_DIM,
+            round_scale=ROUND_SCALE,
+        )
+
+    for t in range(start):
+        step([t], key[t], score[t])
+    if seed_prefill:
+        tail.zero_()
+        positions = torch.arange(start, dtype=torch.int32, device="cuda")
+        kpool_seed_tail_cache(
+            tail, key[:start], score[:start], ring + positions % ring, pool, HEAD_DIM
+        )
+    step(
+        list(range(start, start + num_spec + 1)),
+        torch.cat([key[start : start + 1], torch.randn_like(key[:num_spec])]),
+        torch.cat([score[start : start + 1], torch.randn_like(score[:num_spec])]),
+    )
+    # Only the first token was accepted; redo every draft with its true value.
+    for t in range(start + 1, n_tok):
+        step([t], key[t], score[t])
+    torch.testing.assert_close(cache, reference, rtol=0, atol=0)

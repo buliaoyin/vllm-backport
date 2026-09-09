@@ -48,7 +48,7 @@ _SPLIT_MAX_OCCUPANCY = 4  # skip split when baseline grid fills >=1/4 of SMs
 
 
 @triton.jit
-def _sparse_mla_compute_tile(
+def _sparse_mla_compute_tile_impl(
     q_buffer,
     k_buffer,  # V is the first BLOCK_DV lanes of each row of k_buffer.
     indices_ptr,
@@ -71,6 +71,7 @@ def _sparse_mla_compute_tile(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    SKIP_EMPTY: tl.constexpr,
 ):
     """Shared stage-1 body: load Q, run the sparse online-softmax loop over
     `[split_start, split_end)` of the topk axis, return accumulators."""
@@ -118,45 +119,140 @@ def _sparse_mla_compute_tile(
         )
         mask_kv = (indices >= 0) & (indices < seq_kv)
 
-        offs_k = (
-            indices[None, :].to(tl.int64) * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_d[:, None]
-        )
-        k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
-        qk = tl.dot(q, k.to(q.dtype))
-
-        if BLOCK_DPE > 0:
-            offs_kpe = (
+        if not SKIP_EMPTY or tl.sum(mask_kv.to(tl.int32)) > 0:
+            offs_k = (
                 indices[None, :].to(tl.int64) * stride_kv_token
                 + cur_kv_head_id * stride_kv_head
-                + offs_dpe[:, None]
+                + offs_d[:, None]
             )
-            kpe = tl.load(
-                k_buffer + offs_kpe,
-                mask=mask_kv[None, :],
-                other=0.0,
+            k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
+            qk = tl.dot(q, k.to(q.dtype))
+
+            if BLOCK_DPE > 0:
+                offs_kpe = (
+                    indices[None, :].to(tl.int64) * stride_kv_token
+                    + cur_kv_head_id * stride_kv_head
+                    + offs_dpe[:, None]
+                )
+                kpe = tl.load(
+                    k_buffer + offs_kpe,
+                    mask=mask_kv[None, :],
+                    other=0.0,
+                )
+                qk += tl.dot(qpe, kpe.to(q.dtype))
+
+            qk *= sm_scale
+            qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
+
+            offs_v = (
+                indices[:, None].to(tl.int64) * stride_kv_token
+                + cur_kv_head_id * stride_kv_head
+                + offs_dv[None, :]
             )
-            qk += tl.dot(qpe, kpe.to(q.dtype))
+            v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
 
-        qk *= sm_scale
-        qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp2(e_max - n_e_max)
+            p = tl.exp2(qk - n_e_max[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
 
-        offs_v = (
-            indices[:, None].to(tl.int64) * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_dv[None, :]
+    return acc, e_max, e_sum
+
+
+@triton.jit
+def _sparse_mla_compute_tile(
+    q_buffer,
+    k_buffer,  # V is the first BLOCK_DV lanes of each row of k_buffer.
+    indices_ptr,
+    cur_q,
+    cur_head,
+    cur_kv_head_id,
+    mask_h,
+    split_start,
+    split_end,
+    seq_kv,
+    stride_q_token,
+    stride_q_head,
+    stride_kv_token,
+    stride_kv_head,
+    stride_indices_token,
+    stride_indices_head,
+    sm_scale,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+):
+    skip_empty = False
+    if BLOCK_DPE == 0:
+        # A missing early index usually means a short, heavily padded history.
+        # Both loops accept arbitrary padding; the probe only selects their cost.
+        probe = tl.maximum(0, tl.minimum(511, split_end - 1))
+        index = tl.load(
+            indices_ptr
+            + cur_q * stride_indices_token
+            + cur_kv_head_id * stride_indices_head
+            + probe,
+            mask=split_end > 0,
+            other=-1,
         )
-        v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
-
-        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp2(e_max - n_e_max)
-        p = tl.exp2(qk - n_e_max[:, None])
-        acc *= re_scale[:, None]
-        acc += tl.dot(p.to(v.dtype), v)
-        e_sum = e_sum * re_scale + tl.sum(p, 1)
-        e_max = n_e_max
-
+        skip_empty = (index < 0) | (index >= seq_kv)
+    if skip_empty:
+        acc, e_max, e_sum = _sparse_mla_compute_tile_impl(
+            q_buffer,
+            k_buffer,
+            indices_ptr,
+            cur_q,
+            cur_head,
+            cur_kv_head_id,
+            mask_h,
+            split_start,
+            split_end,
+            seq_kv,
+            stride_q_token,
+            stride_q_head,
+            stride_kv_token,
+            stride_kv_head,
+            stride_indices_token,
+            stride_indices_head,
+            sm_scale,
+            BLOCK_H,
+            BLOCK_N,
+            BLOCK_DV,
+            BLOCK_DMODEL,
+            BLOCK_DPE,
+            True,
+        )
+    else:
+        acc, e_max, e_sum = _sparse_mla_compute_tile_impl(
+            q_buffer,
+            k_buffer,
+            indices_ptr,
+            cur_q,
+            cur_head,
+            cur_kv_head_id,
+            mask_h,
+            split_start,
+            split_end,
+            seq_kv,
+            stride_q_token,
+            stride_q_head,
+            stride_kv_token,
+            stride_kv_head,
+            stride_indices_token,
+            stride_indices_head,
+            sm_scale,
+            BLOCK_H,
+            BLOCK_N,
+            BLOCK_DV,
+            BLOCK_DMODEL,
+            BLOCK_DPE,
+            False,
+        )
     return acc, e_max, e_sum
 
 

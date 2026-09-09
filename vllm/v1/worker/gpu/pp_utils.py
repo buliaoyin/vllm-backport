@@ -11,8 +11,50 @@ import torch
 
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+
+@triton.jit
+def _scatter_draft_tokens_kernel(
+    dst,
+    src,
+    indices,
+    dst_stride: tl.constexpr,
+    src_stride: tl.constexpr,
+    idx_stride: tl.constexpr,
+    width: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    index = tl.load(indices + row * idx_stride)
+    if index < 0:
+        return
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(src + row * src_stride + offsets, offsets < width, other=0)
+    tl.store(dst + index * dst_stride + offsets, values, offsets < width)
+
+
+def scatter_draft_tokens(
+    dst: torch.Tensor, src: torch.Tensor, indices: torch.Tensor
+) -> None:
+    """Scatter request rows, skipping padding without a device-to-host sync."""
+    rows, width = src.shape
+    assert dst.shape[1] == width and indices.shape == (rows,)
+    assert dst.stride(1) == src.stride(1) == 1
+    if rows == 0 or width == 0:
+        return
+    _scatter_draft_tokens_kernel[(rows,)](
+        dst,
+        src,
+        indices,
+        dst.stride(0),
+        src.stride(0),
+        indices.stride(0),
+        width,
+        BLOCK=triton.next_power_of_2(width),
+    )
 
 
 class PPRecvBufferState(Enum):

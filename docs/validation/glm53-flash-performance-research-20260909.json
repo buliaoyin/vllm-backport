@@ -1,0 +1,590 @@
+{
+  "research_date": "2026-09-09",
+  "recorded_at_utc": "2026-09-09T08:04:32.302068+00:00",
+  "local_head": "9d12faf89bfbcd7280e966b4f1479b001bc85864",
+  "local_branch": "codex/deepseek-v4-vision-tested",
+  "scope": "Read-only source and public PR/fork research; no new model benchmarks or runtime changes",
+  "raw_artifacts": "/tmp/glm53-research-20260909",
+  "backport_forks": [
+    {
+      "repo": "forwis/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "chenqi123/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "clascclon/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "5cc80fc389d5d7ebb5e957714b25cbf9645dc922",
+          "ref": "community/dsv4-vision-sm80"
+        },
+        {
+          "sha": "b3296fcfe7959293b116b2df929651fcf1794843",
+          "ref": "local/dsv4-vision-sm80"
+        },
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "lzf-tech/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "lllyyyqqq/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "snailwei/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "lalalabreeze/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "304d6b1d7a9fa1fb889720317bdf0af4a1ea3e53",
+          "ref": "fix/glm5next-fp8-pp-missing-layer"
+        },
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "okcodemaybe/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "feiyucq/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "d97324fb04244a918c35311b685e6a3a69142261",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "averyaveavi-netizen/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "0ef4bff219c098d48cf16d3d63ebef329e9b74b0",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "zhangjiekui/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "0ef4bff219c098d48cf16d3d63ebef329e9b74b0",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "leflakk/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "e8953f6e50b2790668b2c6739e38b84bb30fc342",
+          "ref": "dsv4v"
+        },
+        {
+          "sha": "0ef4bff219c098d48cf16d3d63ebef329e9b74b0",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "Karl0007/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "a9500a205f8e158a710667982fc0e2481550d9d4",
+          "ref": "cmp170hx"
+        },
+        {
+          "sha": "0ef4bff219c098d48cf16d3d63ebef329e9b74b0",
+          "ref": "master"
+        },
+        {
+          "sha": "3b890f43edb5ad2c5e696b65d8782f16b3d2e46b",
+          "ref": "pr/glm-pp-mhc-handoff"
+        },
+        {
+          "sha": "55fc37470e85d56d2508935fd3577ae03823bce2",
+          "ref": "pr/mamba-pp-state-corruption"
+        },
+        {
+          "sha": "4a23c6b64bf813f3cb74f2e6b3aa97dc61865358",
+          "ref": "pr/mtp-embed-from-checkpoint"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "kaka86mm/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "fb4a3d9e37616e6f0c3e8dca63210808e00a36d7",
+          "ref": "master"
+        },
+        {
+          "sha": "4d1acaf05853a2a5f87fc48f4e084e3f1a6aedb5",
+          "ref": "ple-pp-qwen38-flash-next"
+        },
+        {
+          "sha": "5cc80fc389d5d7ebb5e957714b25cbf9645dc922",
+          "ref": "pr/vision-sm80"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "344303947/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "fb4a3d9e37616e6f0c3e8dca63210808e00a36d7",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "TheInfamousJrod/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "fb4a3d9e37616e6f0c3e8dca63210808e00a36d7",
+          "ref": "master"
+        },
+        {
+          "sha": "2bac08103c25764f738814fc7ca0a5cba73dcee1",
+          "ref": "qwen38-flash-next-mtp3-sm86"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "HirokiChin/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "611e908e6350d022bad9f7cc383fec0ae3f9468a",
+          "ref": "codex/fix-glm53-mtp-processor"
+        },
+        {
+          "sha": "13acfebd73e062b3c9004f1adee6fd568de2968f",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "superlowstar/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "b49657b63718f2f549d3744df09f0b940f065d71",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "artlair/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "0a58c55b788f635f979ddd7d1f1ea8e5074aebb4",
+          "ref": "glm53-flash"
+        },
+        {
+          "sha": "16f00c3f7262fddcc2a767a96e8ef365579957a3",
+          "ref": "glm53-kpool-tail"
+        },
+        {
+          "sha": "60170fe84eace9a5b529186c953a6ab5d301646e",
+          "ref": "glm53-launch-cost"
+        },
+        {
+          "sha": "2a576a6b2c9955497aafe5f80c0c63c96d2daef0",
+          "ref": "glm53-padlane-fix"
+        },
+        {
+          "sha": "444369bb2b0d2b5e0fd3d27d52e7491e2d1431d6",
+          "ref": "glm53-pp-ubatch"
+        },
+        {
+          "sha": "2674c8bb6d8799b32158c94bee33356d84772a2a",
+          "ref": "master"
+        },
+        {
+          "sha": "82a9f246e16d80f14c7a6573d20b228e4ba4fac1",
+          "ref": "qwen38-next"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "shiyukonghui/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "f8e7e3b5882ffd92f5278cb76a08c721d4471ec1",
+          "ref": "fix/glm-mtp-kpool-slot-mapping"
+        },
+        {
+          "sha": "e2353c13a7f79480a6a6ddc2c1d99ba81c85fc7a",
+          "ref": "master"
+        },
+        {
+          "sha": "a56e577e31e364f8430aa40dc328873efc274d9e",
+          "ref": "port/qwen4-exp"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "workcode-del/vllm-backport",
+      "ok": true,
+      "refs": [],
+      "error": null
+    },
+    {
+      "repo": "diyang1354/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "0330bfe7302dffc045d6319270eb4ae4a5077b78",
+          "ref": "dsv4-a6000-opt"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "sjug/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "e8953f6e50b2790668b2c6739e38b84bb30fc342",
+          "ref": "dsv4-a6000-opt"
+        },
+        {
+          "sha": "7924e948bd7e1cdfeda9a1d34c6011e362cc8409",
+          "ref": "feat/dsv4-vision-sm80"
+        },
+        {
+          "sha": "5b3747bdb9832e21f01732169b535f098bd4701c",
+          "ref": "fix/dsv4-sm80-mhc-backport"
+        },
+        {
+          "sha": "ea01d2fe78955eb488061fc723dda30c9ef97e95",
+          "ref": "perf/haosdent-ports"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "Shylift/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "321e155a0b963ef2076b9796688c68c7d84b87d4",
+          "ref": "dsv4-a6000-opt"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "lin285170/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "f523a7b0631253549d936362f7ae7067019f2dee",
+          "ref": "dsv4-vision-exp"
+        },
+        {
+          "sha": "3bec275739c6f4cc7c2ff403d0556d477e4d0f33",
+          "ref": "master"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "FlapperChen/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "40712085a42231eae0cea5a69fb712b777cab0a4",
+          "ref": "dsv4-a6000-opt"
+        }
+      ],
+      "error": null
+    },
+    {
+      "repo": "james2v/vllm-backport",
+      "ok": true,
+      "refs": [
+        {
+          "sha": "df0106585c7e13f67f5b1ea0890336641ff82ad2",
+          "ref": "dsv4-a6000-opt"
+        }
+      ],
+      "error": null
+    }
+  ],
+  "upstream_prs": [
+    {
+      "number": 53781,
+      "title": "[3/N] HiSparse: host-resident sparse-MLA decode hot-buffering",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53781",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-09T03:09:43Z",
+      "merged_at": null,
+      "head_repo": "vllm-project/vllm",
+      "head_ref": "feat/hisparse-mla-decode-main",
+      "head_sha": "c2e4512a8bfdcf12dda19da368af256caea57a53"
+    },
+    {
+      "number": 54524,
+      "title": "[Kernel] Make FlashInfer CuTeDSL the default unquantized BF16 GEMM and drop skinny-GEMM dispatch",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54524",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-04T08:33:08Z",
+      "merged_at": null,
+      "head_repo": "zyongye/vllm",
+      "head_ref": "flashinfer-cutedsl-default-bf16-gemm",
+      "head_sha": "c0cab8ca300763ed59978a67246b6cfa7a55a860"
+    },
+    {
+      "number": 54790,
+      "title": "[Spec Decode] Enable fused draft metadata updates for sparse MLA backends under DCP",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54790",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-06T05:41:52Z",
+      "merged_at": null,
+      "head_repo": "Leoyzen/vllm",
+      "head_ref": "feat/fused-draft-decode-sparse-mla-dcp",
+      "head_sha": "168bfd56b9d89927ab346f6d1bdbd6e391bd8b43"
+    },
+    {
+      "number": 54929,
+      "title": "[Attention] Portable Triton sparse-MLA fallback for SM12x (consumer Blackwell)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54929",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-09T07:35:18Z",
+      "merged_at": null,
+      "head_repo": "Hivenet-Igor/vllm",
+      "head_ref": "sm12x-triton-sparse-mla",
+      "head_sha": "e6e584d6a29bc8e10c9c843a6af391bc81505e8f"
+    },
+    {
+      "number": 54951,
+      "title": "[Perf][GLM-5.3-Flash] Shard long-context indexer prefill rows across TP",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54951",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-09T04:25:14Z",
+      "merged_at": null,
+      "head_repo": "zigzagcai/vllm",
+      "head_ref": "newly-optimize-GLM-5.3-Flash-long-context",
+      "head_sha": "b466281a9ab20e483444736f85d650418ca40d44"
+    },
+    {
+      "number": 55219,
+      "title": "[KV Cache] GLM-5.3-Flash: use the generic packed KV layout; CircularBufferSpec tail with speculative ring slots",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55219",
+      "state": "open",
+      "draft": true,
+      "updated_at": "2026-09-06T03:21:58Z",
+      "merged_at": null,
+      "head_repo": "ivanium/vllm",
+      "head_ref": "refactor/glm-release",
+      "head_sha": "6712aa109b856d2fefd75a28084db358eb7f9e1b"
+    },
+    {
+      "number": 55222,
+      "title": "[Bugfix] GLM-5.3-Flash: fp8 plan dtype on SM90 sparse MLA, and right-size the indexer prefill workspace",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55222",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-07T14:41:31Z",
+      "merged_at": null,
+      "head_repo": "drakosha/vllm",
+      "head_ref": "fix-glm53-sm90-fp8-and-workspace",
+      "head_sha": "24b07cd3b099400b10a4a4bd58626216ebbd5b9f"
+    },
+    {
+      "number": 55277,
+      "title": "[Bugfix][SM120][MLA] Support NoPE sparse MLA (GLM-5.3-Flash) on the FlashInfer SM120 backend",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55277",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-04T06:01:10Z",
+      "merged_at": null,
+      "head_repo": "lucifer1004/vllm",
+      "head_ref": "pr/glm53-nope-sm120",
+      "head_sha": "8d09804c877c48165c6ba69bc9dc02d09bae0b83"
+    },
+    {
+      "number": 55423,
+      "title": "[Spec Decode] Enable GLM-5.3-Flash DFlash2 on NVIDIA",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55423",
+      "state": "open",
+      "draft": true,
+      "updated_at": "2026-09-08T12:43:46Z",
+      "merged_at": null,
+      "head_repo": "zixi-qi/vllm",
+      "head_ref": "glm53-dflash2-support",
+      "head_sha": "374e367e2b87ee65332b03468b76dc4c40e69519"
+    },
+    {
+      "number": 55442,
+      "title": "[Bugfix][Model][Spec Decode] Defer disposable GLM MTP head",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55442",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-08T19:29:03Z",
+      "merged_at": null,
+      "head_repo": "lucamotz/vllm",
+      "head_ref": "codex/defer-glm-mtp-head",
+      "head_sha": "a3d341f3a472ea35e68055b90e8bdc45264e1146"
+    },
+    {
+      "number": 55682,
+      "title": "[Spec Decode] GLM-5.3-Flash DFlash2 aux hidden-state capture",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55682",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-07T08:58:54Z",
+      "merged_at": null,
+      "head_repo": "Leoyzen/vllm",
+      "head_ref": "pr-a-aux-capture",
+      "head_sha": "7998c9aa8247008d7b3493bfd32028dd21db21e1"
+    },
+    {
+      "number": 55736,
+      "title": "[Perf][GLM-5.3-Flash] Decode hot-path cleanups: strided KDA recurrent inputs, NoPE MQA query without concat, no duplicate router GEMM",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55736",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-09T07:25:56Z",
+      "merged_at": null,
+      "head_repo": "JaredforReal/vllm",
+      "head_ref": "perf/glm53-flash-decode-cleanups",
+      "head_sha": "aece03a807d4250fa7b03b220175515fab26dc76"
+    },
+    {
+      "number": 55737,
+      "title": "[Perf][GLM-5.3-Flash] Use FlashKDA for KDA chunked prefill (1.7-3.8x faster than the Triton chunk path)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55737",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-09T07:16:05Z",
+      "merged_at": null,
+      "head_repo": "JaredforReal/vllm",
+      "head_ref": "perf/glm53-flash-flashkda",
+      "head_sha": "8050130234a519ab2aae2e3a04e42634a253254a"
+    },
+    {
+      "number": 55738,
+      "title": "[Perf][GLM-5.3-Flash] Dense/masked-MHA sparse prefill for the NoPE (256, 0, 256) layout + skip the NoPE K concat",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55738",
+      "state": "open",
+      "draft": false,
+      "updated_at": "2026-09-09T07:10:39Z",
+      "merged_at": null,
+      "head_repo": "JaredforReal/vllm",
+      "head_ref": "perf/glm53-flash-masked-mha",
+      "head_sha": "679cd7222e70a144074ab0b49670f9be6773ebac"
+    }
+  ],
+  "upstream_glm_search_total": 158,
+  "selected_fork_snapshots": [
+    {
+      "repo": "promisezackr/glm53-flash-170hx-pp8",
+      "sha": "90ec72e9525e90be701e742c70a20c4154418307"
+    },
+    {
+      "repo": "voipmonitor/vllm",
+      "ref": "integration/glm-scheduler-hardening-20260908",
+      "sha": "9ff42d83938e74018f9c255e8cfa7ca6df6921b0"
+    },
+    {
+      "repo": "artlair/vllm-backport",
+      "ref": "glm53-launch-cost",
+      "sha": "60170fe84eace9a5b529186c953a6ab5d301646e"
+    },
+    {
+      "repo": "wtdcode/vllm-backport",
+      "ref": "master",
+      "sha": "85f227da62bbcc851cdf32a841b4b92017a0f02f"
+    }
+  ]
+}

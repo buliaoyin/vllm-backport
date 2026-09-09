@@ -21,7 +21,6 @@ def make_handler(
     *,
     is_last_rank: bool,
     num_speculative_steps: int,
-    relay_draft_tokens: bool,
     world_size: int = 2,
 ) -> PPHandler:
     """Build a real PPHandler with the PP group stubbed out."""
@@ -36,7 +35,6 @@ def make_handler(
         max_num_reqs=8,
         num_speculative_steps=num_speculative_steps,
         device=torch.device("cuda"),
-        relay_draft_tokens=relay_draft_tokens,
     )
 
 
@@ -90,7 +88,6 @@ def test_broadcast_pads_sampled_tokens_to_max_sample_len(monkeypatch, width, num
         monkeypatch,
         is_last_rank=True,
         num_speculative_steps=num_spec,
-        relay_draft_tokens=True,
     )
     calls = record_broadcasts(monkeypatch)
     input_batch = make_input_batch()
@@ -113,9 +110,7 @@ def test_broadcast_pads_sampled_tokens_to_max_sample_len(monkeypatch, width, num
 @requires_cuda
 def test_send_and_recv_op_counts_match_with_speculator(monkeypatch):
     """With a speculator the step is three broadcasts: sampled, combined, draft."""
-    sender = make_handler(
-        monkeypatch, is_last_rank=True, num_speculative_steps=3, relay_draft_tokens=True
-    )
+    sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(), width=1, with_draft=True)
     assert len(calls) == 3
@@ -124,7 +119,6 @@ def test_send_and_recv_op_counts_match_with_speculator(monkeypatch):
         monkeypatch,
         is_last_rank=False,
         num_speculative_steps=3,
-        relay_draft_tokens=True,
     )
     calls.clear()
     assert receiver.receive(make_input_batch())
@@ -133,16 +127,12 @@ def test_send_and_recv_op_counts_match_with_speculator(monkeypatch):
 
 
 @requires_cuda
-def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
-    """Diffusion LLMs set num_speculative_steps > 0 but have no speculator, so
-    the last rank never relays draft tokens. Gating the receiver's third recv on
-    num_speculative_steps instead of on the speculator hangs the non-last ranks
-    waiting for a broadcast that is never issued."""
+def test_send_and_recv_op_counts_match_without_speculative_steps(monkeypatch):
+    """Plain decode only broadcasts sampled tokens and sample counts."""
     sender = make_handler(
         monkeypatch,
         is_last_rank=True,
-        num_speculative_steps=3,
-        relay_draft_tokens=False,
+        num_speculative_steps=0,
     )
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(), width=1, with_draft=False)
@@ -151,8 +141,7 @@ def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
     receiver = make_handler(
         monkeypatch,
         is_last_rank=False,
-        num_speculative_steps=3,
-        relay_draft_tokens=False,
+        num_speculative_steps=0,
     )
     calls.clear()
     assert receiver.receive(make_input_batch())
@@ -163,9 +152,7 @@ def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
 @requires_cuda
 def test_both_ranks_skip_when_no_request_needs_sampling(monkeypatch):
     """The skip gate must be symmetric, or the ranks desynchronize."""
-    sender = make_handler(
-        monkeypatch, is_last_rank=True, num_speculative_steps=3, relay_draft_tokens=True
-    )
+    sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(needs_sample=False), width=1, with_draft=True)
     assert calls == []
@@ -174,7 +161,6 @@ def test_both_ranks_skip_when_no_request_needs_sampling(monkeypatch):
         monkeypatch,
         is_last_rank=False,
         num_speculative_steps=3,
-        relay_draft_tokens=True,
     )
     calls.clear()
     assert not receiver.receive(make_input_batch(needs_sample=False))
@@ -199,3 +185,31 @@ def test_deepseek_mtp_passes_supports_pp_gate():
     from vllm.model_executor.models.interfaces import supports_pp
 
     assert supports_pp(DeepSeekMTP)
+
+
+@requires_cuda
+@pytest.mark.parametrize("width", [1, 3, 7])
+@pytest.mark.parametrize("all_invalid", [False, True])
+def test_draft_scatter_preserves_padding_and_supports_cuda_graph(width, all_invalid):
+    """No host synchronization is allowed when scattering remapped request slots."""
+    dst_storage = torch.full((12, width + 2), -99, device="cuda", dtype=torch.int32)
+    dst = dst_storage[:, :width]
+    src = torch.arange(8 * (width + 1), device="cuda").view(8, width + 1)[:, :width]
+    indices = torch.tensor(
+        [-1] * 16
+        if all_invalid
+        else [7, 0, -1, 0, 2, 0, 9, 0, -1, 0, 1, 0, 0, 0, 11, 0],
+        device="cuda",
+        dtype=torch.int64,
+    )[::2]
+    expected = dst_storage.clone()
+    valid = indices >= 0
+    expected[indices[valid], :width] = src[valid].to(expected.dtype)
+    pp_utils.scatter_draft_tokens(dst, src, indices)
+    torch.accelerator.synchronize()
+    dst_storage.fill_(-99)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pp_utils.scatter_draft_tokens(dst, src, indices)
+    graph.replay()
+    torch.testing.assert_close(dst_storage, expected, rtol=0, atol=0)

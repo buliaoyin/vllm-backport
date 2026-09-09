@@ -1766,3 +1766,47 @@ def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(monkeypatch):
     assert out.is_contiguous()
     assert not out.isnan().any()
     assert not lse.isnan().any()
+
+
+@pytest.mark.parametrize("rope_dim", [0, 64])
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_triton_sparse_mla_reuses_contiguous_nope_query(
+    monkeypatch, rope_dim, contiguous
+):
+    from vllm.v1.attention.backends.mla import xpu_mla_sparse
+    from vllm.v1.attention.backends.mla.triton_mla_sparse import TritonMLASparseImpl
+
+    rows, heads, latent = 3, 2, 512
+    q_nope = torch.randn(heads, rows, latent).transpose(0, 1)
+    if contiguous:
+        q_nope = q_nope.contiguous()
+    q_pe = torch.randn(rows, heads, rope_dim)
+    expected = torch.cat([q_nope, q_pe], dim=-1)
+    topk = torch.zeros(rows, 1, dtype=torch.int32)
+    meta = SimpleNamespace(
+        block_size=1,
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        req_id_per_token=torch.zeros(rows, dtype=torch.int32),
+    )
+    impl = object.__new__(TritonMLASparseImpl)
+    impl.kv_cache_dtype = "auto"
+    impl._indexer = None
+    impl.topk_indices_buffer = topk
+    seen = []
+
+    def forward(q, *args):
+        seen.append(q)
+        return q
+
+    impl._forward_bf16_kv = forward
+    monkeypatch.setattr(
+        xpu_mla_sparse,
+        "triton_convert_req_index_to_global_index",
+        lambda *a, **kw: topk,
+    )
+    out, _ = impl.forward_mqa(
+        (q_nope, q_pe), torch.zeros(1, 1, latent + rope_dim), meta, SimpleNamespace()
+    )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert out.is_contiguous()
+    assert (seen[0] is q_nope) == (rope_dim == 0 and contiguous)
