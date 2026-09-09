@@ -4,6 +4,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 import torch
@@ -12,6 +13,98 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+
+class PPRecvBufferState(Enum):
+    FREE = "free"
+    RECEIVING = "receiving"
+    MODEL = "model"
+    DSPARK = "dspark"
+
+
+class PPRecvBufferGuard:
+    """Tracks enqueue-time ownership of a reused PP receive buffer."""
+
+    def __init__(self) -> None:
+        self._state = PPRecvBufferState.FREE
+        self._generation = 0
+        self._owner_stream: object | None = None
+
+    @property
+    def state(self) -> PPRecvBufferState:
+        return self._state
+
+    @property
+    def is_stream_tracked(self) -> bool:
+        return self._owner_stream is not None
+
+    def begin_receive(self, stream: object | None = None) -> int:
+        if self._owner_stream is not None:
+            raise RuntimeError(
+                "Cannot start a receive while the PP receive buffer still has "
+                f"owner stream {self._owner_stream}."
+            )
+        self._transition(
+            PPRecvBufferState.FREE,
+            PPRecvBufferState.RECEIVING,
+            "start a receive",
+        )
+        self._generation += 1
+        self._owner_stream = stream
+        return self._generation
+
+    def finish_receive(self, generation: int, stream: object | None = None) -> None:
+        if generation != self._generation:
+            raise RuntimeError(
+                "Stale PP receive completion for buffer generation "
+                f"{generation}; current generation is {self._generation}."
+            )
+        self._assert_stream(stream, "finish a receive")
+        self._transition(
+            PPRecvBufferState.RECEIVING,
+            PPRecvBufferState.MODEL,
+            "finish a receive",
+        )
+
+    def begin_dspark(self, stream: object | None = None) -> None:
+        self._assert_stream(stream, "start DSpark")
+        self._transition(
+            PPRecvBufferState.MODEL,
+            PPRecvBufferState.DSPARK,
+            "start DSpark",
+        )
+
+    def release(self, stream: object | None = None) -> None:
+        self._assert_stream(stream, "release the buffer")
+        if self._state not in (
+            PPRecvBufferState.MODEL,
+            PPRecvBufferState.DSPARK,
+        ):
+            raise RuntimeError(
+                f"Cannot release PP receive buffer while it is {self._state.value}."
+            )
+        self._state = PPRecvBufferState.FREE
+        self._owner_stream = None
+
+    def _assert_stream(self, stream: object | None, action: str) -> None:
+        if self._owner_stream is not None and stream != self._owner_stream:
+            raise RuntimeError(
+                f"Cannot {action} on CUDA stream {stream}; PP receive buffer "
+                f"is owned by stream {self._owner_stream}."
+            )
+
+    def _transition(
+        self,
+        expected: PPRecvBufferState,
+        new: PPRecvBufferState,
+        action: str,
+    ) -> None:
+        if self._state is not expected:
+            raise RuntimeError(
+                f"Cannot {action} while PP receive buffer is {self._state.value}; "
+                f"expected {expected.value}."
+            )
+        self._state = new
 
 
 @dataclass
@@ -30,10 +123,24 @@ class PendingRecv:
     # Snapshot of slot generation counters at receive time, used to
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
-    # Spec decode: proposed draft tokens relayed from the last rank, scattered
-    # into the non-last rank's req_states.draft_tokens on consume. None when spec
-    # is off (max_sample_len == 1).
-    draft_tokens: torch.Tensor | None = None  # [num_reqs, max_sample_len - 1]
+    draft_tokens: torch.Tensor | None = None  # [num_reqs, num_spec_tokens]
+
+
+def _pad_sampled_tokens_for_pp(
+    sampled_token_ids: torch.Tensor, max_sample_len: int
+) -> torch.Tensor:
+    width = sampled_token_ids.shape[-1]
+    if width == max_sample_len:
+        return sampled_token_ids
+    if width > max_sample_len:
+        raise ValueError(
+            f"Sampled token width {width} exceeds PP receive width {max_sample_len}."
+        )
+    padded = sampled_token_ids.new_full(
+        (sampled_token_ids.shape[0], max_sample_len), -1
+    )
+    padded[:, :width] = sampled_token_ids
+    return padded
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -202,22 +309,9 @@ class PPHandler:
             return
 
         assert sampled_token_ids.dtype == torch.int64
-        # The receiver always posts a [num_reqs, max_sample_len] buffer, but under
-        # spec decode the sampler emits width 1 on any step with no draft tokens
-        # (prefill, first decode) and width (num_spec+1) only once rejection
-        # sampling has run. Pad to max_sample_len so the NCCL broadcast element
-        # count matches the receiver on EVERY step (an unpadded width-1 send vs a
-        # width-(num_spec+1) recv is a count mismatch that deadlocks the receiver).
-        # Trailing -1 columns are placeholders ignored by post_update, which
-        # advances each request by its per-request num_sampled valid count.
-        width = sampled_token_ids.shape[-1]
-        if width != self.max_sample_len:
-            assert width < self.max_sample_len
-            padded = sampled_token_ids.new_full(
-                (sampled_token_ids.shape[0], self.max_sample_len), -1
-            )
-            padded[:, :width] = sampled_token_ids
-            sampled_token_ids = padded
+        sampled_token_ids = _pad_sampled_tokens_for_pp(
+            sampled_token_ids, self.max_sample_len
+        )
 
         if current_platform.is_xpu():
             self.main_stream.synchronize()
@@ -252,7 +346,16 @@ class PPHandler:
             # No request needs sampled outputs next step; `broadcast` skipped too,
             # so skip here to keep the per-step broadcast count matched.
             return
-        draft_tokens = draft_tokens.to(torch.int64).contiguous()
+        expected_shape = (input_batch.num_reqs, self.max_sample_len - 1)
+        if draft_tokens.shape != expected_shape:
+            raise ValueError(
+                f"Draft token shape {tuple(draft_tokens.shape)} does not match "
+                f"PP receive shape {expected_shape}."
+            )
+        # The next proposal may overwrite the source before this broadcast ends.
+        draft_tokens = draft_tokens.to(
+            dtype=torch.int64, memory_format=torch.contiguous_format, copy=True
+        )
         with torch.cuda.stream(self.broadcast_stream):
             # wait_stream so the side-stream broadcast sees propose()'s output.
             self.broadcast_stream.wait_stream(self.main_stream)

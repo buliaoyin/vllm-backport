@@ -97,6 +97,12 @@ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 logger = init_logger(__name__)
 
 
+def _needs_mtp_hidden_states(spec_config: typing.Any | None) -> bool:
+    if spec_config is None or spec_config.use_dspark():
+        return False
+    return spec_config.use_eagle() or spec_config.uses_draft_model()
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -1392,9 +1398,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         spec_config = vllm_config.speculative_config
-        needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
-        )
+        needs_mtp_hidden_states = _needs_mtp_hidden_states(spec_config)
         if get_pp_group().is_last_rank and needs_mtp_hidden_states:
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,

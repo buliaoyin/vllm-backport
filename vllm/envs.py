@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_REUSE_RECV_BUFFER: bool = True
+    VLLM_PP_REUSE_RECV_BUFFER_DEBUG: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -306,7 +308,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
-    VLLM_DETERMINISTIC_MOE_ALIGN: bool = True
+    VLLM_DETERMINISTIC_MOE_ALIGN: bool = False
     VLLM_DISABLE_MULTI_STREAM_PARALLEL: bool = False
     VLLM_MHC_POST_FUSE_SQRSUM: bool = False
     VLLM_MHC_PRENORM_SHARD: bool = False
@@ -315,7 +317,9 @@ if TYPE_CHECKING:
     VLLM_INDEXER_QUERY_SHARD_QPATH: bool = False
     VLLM_SPARSE_PREFILL_EXACT_TILE: bool = False
     VLLM_SPARSE_RAGGED_FAST_SCAN: bool = False
-    VLLM_DSV4_FIXED_DECODE_SPLITS: int = 16
+    VLLM_DSV4_UNIFORM_DECODE_BLOCK_K: bool = True
+    VLLM_DSV4_SM80_COMPRESSOR_TUNING: bool = True
+    VLLM_DSV4_FIXED_DECODE_SPLITS: int = 0
     VLLM_DSV4_LOGITS_ROW_CHUNK: int = 128
     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
     VLLM_TOKEN_BUCKET_PAD: bool = True
@@ -889,6 +893,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Receive PP activations directly into the V2 runner's stable input arena.
+    # Set to 0 to restore the allocating receive path.
+    "VLLM_PP_REUSE_RECV_BUFFER": lambda: bool(
+        int(os.getenv("VLLM_PP_REUSE_RECV_BUFFER", "1"))
+    ),
+    # Validate that PP receive-buffer reuse stays on the worker's main CUDA stream.
+    "VLLM_PP_REUSE_RECV_BUFFER_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_PP_REUSE_RECV_BUFFER_DEBUG", "0"))
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (
@@ -2179,16 +2192,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION": lambda: bool(
         int(os.getenv("VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION", "0"))
     ),
-    # Deterministic moe_align_block_size (stable sort instead of FCFS atomics).
-    # The Marlin MoE GEMM is permutation-sensitive at the ulp level, so the
-    # atomic ordering makes temp=0 outputs non-reproducible (#50576). Set to 0
-    # to restore the historical CUDA kernel path. Cost note from the sm80
-    # branch (8xA100 TP8): the stable sort adds ~15 ms cold TTFT@8K and
-    # ~0.6 ms/token ITL there; we keep it ON because batch>1 corruption
-    # (#50576) traces back to batch-composition-dependent numerics and this
-    # is one of the pinned sources. Set 0 to trade determinism for latency.
+    # Opt in to stable expert ordering for permutation-sensitive MoE numerics.
+    # The default CUDA path avoids the stable sort's additional decode cost.
     "VLLM_DETERMINISTIC_MOE_ALIGN": lambda: bool(
-        int(os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "1"))
+        int(os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "0"))
     ),
     # Debug kill-switch: force execute_in_parallel/maybe_execute_in_parallel
     # to run serially on the default stream (no aux-stream overlap).
@@ -2260,18 +2267,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FUSED_MARKOV": lambda: (
         os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "1"
     ),
-    # Fix the DSv4 sparse-decode flash-decode split count to this value instead
-    # of the batch-adaptive heuristic. The heuristic picks splits from the
-    # total query count and batch-average KV lengths, so a request's reduction
-    # order (and hence bf16 rounding) depends on what else is in the batch;
-    # pinning the split count makes decode attention batch-invariant. Default
-    # 16 = index_topk(512) / BLOCK_K(32): every ragged row is bounded by
-    # index_topk, so 16 is the largest split count that still lowers the
-    # per-program iteration count -- best single-stream occupancy at equal
-    # invariance (measured perf-neutral at c8 on A6000 TP4). Set 0 to restore
-    # the adaptive heuristic.
+    # SM80 kernel A/B controls. Keep the existing split heuristic unless overridden.
+    "VLLM_DSV4_UNIFORM_DECODE_BLOCK_K": lambda: bool(
+        int(os.environ.get("VLLM_DSV4_UNIFORM_DECODE_BLOCK_K", "1"))
+    ),
+    "VLLM_DSV4_SM80_COMPRESSOR_TUNING": lambda: bool(
+        int(os.environ.get("VLLM_DSV4_SM80_COMPRESSOR_TUNING", "1"))
+    ),
     "VLLM_DSV4_FIXED_DECODE_SPLITS": lambda: int(
-        os.environ.get("VLLM_DSV4_FIXED_DECODE_SPLITS", "16")
+        os.environ.get("VLLM_DSV4_FIXED_DECODE_SPLITS", "0")
     ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient

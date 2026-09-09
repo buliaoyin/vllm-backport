@@ -161,18 +161,13 @@ class DeepseekV4SparseMLAMetadataBuilder(
             # into adjacent rows (present in both decode and prefill branches of
             # _build_c128a_topk_metadata_kernel).
             self.c128a_max_compressed = c128a_max_compressed
-            self.c128a_global_decode_buffer = torch.empty(
+            self.c128a_topk_buffer = torch.empty(
                 (max_num_batched_tokens, c128a_max_compressed),
                 dtype=torch.int32,
                 device=device,
             )
             self.c128a_decode_lens_buffer = torch.empty(
                 max_num_batched_tokens, dtype=torch.int32, device=device
-            )
-            self.c128a_prefill_buffer = torch.empty(
-                (max_num_batched_tokens, c128a_max_compressed),
-                dtype=torch.int32,
-                device=device,
             )
 
     def build(
@@ -260,9 +255,8 @@ class DeepseekV4SparseMLAMetadataBuilder(
             cm.block_table_tensor[:num_decodes],
             block_size,
             cm.slot_mapping,
-            self.c128a_global_decode_buffer,
+            self.c128a_topk_buffer,
             self.c128a_decode_lens_buffer,
-            self.c128a_prefill_buffer,
             max_compressed_tokens=active_topk_width,
         )
 
@@ -299,44 +293,34 @@ def build_c128a_topk_metadata(
     block_table: torch.Tensor,
     block_size: int,
     slot_mapping: torch.Tensor,
-    global_decode_buffer: torch.Tensor,
+    topk_buffer: torch.Tensor,
     decode_lens_buffer: torch.Tensor,
-    prefill_buffer: torch.Tensor,
     max_compressed_tokens: int = 8192,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Single kernel for all C128A tokens (decode + prefill).
+    """Build decode and prefill indices in disjoint rows of one stable buffer.
 
-    Decode tokens: position → block_table lookup → global slot ids + topk_lens.
-    Prefill tokens: position → local indices [0, ..., n-1, -1, ...].
-
-    Writes into pre-allocated buffers for CUDA graph address stability.
-    Returns slices of the buffers.
+    Keep the capacity stride when the active width changes so captured consumers
+    can replay against metadata written by a later eager build.
     """
     num_tokens = positions.shape[0]
-    num_prefill_tokens = num_tokens - num_decode_tokens
+    assert 0 <= num_decode_tokens <= num_tokens <= topk_buffer.shape[0]
     assert max_compressed_tokens % _C128A_TOPK_ALIGNMENT == 0
-    assert (
-        0
-        < max_compressed_tokens
-        <= min(global_decode_buffer.shape[1], prefill_buffer.shape[1])
-    )
-    assert global_decode_buffer.stride(-1) == prefill_buffer.stride(-1) == 1
+    assert 0 < max_compressed_tokens <= topk_buffer.shape[1]
+    assert topk_buffer.stride(-1) == 1
 
-    global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
+    global_decode = topk_buffer[:num_decode_tokens, :max_compressed_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
-    prefill_local = prefill_buffer[:num_prefill_tokens, :max_compressed_tokens]
-    assert global_decode.stride(0) == global_decode_buffer.stride(0)
-    assert prefill_local.stride(0) == prefill_buffer.stride(0)
+    prefill_local = topk_buffer[num_decode_tokens:num_tokens, :max_compressed_tokens]
 
     if num_tokens == 0:
         return global_decode, decode_lens, prefill_local
 
     _build_c128a_topk_metadata_kernel[(num_tokens,)](
-        global_decode_buffer,
-        global_decode_buffer.stride(0),
+        global_decode,
+        global_decode.stride(0),
         decode_lens_buffer,
-        prefill_buffer,
-        prefill_buffer.stride(0),
+        prefill_local,
+        prefill_local.stride(0),
         positions,
         compress_ratio,
         max_compressed_tokens,

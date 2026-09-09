@@ -511,16 +511,25 @@ class CommonAttentionMetadata:
         # but not the right per-request boundaries. Padding requests have a query
         # length of zero and drop out of the repeat.
         num_mapped_tokens = int(self.query_start_loc_cpu[-1])
-        query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
         assert buffer.shape[0] >= max(num_mapped_tokens, num_tokens)
-        token_to_req_indices = torch.repeat_interleave(
-            torch.arange(query_lens.shape[0], dtype=torch.int32, device=buffer.device),
-            query_lens,
-            output_size=num_mapped_tokens,
-        )
-        buffer[:num_mapped_tokens].copy_(token_to_req_indices)
-        if num_mapped_tokens < num_tokens:
-            buffer[num_mapped_tokens:num_tokens].zero_()
+        if self.query_start_loc.is_cuda:
+            from vllm.v1.attention.ops.common import fill_token_to_req_indices
+
+            fill_token_to_req_indices(
+                self.query_start_loc, buffer, max(num_mapped_tokens, num_tokens)
+            )
+        else:
+            query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
+            token_to_req_indices = torch.repeat_interleave(
+                torch.arange(
+                    query_lens.shape[0], dtype=torch.int32, device=buffer.device
+                ),
+                query_lens,
+                output_size=num_mapped_tokens,
+            )
+            buffer[:num_mapped_tokens].copy_(token_to_req_indices)
+            if num_mapped_tokens < num_tokens:
+                buffer[num_mapped_tokens:num_tokens].zero_()
         self._token_to_req_indices_cache = buffer[: max(num_mapped_tokens, num_tokens)]
         return self._token_to_req_indices_cache[:num_tokens]
 

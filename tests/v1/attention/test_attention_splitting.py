@@ -460,3 +460,50 @@ def test_build_attention_metadata_zeros_stale_is_prefilling():
     assert not captured_is_prefilling[2]  # decode  (200 >= 200)
     assert not captured_is_prefilling[3]  # stale data (10 < 100) zeroed
     assert not captured_is_prefilling[4]  # stale data (20 < 200) zeroed
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("query_lens", [[8], [0, 3, 0, 5, 0], [0, 0], [31, 0, 257, 5]])
+def test_token_to_req_indices_uses_device_boundaries_and_preserves_padding(
+    device, query_lens
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[1024] * len(query_lens), query_lens=query_lens),
+        block_size=16,
+        device=torch.device(device),
+    )
+    # Device boundaries can differ from the CPU split after adaptive verification.
+    metadata.query_start_loc_cpu = metadata.query_start_loc_cpu.clone()
+    metadata.query_start_loc_cpu[1:-1] = 0
+    num_mapped = sum(query_lens)
+    metadata.num_actual_tokens = num_mapped + 3
+    storage = torch.full((2 * (num_mapped + 5),), -1, dtype=torch.int32, device=device)
+    buffer = storage[::2]
+    result = metadata.token_to_req_indices(buffer)
+    expected = [i for i, length in enumerate(query_lens) for _ in range(length)]
+    assert result.tolist() == expected + [0] * 3
+    assert (storage[1::2] == -1).all()
+    assert (buffer[num_mapped + 3 :] == -1).all()
+    other = torch.full_like(buffer, -2)
+    assert metadata.token_to_req_indices(other).data_ptr() == result.data_ptr()
+    assert (other == -2).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_token_to_req_indices_graph_replay_reads_changed_device_boundaries():
+    metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[16, 16, 16], query_lens=[3, 0, 5]),
+        block_size=16,
+        device=torch.device("cuda"),
+    )
+    buffer = torch.empty(8, dtype=torch.int32, device="cuda")
+    metadata.token_to_req_indices(buffer)
+    metadata._token_to_req_indices_cache = None
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        metadata.token_to_req_indices(buffer)
+    metadata.query_start_loc.copy_(torch.tensor([0, 0, 6, 8], device="cuda"))
+    graph.replay()
+    assert buffer.tolist() == [1] * 6 + [2] * 2

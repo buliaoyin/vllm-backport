@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     LogprobsTensors,
     ModelRunnerOutput,
     PoolerOutput,
@@ -133,6 +134,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
+        self._main_stream = main_stream
+        self._copy_stream = copy_stream
+        self._draft_copy_event: torch.cuda.Event | None = None
+        self._draft_token_ids: np.ndarray | None = None
+        self._draft_req_ids: list[str] = []
+        self._draft_req_indices: list[int] = []
+        self._draft_producer_step_id: int | None = None
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -164,8 +172,43 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
 
+    def set_draft_token_ids(
+        self,
+        req_ids: list[str],
+        draft_token_ids: torch.Tensor,
+        structured_output_request_ids: list[str],
+        producer_step_id: int | None,
+    ) -> None:
+        req_id_to_index = {req_id: i for i, req_id in enumerate(req_ids)}
+        self._draft_req_ids = [
+            req_id
+            for req_id in structured_output_request_ids
+            if req_id in req_id_to_index
+        ]
+        if not self._draft_req_ids:
+            return
+
+        self._draft_req_indices = [
+            req_id_to_index[req_id] for req_id in self._draft_req_ids
+        ]
+        self._draft_producer_step_id = producer_step_id
+        self._draft_copy_event = torch.cuda.Event(blocking=True)
+        with stream(self._copy_stream, self._main_stream):
+            self._copy_stream.wait_stream(self._main_stream)
+            self._draft_token_ids = async_copy_to_np(draft_token_ids)
+            draft_token_ids.record_stream(self._copy_stream)
+            self._draft_copy_event.record(self._copy_stream)
+
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
+        if self._draft_copy_event is not None:
+            self._draft_copy_event.synchronize()
+            assert self._draft_token_ids is not None
+            self.model_runner_output.draft_token_ids = DraftTokenIds(
+                req_ids=self._draft_req_ids,
+                draft_token_ids=self._draft_token_ids[self._draft_req_indices].tolist(),
+                producer_step_id=self._draft_producer_step_id,
+            )
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.

@@ -60,14 +60,8 @@ class DSparkSpeculator(DFlashSpeculator):
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
 
-        # DSpark consumes mean-pooled target aux hidden states at the target
-        # layers, combined to hidden_size via main_proj. Store that combined
-        # main_x (hidden_size wide). DSpark does not use the same pre-allocated buffer
-        # that DeepSeek-V4's MTP uses.
-        draft_hidden = self.draft_model_config.get_hidden_size()
-        self.hidden_states = torch.zeros(
-            self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
-        )
+        self.hidden_states = None
+        self._target_hidden_states_workspace: torch.Tensor | None = None
 
         self._step_cols = torch.arange(
             self.num_speculative_steps, dtype=torch.int32, device=device
@@ -95,6 +89,48 @@ class DSparkSpeculator(DFlashSpeculator):
         # Fused Markov chain (greedy vocab-sharded path only); built in
         # load_draft_model once the head's weights and shard geometry exist.
         self._fused_markov: FusedMarkovSampler | None = None
+
+    def set_target_hidden_states_workspace(self, workspace: torch.Tensor) -> bool:
+        if (
+            workspace.is_contiguous()
+            and workspace.dtype == self.dtype
+            and workspace.device == self.device
+        ):
+            self._target_hidden_states_workspace = workspace.view(-1)
+            return True
+        return False
+
+    def _prepare_context_hidden_states(
+        self,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_target_tokens: int,
+    ) -> torch.Tensor:
+        if not aux_hidden_states:
+            return last_hidden_states[:num_target_tokens]
+
+        num_rows = aux_hidden_states[0].shape[0]
+        packed_width = sum(tensor.shape[-1] for tensor in aux_hidden_states)
+        packed_numel = num_rows * packed_width
+        workspace = self._target_hidden_states_workspace
+        can_reuse_workspace = (
+            workspace is not None
+            and workspace.numel() >= packed_numel
+            and all(
+                tensor.untyped_storage().data_ptr()
+                != workspace.untyped_storage().data_ptr()
+                for tensor in aux_hidden_states
+            )
+        )
+        if can_reuse_workspace:
+            assert workspace is not None
+            packed_hidden_states = workspace[:packed_numel].view(num_rows, packed_width)
+            torch.cat(aux_hidden_states, dim=-1, out=packed_hidden_states)
+        else:
+            packed_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+
+        hidden_states = self.model.combine_hidden_states(packed_hidden_states)
+        return hidden_states[:num_target_tokens]
 
     def load_draft_model(
         self,

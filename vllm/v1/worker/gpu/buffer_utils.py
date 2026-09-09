@@ -41,6 +41,61 @@ def async_copy_to_gpu(
     return out.copy_(pinned, non_blocking=True)
 
 
+class PinnedStagingPool:
+    """Reuse host buffers at one copy site across bounded in-flight batches.
+
+    The pool depth must cover all concurrent steps, as for UvaBufferPool.
+    Retain replaced buffers during growth because their DMA may still be active.
+    """
+
+    def __init__(self, dtype: torch.dtype, max_concurrency: int | None = None):
+        self.dtype = dtype
+        self.max_concurrency = (
+            _DEFAULT_MAX_CONCURRENCY if max_concurrency is None else max_concurrency
+        )
+        if self.max_concurrency < 1:
+            raise ValueError("Staging pool concurrency must be positive")
+        self._bufs: list[torch.Tensor] = []
+        self._retired: list[list[torch.Tensor]] = []
+        self._capacity = 0
+        self._curr = 0
+
+    def reserve(self, numel: int) -> None:
+        numel = max(numel, 1)
+        if numel <= self._capacity:
+            return
+        capacity = 1 << (numel - 1).bit_length()
+        if self._bufs:
+            self._retired.append(self._bufs)
+        self._bufs = [
+            torch.empty(capacity, dtype=self.dtype, device="cpu", pin_memory=True)
+            for _ in range(self.max_concurrency)
+        ]
+        self._capacity = capacity
+        self._curr = 0
+
+    def stage(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.is_cpu and x.dtype == self.dtype
+        self.reserve(x.numel())
+        self._curr = (self._curr + 1) % self.max_concurrency
+        staged = self._bufs[self._curr][: x.numel()].view(x.shape)
+        staged.copy_(x)
+        return staged
+
+    def copy_to_gpu(
+        self,
+        x: torch.Tensor | np.ndarray,
+        out: torch.Tensor | None = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+        if out is None:
+            assert device is not None
+            out = torch.empty_like(x, device=device)
+        return out.copy_(self.stage(x), non_blocking=True)
+
+
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():

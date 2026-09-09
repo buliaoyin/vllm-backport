@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
@@ -203,3 +204,24 @@ def test_append_block_ids_rejects_write_past_row_capacity():
         )
 
     assert block_tables.num_blocks.np[0, 1] == 3
+
+
+@pytest.mark.parametrize("with_draft", [False, True])
+def test_auto_fit_updates_attention_capture_and_draft_limits(with_draft):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.max_model_len = 1048576
+    runner.req_states = SimpleNamespace(max_model_len=1048576)
+    runner.model_state = SimpleNamespace(max_model_len=1048576)
+    runner.speculator = None
+    if with_draft:
+        runner.speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+        runner.speculator.max_model_len = 1048576
+        runner.speculator.draft_max_seq_len = 1048576
+
+    runner.update_max_model_len(466432)
+
+    assert runner.max_model_len == runner.req_states.max_model_len == 466432
+    assert runner.model_state.max_model_len == 466432
+    if with_draft:
+        assert runner.speculator.max_model_len == 466432
+        assert runner.speculator.draft_max_seq_len == 466432

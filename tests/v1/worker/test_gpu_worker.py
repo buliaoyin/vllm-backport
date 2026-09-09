@@ -5,9 +5,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
+from vllm.v1.worker.gpu.pp_utils import (
+    PPRecvBufferGuard,
+    PPRecvBufferState,
+)
+from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -77,3 +83,75 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+def test_pp_recv_buffer_guard_allows_consecutive_dspark_batches():
+    guard = PPRecvBufferGuard()
+
+    for expected_generation, stream in enumerate((object(), object()), start=1):
+        generation = guard.begin_receive(stream)
+        assert generation == expected_generation
+        assert guard.state is PPRecvBufferState.RECEIVING
+
+        guard.finish_receive(generation, stream)
+        assert guard.state is PPRecvBufferState.MODEL
+
+        guard.begin_dspark(stream)
+        assert guard.state is PPRecvBufferState.DSPARK
+
+        guard.release(stream)
+        assert guard.state is PPRecvBufferState.FREE
+
+
+def test_pp_recv_buffer_guard_tracks_stream_per_generation():
+    guard = PPRecvBufferGuard()
+    warmup_stream = object()
+    other_stream = object()
+
+    generation = guard.begin_receive(warmup_stream)
+    guard.finish_receive(generation, warmup_stream)
+
+    with pytest.raises(RuntimeError, match="owned by stream"):
+        guard.begin_dspark(other_stream)
+
+    guard.begin_dspark(warmup_stream)
+    guard.release(warmup_stream)
+
+    generation = guard.begin_receive(other_stream)
+    guard.finish_receive(generation, other_stream)
+    guard.release(other_stream)
+
+
+def test_pp_recv_buffer_guard_rejects_overlapping_receive():
+    guard = PPRecvBufferGuard()
+    generation = guard.begin_receive()
+
+    with pytest.raises(RuntimeError, match="receiving"):
+        guard.begin_receive()
+    with pytest.raises(RuntimeError, match="Stale PP receive completion"):
+        guard.finish_receive(generation + 1)
+
+    guard.finish_receive(generation)
+    guard.release()
+
+
+def test_async_intermediate_tensors_marks_complete_after_comm():
+    events: list[str] = []
+
+    class DummyWork:
+        def wait(self) -> None:
+            events.append("wait")
+
+    intermediate_tensors = AsyncIntermediateTensors(
+        {"hidden_states": torch.zeros(1)},
+        comm_handles=[DummyWork()],  # type: ignore[list-item]
+        comm_postprocess=[lambda: events.append("postprocess")],
+        comm_complete_callback=lambda: events.append("complete"),
+    )
+
+    assert not events
+    assert intermediate_tensors.tensors["hidden_states"].item() == 0
+    assert events == ["wait", "postprocess", "complete"]
+
+    _ = intermediate_tensors.tensors
+    assert events == ["wait", "postprocess", "complete"]

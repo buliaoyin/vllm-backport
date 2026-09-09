@@ -120,13 +120,16 @@ class SchedulerInterface(ABC):
 
     @abstractmethod
     def update_draft_token_ids_in_output(
-        self, draft_token_ids: "DraftTokenIds", scheduler_output: "SchedulerOutput"
+        self,
+        draft_token_ids: "DraftTokenIds | None",
+        scheduler_output: "SchedulerOutput",
     ) -> None:
         """Update scheduler output with newly generated draft token ids, applying
-        structured output grammar validation if needed.
+        structured output grammar validation and batch matching if needed.
 
         Args:
-            draft_token_ids: The input draft token ids for each request.
+            draft_token_ids: Legacy V1 draft ids, or None to consume V2
+                batch-bound drafts already ingested from model outputs.
             scheduler_output: Update the given scheduler_output
                 with the corresponding draft token ids.
         """
@@ -194,6 +197,17 @@ class SchedulerInterface(ABC):
         """Returns True if there are unfinished requests, or finished requests
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
+
+    def has_structured_output_in_flight(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        """Returns True if any structured-output request scheduled in
+        `scheduler_output` still has a previously scheduled token in flight,
+        i.e. its grammar FSM has not yet caught up. Used under pipeline
+        parallelism to decide whether in-flight batches must be drained before
+        computing the next grammar bitmask. Defaults to False for schedulers
+        that do not track in-flight output tokens."""
+        return False
 
     @property
     @abstractmethod

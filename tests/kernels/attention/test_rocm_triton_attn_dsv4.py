@@ -640,12 +640,13 @@ def test_decode_num_splits_gfx950(monkeypatch) -> None:
 
 
 @requires_split_decode_arch
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
 @pytest.mark.parametrize("num_splits", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("with_extra", [True, False])
 @pytest.mark.parametrize("with_sink", [True, False])
 @torch.inference_mode()
 def test_sparse_attn_decode_split_k_kernel(
-    monkeypatch, num_splits: int, with_extra: bool, with_sink: bool
+    monkeypatch, num_splits: int, with_extra: bool, with_sink: bool, compress_ratio: int
 ) -> None:
     """Flash-decode split-K decode path (partial + reduce kernels).
 
@@ -660,7 +661,7 @@ def test_sparse_attn_decode_split_k_kernel(
     device = torch.device("cuda")
     torch.manual_seed(7)
     block_size = 4
-    num_heads = 3
+    num_heads = 64 if compress_ratio == 4 else 3
     main_use_fnuz = current_platform.is_fp8_fnuz()
 
     main_rows = [[0, 2, 4, 6, 1, 3, 7, 5], [4, 1, 6, 0, 2]]
@@ -687,7 +688,7 @@ def test_sparse_attn_decode_split_k_kernel(
         extra_indices, extra_indptr = _ragged_from_rows(rows, device)
 
     attn_sink = (
-        torch.tensor([-0.1, 0.0, 0.1], dtype=torch.float32, device=device)
+        torch.linspace(-0.1, 0.1, num_heads, dtype=torch.float32, device=device)
         if with_sink
         else None
     )
@@ -703,8 +704,13 @@ def test_sparse_attn_decode_split_k_kernel(
         mod, other_split_fn, lambda *args, **kwargs: pytest.fail("wrong selector")
     )
 
+    if current_platform.is_cuda() and current_platform.is_device_capability(80):
+        monkeypatch.setenv("VLLM_DSV4_FIXED_DECODE_SPLITS", str(num_splits))
+        monkeypatch.setenv("VLLM_DSV4_UNIFORM_DECODE_BLOCK_K", "0")
+
     actual = mod._rocm_sparse_attn_decode_ragged_triton(
         q=q,
+        compress_ratio=compress_ratio,
         main_cache=main_cache,
         main_indices=main_indices,
         main_indptr=main_indptr,
@@ -1257,7 +1263,6 @@ def test_lengths_to_indptr_stays_one_block_at_prefill_width() -> None:
     checks the result is still correct.
     """
     import vllm.envs as envs
-
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as ops
 
     if not envs.VLLM_SPARSE_RAGGED_FAST_SCAN:
@@ -1268,7 +1273,7 @@ def test_lengths_to_indptr_stays_one_block_at_prefill_width() -> None:
 
     device = torch.device("cuda")
     num_rows = 8192
-    assert ops._MAX_ONE_BLOCK_INDPTR_ROWS >= num_rows, (
+    assert num_rows <= ops._MAX_ONE_BLOCK_INDPTR_ROWS, (
         "the one-block cap no longer covers the 8K prefill shape; every "
         "prefill layer will take the pageable-H2D fallback"
     )
@@ -1510,3 +1515,53 @@ def test_lengths_to_indptr_rejects_strided_out() -> None:
     assert strided.shape == (7,) and not strided.is_contiguous()
     with pytest.raises(AssertionError):
         lengths_to_indptr(lengths, out=strided)
+
+
+@pytest.mark.parametrize("num_heads", [8, 64])
+@torch.inference_mode()
+def test_c128_blocked_prefill_respects_request_and_compression_boundaries(num_heads):
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    torch.manual_seed(42)
+    q = torch.randn(9, num_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(1024, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(num_heads, device="cuda")
+    starts = torch.tensor([100, 103, 109], dtype=torch.int32)
+    seq_lens = [129, 260]
+    gather_lens = [129, 133]
+    block_m = 64 // mod._sparse_block_h(num_heads)
+    block_req, block_qstart = mod.build_query_blocks(starts, block_m, q.device)
+    out = torch.empty_like(q)
+    mod.rocm_sparse_attn_prefill_blocked(
+        q=q,
+        kv=kv[:, None],
+        block_req=block_req,
+        block_qstart=block_qstart,
+        query_start_loc=starts.to("cuda"),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
+        gather_lens=torch.tensor(gather_lens, dtype=torch.int32, device="cuda"),
+        scale=HEAD_DIM**-0.5,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        attn_sink=sink,
+        top_k=64,
+        row_stride=512,
+        swa_offset=64,
+        compress_ratio=128,
+        window_size=128,
+        block_m=block_m,
+        output=out,
+    )
+    rows = []
+    for req, count in enumerate((3, 6)):
+        for pos in range(seq_lens[req] - count, seq_lens[req]):
+            compressed = list(range(req * 512, req * 512 + (pos + 1) // 128))
+            gather_start = seq_lens[req] - gather_lens[req]
+            window = [
+                req * 512 + 64 + p - gather_start
+                for p in range(max(0, pos - 127), pos + 1)
+            ]
+            rows.append(compressed + window)
+    expected = _ref_sparse_prefill_ragged(q, kv, rows, HEAD_DIM**-0.5, sink)
+    torch.testing.assert_close(out.float(), expected.float(), atol=5e-3, rtol=1e-2)

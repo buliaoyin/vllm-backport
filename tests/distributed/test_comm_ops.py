@@ -238,6 +238,50 @@ def _make_group_for_unit_test(
     return g
 
 
+def test_irecv_tensor_dict_reuses_matching_preallocated_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[torch.Tensor] = []
+
+    def fake_irecv(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        received.append(t)
+        t.fill_(3)
+        return _DummyWork()
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "irecv", fake_irecv)
+
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    metadata_list = [
+        (
+            "hidden_states",
+            TensorMetadata("cpu", torch.int32, torch.Size([2, 4])),
+        ),
+        ("residual", TensorMetadata("cpu", torch.int32, torch.Size([2, 3]))),
+    ]
+    g.recv_object = lambda src=None: metadata_list  # type: ignore[method-assign]
+
+    hidden_states = torch.zeros((4, 4), dtype=torch.int32)
+    wrong_shape = torch.zeros((4, 5), dtype=torch.int32)
+    tp_group = _DummyAllGatherGroup(world_size=1, rank_in_group=0)
+    td, handles, postprocess = g.irecv_tensor_dict(
+        all_gather_group=tp_group,
+        recv_buffers={
+            "hidden_states": hidden_states,
+            "residual": wrong_shape,
+        },
+    )
+
+    assert td is not None
+    assert len(handles) == 2
+    assert not postprocess
+    assert td["hidden_states"].data_ptr() == hidden_states.data_ptr()
+    assert td["hidden_states"].shape == torch.Size([2, 4])
+    assert td["residual"].data_ptr() != wrong_shape.data_ptr()
+    torch.testing.assert_close(hidden_states[:2], torch.full_like(hidden_states[:2], 3))
+    torch.testing.assert_close(hidden_states[2:], torch.zeros_like(hidden_states[2:]))
+
+
 def test_irecv_tensor_dict_send_allgather_postprocess_binds_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

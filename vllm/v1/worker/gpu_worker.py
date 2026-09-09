@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
+from functools import partial
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -116,10 +117,12 @@ class AsyncIntermediateTensors(IntermediateTensors):
         tensors: dict[str, torch.Tensor],
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
+        comm_complete_callback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
+        self._comm_complete_callback = comm_complete_callback
         self._comm_waited = False
 
     def wait_for_comm(self) -> None:
@@ -131,6 +134,8 @@ class AsyncIntermediateTensors(IntermediateTensors):
         if self._comm_postprocess:
             for fn in self._comm_postprocess:
                 fn()
+        if self._comm_complete_callback is not None:
+            self._comm_complete_callback()
         self._comm_waited = True
 
     def __getattribute__(self, name: str):
@@ -197,6 +202,14 @@ class Worker(WorkerBase):
                     "process creation.",
                     getattr(text_config, "ple_layer_ids", None),
                 )
+        self._reuse_pp_recv_buffer = (
+            self.use_v2_model_runner
+            and envs.VLLM_PP_REUSE_RECV_BUFFER
+            and self.parallel_config.tensor_parallel_size == 1
+        )
+        self._pp_recv_buffer_debug = (
+            self._reuse_pp_recv_buffer and envs.VLLM_PP_REUSE_RECV_BUFFER_DEBUG
+        )
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
@@ -212,9 +225,7 @@ class Worker(WorkerBase):
             parallel_config.prefill_context_parallel_size
             * parallel_config.tensor_parallel_size
         )
-        pp_rank = (
-            self.rank // pp_stride
-        ) % parallel_config.pipeline_parallel_size
+        pp_rank = (self.rank // pp_stride) % parallel_config.pipeline_parallel_size
         if pp_rank != 0:
             return False
         text_config = self.model_config.hf_text_config
@@ -1223,7 +1234,10 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        output = self.model_runner.sample_tokens(grammar_output)
+        if self._reuse_pp_recv_buffer and output is not None:
+            self.model_runner.release_pp_recv_buffer()  # type: ignore[attr-defined]
+        return output
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1273,10 +1287,29 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
+            recv_buffers = None
+            comm_complete_callback = None
+            if self._reuse_pp_recv_buffer:
+                recv_stream = (
+                    torch.cuda.current_stream(self.device)
+                    if self._pp_recv_buffer_debug
+                    else None
+                )
+                recv_buffers, recv_generation = (
+                    self.model_runner.acquire_pp_recv_buffer(  # type: ignore[attr-defined]
+                        recv_stream
+                    )
+                )
+                comm_complete_callback = partial(
+                    self.model_runner.finish_pp_recv_buffer,  # type: ignore[attr-defined]
+                    recv_generation,
+                )
+
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
                     all_gather_tensors=all_gather_tensors,
+                    recv_buffers=recv_buffers,
                 )
             )
             assert tensor_dict is not None
@@ -1284,6 +1317,7 @@ class Worker(WorkerBase):
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
+                comm_complete_callback=comm_complete_callback,
             )
 
         with self.annotate_profile(scheduler_output):
@@ -1299,6 +1333,10 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                if self._reuse_pp_recv_buffer and output is not None:
+                    if intermediate_tensors is not None:
+                        intermediate_tensors.wait_for_comm()
+                    self.model_runner.release_pp_recv_buffer()  # type: ignore[attr-defined]
                 return output
 
         assert isinstance(output, IntermediateTensors)

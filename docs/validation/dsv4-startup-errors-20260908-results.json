@@ -1,0 +1,528 @@
+{
+  "date": "2026-09-08",
+  "model": "/home/bul/dev/models1/DeepSeek/DeepSeek-V4-Flash-Vision-Exp",
+  "environment": "/home/bul/miniconda3/envs/vllm-backport",
+  "gpus": [
+    0,
+    1,
+    2
+  ],
+  "pipeline_layer_partition": [
+    15,
+    16,
+    12
+  ],
+  "max_model_len": "auto",
+  "max_num_seqs": 64,
+  "kv_cache_dtype": "fp8",
+  "gpu_memory_utilization": 0.95,
+  "artifacts": "/tmp/dsv4-startup-errors-20260908",
+  "unit_tests": {
+    "pre_fix_failed": 4,
+    "pre_fix_passed": 1,
+    "post_fix_passed": 49,
+    "post_lint_config_passed": 12
+  },
+  "configurations": {
+    "dspark6": {
+      "auto_fit_max_model_len": 466432,
+      "started": true,
+      "graph_capture_workers": 3,
+      "error_lines": [],
+      "gsm8k_sample": {
+        "count": 32,
+        "shots": 5,
+        "concurrency": 4,
+        "thinking": false,
+        "max_tokens": 4096,
+        "test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+        "passed": 32,
+        "elapsed_s": 17.670876490999945,
+        "metrics": {
+          "draft_tokens": 5322.0,
+          "accepted_tokens": 2631.0,
+          "acceptance_rate": 0.4943630214205186,
+          "mean_acceptance_length": 3.9661781285231115,
+          "prefix_hits": 15872.0
+        },
+        "cases": [
+          {
+            "index": 0,
+            "label": "18",
+            "prediction": "18",
+            "passed": true
+          },
+          {
+            "index": 1,
+            "label": "3",
+            "prediction": "3",
+            "passed": true
+          },
+          {
+            "index": 2,
+            "label": "70000",
+            "prediction": "70000",
+            "passed": true
+          },
+          {
+            "index": 3,
+            "label": "540",
+            "prediction": "540",
+            "passed": true
+          },
+          {
+            "index": 4,
+            "label": "20",
+            "prediction": "20",
+            "passed": true
+          },
+          {
+            "index": 5,
+            "label": "64",
+            "prediction": "64",
+            "passed": true
+          },
+          {
+            "index": 6,
+            "label": "260",
+            "prediction": "260",
+            "passed": true
+          },
+          {
+            "index": 7,
+            "label": "160",
+            "prediction": "160",
+            "passed": true
+          },
+          {
+            "index": 8,
+            "label": "45",
+            "prediction": "45",
+            "passed": true
+          },
+          {
+            "index": 9,
+            "label": "460",
+            "prediction": "460",
+            "passed": true
+          },
+          {
+            "index": 10,
+            "label": "366",
+            "prediction": "366",
+            "passed": true
+          },
+          {
+            "index": 11,
+            "label": "694",
+            "prediction": "694",
+            "passed": true
+          },
+          {
+            "index": 12,
+            "label": "13",
+            "prediction": "13",
+            "passed": true
+          },
+          {
+            "index": 13,
+            "label": "18",
+            "prediction": "18",
+            "passed": true
+          },
+          {
+            "index": 14,
+            "label": "60",
+            "prediction": "60",
+            "passed": true
+          },
+          {
+            "index": 15,
+            "label": "125",
+            "prediction": "125",
+            "passed": true
+          },
+          {
+            "index": 16,
+            "label": "230",
+            "prediction": "230",
+            "passed": true
+          },
+          {
+            "index": 17,
+            "label": "57500",
+            "prediction": "57500",
+            "passed": true
+          },
+          {
+            "index": 18,
+            "label": "7",
+            "prediction": "7",
+            "passed": true
+          },
+          {
+            "index": 19,
+            "label": "6",
+            "prediction": "6",
+            "passed": true
+          },
+          {
+            "index": 20,
+            "label": "15",
+            "prediction": "15",
+            "passed": true
+          },
+          {
+            "index": 21,
+            "label": "14",
+            "prediction": "14",
+            "passed": true
+          },
+          {
+            "index": 22,
+            "label": "7",
+            "prediction": "7",
+            "passed": true
+          },
+          {
+            "index": 23,
+            "label": "8",
+            "prediction": "8",
+            "passed": true
+          },
+          {
+            "index": 24,
+            "label": "26",
+            "prediction": "26",
+            "passed": true
+          },
+          {
+            "index": 25,
+            "label": "2",
+            "prediction": "2",
+            "passed": true
+          },
+          {
+            "index": 26,
+            "label": "243",
+            "prediction": "243",
+            "passed": true
+          },
+          {
+            "index": 27,
+            "label": "16",
+            "prediction": "16",
+            "passed": true
+          },
+          {
+            "index": 28,
+            "label": "25",
+            "prediction": "25",
+            "passed": true
+          },
+          {
+            "index": 29,
+            "label": "104",
+            "prediction": "104",
+            "passed": true
+          },
+          {
+            "index": 30,
+            "label": "109",
+            "prediction": "109",
+            "passed": true
+          },
+          {
+            "index": 31,
+            "label": "80",
+            "prediction": "80",
+            "passed": true
+          }
+        ]
+      },
+      "vision_probes": {
+        "passed": 20,
+        "count": 20
+      },
+      "structured_mixed": {
+        "passed": 48,
+        "count": 48
+      },
+      "burst64": {
+        "count": 64,
+        "passed": 64,
+        "elapsed_s": 1.0251377480162773
+      },
+      "long_input": {
+        "passed": true,
+        "status": 200,
+        "elapsed_s": 8.477348549000453,
+        "usage": {
+          "prompt_tokens": 42034,
+          "total_tokens": 42040,
+          "completion_tokens": 6,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "answer": "JADE-7429"
+      },
+      "decode_benchmark_median_tokens_per_s": {
+        "chinese": 58.70158606806497,
+        "code": 103.93367403315077,
+        "english": 71.02181833397415
+      }
+    },
+    "dspark7": {
+      "auto_fit_max_model_len": 466432,
+      "started": true,
+      "graph_capture_workers": 3,
+      "error_lines": [],
+      "gsm8k_sample": {
+        "count": 32,
+        "shots": 5,
+        "concurrency": 4,
+        "thinking": false,
+        "max_tokens": 4096,
+        "test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+        "passed": 32,
+        "elapsed_s": 17.84266088702134,
+        "metrics": {
+          "draft_tokens": 6286.0,
+          "accepted_tokens": 2715.0,
+          "acceptance_rate": 0.4319121858097359,
+          "mean_acceptance_length": 4.023385300668151,
+          "prefix_hits": 15872.0
+        },
+        "cases": [
+          {
+            "index": 0,
+            "label": "18",
+            "prediction": "18",
+            "passed": true
+          },
+          {
+            "index": 1,
+            "label": "3",
+            "prediction": "3",
+            "passed": true
+          },
+          {
+            "index": 2,
+            "label": "70000",
+            "prediction": "70000",
+            "passed": true
+          },
+          {
+            "index": 3,
+            "label": "540",
+            "prediction": "540",
+            "passed": true
+          },
+          {
+            "index": 4,
+            "label": "20",
+            "prediction": "20",
+            "passed": true
+          },
+          {
+            "index": 5,
+            "label": "64",
+            "prediction": "64",
+            "passed": true
+          },
+          {
+            "index": 6,
+            "label": "260",
+            "prediction": "260",
+            "passed": true
+          },
+          {
+            "index": 7,
+            "label": "160",
+            "prediction": "160",
+            "passed": true
+          },
+          {
+            "index": 8,
+            "label": "45",
+            "prediction": "45",
+            "passed": true
+          },
+          {
+            "index": 9,
+            "label": "460",
+            "prediction": "460",
+            "passed": true
+          },
+          {
+            "index": 10,
+            "label": "366",
+            "prediction": "366",
+            "passed": true
+          },
+          {
+            "index": 11,
+            "label": "694",
+            "prediction": "694",
+            "passed": true
+          },
+          {
+            "index": 12,
+            "label": "13",
+            "prediction": "13",
+            "passed": true
+          },
+          {
+            "index": 13,
+            "label": "18",
+            "prediction": "18",
+            "passed": true
+          },
+          {
+            "index": 14,
+            "label": "60",
+            "prediction": "60",
+            "passed": true
+          },
+          {
+            "index": 15,
+            "label": "125",
+            "prediction": "125",
+            "passed": true
+          },
+          {
+            "index": 16,
+            "label": "230",
+            "prediction": "230",
+            "passed": true
+          },
+          {
+            "index": 17,
+            "label": "57500",
+            "prediction": "57500",
+            "passed": true
+          },
+          {
+            "index": 18,
+            "label": "7",
+            "prediction": "7",
+            "passed": true
+          },
+          {
+            "index": 19,
+            "label": "6",
+            "prediction": "6",
+            "passed": true
+          },
+          {
+            "index": 20,
+            "label": "15",
+            "prediction": "15",
+            "passed": true
+          },
+          {
+            "index": 21,
+            "label": "14",
+            "prediction": "14",
+            "passed": true
+          },
+          {
+            "index": 22,
+            "label": "7",
+            "prediction": "7",
+            "passed": true
+          },
+          {
+            "index": 23,
+            "label": "8",
+            "prediction": "8",
+            "passed": true
+          },
+          {
+            "index": 24,
+            "label": "26",
+            "prediction": "26",
+            "passed": true
+          },
+          {
+            "index": 25,
+            "label": "2",
+            "prediction": "2",
+            "passed": true
+          },
+          {
+            "index": 26,
+            "label": "243",
+            "prediction": "243",
+            "passed": true
+          },
+          {
+            "index": 27,
+            "label": "16",
+            "prediction": "16",
+            "passed": true
+          },
+          {
+            "index": 28,
+            "label": "25",
+            "prediction": "25",
+            "passed": true
+          },
+          {
+            "index": 29,
+            "label": "104",
+            "prediction": "104",
+            "passed": true
+          },
+          {
+            "index": 30,
+            "label": "109",
+            "prediction": "109",
+            "passed": true
+          },
+          {
+            "index": 31,
+            "label": "80",
+            "prediction": "80",
+            "passed": true
+          }
+        ]
+      },
+      "vision_probes": {
+        "passed": 20,
+        "count": 20
+      },
+      "structured_mixed": {
+        "passed": 48,
+        "count": 48
+      },
+      "burst64": {
+        "count": 64,
+        "passed": 64,
+        "elapsed_s": 1.2581294770061504
+      },
+      "long_input": {
+        "passed": true,
+        "status": 200,
+        "elapsed_s": 8.510705799009884,
+        "usage": {
+          "prompt_tokens": 42034,
+          "total_tokens": 42040,
+          "completion_tokens": 6,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "answer": "JADE-7429"
+      },
+      "decode_benchmark_median_tokens_per_s": {
+        "chinese": 63.01895326454263,
+        "code": 107.15535109718935,
+        "english": 72.8211019043415
+      }
+    }
+  }
+}

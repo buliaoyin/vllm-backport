@@ -12,11 +12,13 @@ when the target itself is shrunk — which is what kept spec-decode archs like
 """
 
 import functools
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 from transformers import PretrainedConfig
 
+from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 
@@ -185,3 +187,40 @@ def test_mtp_index_share_override(
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
         is expected
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "method,num_tokens", [("dspark", 5), ("dspark", 7), ("mtp", 6)]
+)
+def test_parallel_draft_length_ignores_target_mtp_depth(tmp_path, method, num_tokens):
+    config = dict(
+        model_type="deepseek_v4",
+        architectures=["DeepseekV4ForCausalLM"],
+        hidden_size=128,
+        num_attention_heads=4,
+        num_hidden_layers=4,
+        num_nextn_predict_layers=3,
+        vocab_size=256,
+        max_position_embeddings=8192,
+        dspark_block_size=5,
+        torch_dtype="bfloat16",
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    target = ModelConfig(model=str(tmp_path), tokenizer_mode="skip")
+    spec = SpeculativeConfig(
+        method=method,
+        num_speculative_tokens=num_tokens,
+        target_model_config=target,
+        target_parallel_config=ParallelConfig(),
+    )
+    assert spec.num_speculative_tokens == num_tokens
+    assert spec.method == method
+    # Ordinary MTP still follows its module-reuse contract.
+    with pytest.raises(ValueError, match="must be divisible by n_predict=3"):
+        SpeculativeConfig(
+            method="mtp",
+            num_speculative_tokens=7,
+            target_model_config=target,
+            target_parallel_config=ParallelConfig(),
+        )

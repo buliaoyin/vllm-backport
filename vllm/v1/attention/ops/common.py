@@ -229,3 +229,49 @@ def unpack_seq_triton(
         out = out.reshape(output_shape)
 
     return out
+
+
+@triton.jit
+def _fill_token_to_req_indices_kernel(
+    query_start_loc,
+    buffer,
+    num_tokens,
+    query_stride: tl.constexpr,
+    buffer_stride: tl.constexpr,
+    num_reqs: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    lo = tl.full((BLOCK,), 0, tl.int32)
+    hi = tl.full((BLOCK,), num_reqs, tl.int32)
+    for _ in range(SEARCH_STEPS):
+        mid = (lo + hi) // 2
+        end = tl.load(
+            query_start_loc + (mid + 1) * query_stride,
+            mask=mid < num_reqs,
+            other=2147483647,
+        )
+        right = (mid < num_reqs) & (end <= token)
+        lo = tl.where(right, mid + 1, lo)
+        hi = tl.where(right, hi, mid)
+    req = tl.where(lo < num_reqs, lo, 0)
+    tl.store(buffer + token * buffer_stride, req, mask=token < num_tokens)
+
+
+def fill_token_to_req_indices(
+    query_start_loc: torch.Tensor, buffer: torch.Tensor, num_tokens: int
+) -> None:
+    """Expand device query boundaries into request IDs and zero padded tokens."""
+    if num_tokens == 0:
+        return
+    _fill_token_to_req_indices_kernel[(triton.cdiv(num_tokens, 256),)](
+        query_start_loc,
+        buffer,
+        num_tokens,
+        query_start_loc.stride(0),
+        buffer.stride(0),
+        query_start_loc.numel() - 1,
+        SEARCH_STEPS=(query_start_loc.numel() - 1).bit_length(),
+        BLOCK=256,
+    )

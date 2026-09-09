@@ -179,6 +179,9 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
+        # Scheduler step that produced spec_token_ids. Async scheduling uses
+        # this to keep drafts from adjacent generations of one request apart.
+        self.spec_token_ids_step_id: int | None = None
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 

@@ -8,7 +8,8 @@ import pytest
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar
 from vllm.v1.utils import ConstantList
@@ -301,6 +302,156 @@ def test_prefix_caching_for_multi_turn():
         assert sched_output.num_scheduled_tokens[req.request_id] == (
             req.num_prompt_tokens % BLOCK_SIZE
         )
+
+
+def _make_structured_draft_scheduler(num_requests: int = 1):
+    scheduler = object.__new__(AsyncScheduler)
+    scheduler.structured_output_manager = Mock()
+    scheduler.structured_output_manager.should_advance.return_value = True
+    scheduler._pending_draft_token_ids = {}
+    scheduler._max_pending_draft_token_ids = 16
+
+    requests = create_requests(num_requests=num_requests)
+    for request in requests:
+        request.status = RequestStatus.RUNNING
+        request.is_prefill_chunk = False
+        request.structured_output_request = Mock()
+        grammar = request.structured_output_request.grammar
+        grammar.validate_tokens.side_effect = lambda token_ids: list(token_ids)
+    scheduler.requests = {request.request_id: request for request in requests}
+    return scheduler, requests
+
+
+def _make_draft_consumer_output(
+    request_step_ids: dict[str, int], num_spec_tokens: int = 3
+) -> SchedulerOutput:
+    output = SchedulerOutput.make_empty()
+    output.scheduler_step_id = max(request_step_ids.values(), default=0) + 1
+    output.scheduled_spec_decode_tokens = {
+        req_id: [-1] * num_spec_tokens for req_id in request_step_ids
+    }
+    output.scheduled_spec_decode_step_ids = request_step_ids
+    return output
+
+
+def test_async_draft_placeholders_are_bound_to_producer_step(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    scheduler, (request,) = _make_structured_draft_scheduler()
+    scheduler.num_spec_tokens = 3
+    scheduler.num_sampled_tokens_per_step = 1
+    scheduler._spec_token_placeholders = [-1] * scheduler.num_spec_tokens
+    scheduler.pp_size = 3
+    scheduler.use_v2_model_runner = True
+    scheduler.current_step = 17
+    monkeypatch.setattr(Scheduler, "_update_after_schedule", lambda *_: None)
+
+    output = SchedulerOutput.make_empty()
+    output.scheduler_step_id = scheduler.current_step
+    output.num_spec_tokens_to_schedule = scheduler.num_spec_tokens
+    output.num_scheduled_tokens = {request.request_id: 1}
+
+    scheduler._update_after_schedule(output)
+
+    assert request.spec_token_ids == [-1] * scheduler.num_spec_tokens
+    assert request.spec_token_ids_step_id == output.scheduler_step_id
+
+
+def test_draft_handoff_separates_generations_of_same_request():
+    scheduler, (request,) = _make_structured_draft_scheduler()
+    request.spec_token_ids = [-1, -1, -1]
+    request.spec_token_ids_step_id = 11
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            [request.request_id],
+            [[101, 102, 103]],
+            producer_step_id=10,
+        )
+    )
+    assert request.spec_token_ids == [-1, -1, -1]
+    assert scheduler._pending_draft_token_ids[(request.request_id, 10)] == [
+        101,
+        102,
+        103,
+    ]
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            [request.request_id],
+            [[201, 202, 203]],
+            producer_step_id=11,
+        )
+    )
+    assert request.spec_token_ids == [201, 202, 203]
+
+    consumer_output = _make_draft_consumer_output({request.request_id: 10})
+    scheduler.update_draft_token_ids_in_output(None, consumer_output)
+
+    assert consumer_output.scheduled_spec_decode_tokens[request.request_id] == [
+        101,
+        102,
+        103,
+    ]
+    assert not scheduler._pending_draft_token_ids
+
+
+def test_draft_handoff_isolates_requests_and_fails_closed_on_mismatch():
+    scheduler, requests = _make_structured_draft_scheduler(num_requests=2)
+    req0, req1 = requests
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            [req0.request_id, req1.request_id],
+            [[10, 11, 12], [20, 21, 22]],
+            producer_step_id=7,
+        )
+    )
+
+    consumer_output = _make_draft_consumer_output(
+        {req0.request_id: 7, req1.request_id: 8}
+    )
+    scheduler.update_draft_token_ids_in_output(None, consumer_output)
+
+    assert consumer_output.scheduled_spec_decode_tokens[req0.request_id] == [
+        10,
+        11,
+        12,
+    ]
+    assert consumer_output.scheduled_spec_decode_tokens[req1.request_id] == [
+        -1,
+        -1,
+        -1,
+    ]
+    assert consumer_output.num_invalid_spec_tokens == {req1.request_id: 3}
+    assert scheduler._pending_draft_token_ids[(req1.request_id, 7)] == [
+        20,
+        21,
+        22,
+    ]
+
+
+def test_pending_draft_cache_is_bounded_and_cleared_per_request():
+    scheduler, requests = _make_structured_draft_scheduler(num_requests=2)
+    req0, req1 = requests
+    scheduler._max_pending_draft_token_ids = 2
+
+    scheduler._cache_pending_draft_token_ids(req0.request_id, 1, [1])
+    scheduler._cache_pending_draft_token_ids(req0.request_id, 2, [2])
+    scheduler._cache_pending_draft_token_ids(req1.request_id, 3, [3])
+
+    assert len(scheduler._pending_draft_token_ids) == 2
+    assert (req0.request_id, 1) not in scheduler._pending_draft_token_ids
+    scheduler._discard_pending_draft_token_ids(req0.request_id)
+    assert scheduler._pending_draft_token_ids == {(req1.request_id, 3): [3]}
+
+
+def test_legacy_draft_handoff_remains_supported():
+    scheduler, (request,) = _make_structured_draft_scheduler()
+    request.spec_token_ids = [-1, -1, -1]
+
+    scheduler.update_draft_token_ids(DraftTokenIds([request.request_id], [[1, 2, 3]]))
+
+    assert request.spec_token_ids == [1, 2, 3]
 
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():

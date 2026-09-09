@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
@@ -68,6 +69,13 @@ def compress_norm_rope_store_triton(
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
+        if (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(80)
+            and envs.VLLM_DSV4_SM80_COMPRESSOR_TUNING
+        ):
+            rows = (2 if overlap else 1) * compress_ratio
+            num_warps = max(4, min(16, rows // 2))
         kernel_kwargs = {"SANITIZE_CACHE_NANS": _ON_GFX950}
     elif use_fp4_cache:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn

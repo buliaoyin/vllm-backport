@@ -104,6 +104,31 @@ def _split_tensor_dict(
     return metadata_list, tensor_list
 
 
+def _get_preallocated_recv_tensor(
+    metadata: TensorMetadata,
+    recv_tensor: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if (
+        recv_tensor is None
+        or recv_tensor.dtype != metadata.dtype
+        or recv_tensor.device.type != metadata.device
+        or not recv_tensor.is_contiguous()
+    ):
+        return None
+
+    size = metadata.size
+    if tuple(recv_tensor.shape) == tuple(size):
+        return recv_tensor
+    if (
+        recv_tensor.ndim == 0
+        or recv_tensor.ndim != len(size)
+        or recv_tensor.shape[0] < size[0]
+        or tuple(recv_tensor.shape[1:]) != tuple(size[1:])
+    ):
+        return None
+    return recv_tensor[: size[0]]
+
+
 _group_name_counter: dict[str, int] = {}
 
 
@@ -971,7 +996,7 @@ class GroupCoordinator:
         all_gather_group: "GroupCoordinator | None",
         all_gather_tensors: dict[str, bool] | None,
     ) -> bool:
-        if all_gather_group is None:
+        if all_gather_group is None or all_gather_group.world_size == 1:
             return False
         use_all_gather = numel % all_gather_group.world_size == 0
         if all_gather_tensors is not None:
@@ -1116,6 +1141,7 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        recv_buffers: dict[str, torch.Tensor] | None = None,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -1152,9 +1178,12 @@ class GroupCoordinator:
 
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                full_tensor = torch.empty(
-                    value.size, dtype=value.dtype, device=value.device
-                )
+                recv_tensor = None if recv_buffers is None else recv_buffers.get(key)
+                full_tensor = _get_preallocated_recv_tensor(value, recv_tensor)
+                if full_tensor is None:
+                    full_tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
                 if full_tensor.numel() == 0:
                     tensor_dict[key] = full_tensor
                     continue

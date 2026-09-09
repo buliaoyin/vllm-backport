@@ -309,6 +309,10 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        self._pending_draft_token_ids: dict[tuple[str, int], list[int]] = {}
+        self._max_pending_draft_token_ids = (
+            max(1, vllm_config.max_concurrent_batches) * self.max_num_running_reqs
+        )
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -531,6 +535,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        scheduled_spec_decode_step_ids: dict[str, int] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
 
@@ -688,6 +693,7 @@ class Scheduler(SchedulerInterface):
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            scheduled_spec_decode_step_ids.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
                             )
@@ -739,10 +745,17 @@ class Scheduler(SchedulerInterface):
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                    if request.spec_token_ids_step_id is not None and any(
+                        token_id < 0 for token_id in spec_token_ids
+                    ):
+                        scheduled_spec_decode_step_ids[request.request_id] = (
+                            request.spec_token_ids_step_id
+                        )
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
                 request.spec_token_ids = []
+                request.spec_token_ids_step_id = None
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -1325,6 +1338,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_spec_decode_step_ids=(scheduled_spec_decode_step_ids or None),
+            scheduler_step_id=self.current_step,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             scheduled_encoder_input_stats=scheduled_encoder_input_stats,
             num_common_prefix_blocks=num_common_prefix_blocks,
@@ -1413,6 +1428,8 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        request.spec_token_ids_step_id = None
+        self._discard_pending_draft_token_ids(request.request_id)
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains
@@ -2307,63 +2324,192 @@ class Scheduler(SchedulerInterface):
                 # rejection or drafter gather can reference it.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
+    def _validate_draft_token_ids(
+        self, request: Request, spec_token_ids: list[int]
+    ) -> list[int]:
+        spec_token_ids = list(spec_token_ids)
+        if self.structured_output_manager.should_advance(request):
+            metadata = request.structured_output_request
+            assert metadata is not None
+            grammar = metadata.grammar
+            assert grammar is not None and not isinstance(grammar, Exception)
+            spec_token_ids = grammar.validate_tokens(spec_token_ids)
+        return spec_token_ids
+
+    def _cache_pending_draft_token_ids(
+        self, request_id: str, producer_step_id: int, spec_token_ids: list[int]
+    ) -> None:
+        key = (request_id, producer_step_id)
+        if (
+            key not in self._pending_draft_token_ids
+            and len(self._pending_draft_token_ids) >= self._max_pending_draft_token_ids
+        ):
+            stale_key = next(iter(self._pending_draft_token_ids))
+            self._pending_draft_token_ids.pop(stale_key)
+            logger.warning_once(
+                "The pending batch-bound draft cache is full; evicting old "
+                "entries and using target-only decoding if they are requested."
+            )
+            logger.debug(
+                "Evicted draft tokens for request %s from producer scheduler step %d.",
+                stale_key[0],
+                stale_key[1],
+            )
+        self._pending_draft_token_ids[key] = list(spec_token_ids)
+
+    def _discard_pending_draft_token_ids(self, request_id: str) -> None:
+        stale_keys = [
+            key for key in self._pending_draft_token_ids if key[0] == request_id
+        ]
+        for key in stale_keys:
+            self._pending_draft_token_ids.pop(key)
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        producer_step_id = draft_token_ids.producer_step_id
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
-                # The request may have been finished. Skip.
                 continue
 
             if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
-                if request.spec_token_ids:
+                if (
+                    producer_step_id is None
+                    or request.spec_token_ids_step_id == producer_step_id
+                ):
                     request.spec_token_ids = []
+                    request.spec_token_ids_step_id = None
                 continue
 
-            # Add newly generated spec token ids to the request.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
-            request.spec_token_ids = spec_token_ids
+            if producer_step_id is None:
+                request.spec_token_ids = self._validate_draft_token_ids(
+                    request, spec_token_ids
+                )
+                request.spec_token_ids_step_id = None
+                continue
+
+            if (
+                request.status != RequestStatus.RUNNING
+                or not request.use_structured_output
+            ):
+                continue
+
+            if request.spec_token_ids_step_id == producer_step_id:
+                request.spec_token_ids = self._validate_draft_token_ids(
+                    request, spec_token_ids
+                )
+            else:
+                self._cache_pending_draft_token_ids(
+                    req_id, producer_step_id, spec_token_ids
+                )
+
+    def _prepare_draft_token_ids_for_output(
+        self, request: Request, spec_token_ids: list[int], num_spec_tokens: int
+    ) -> tuple[list[int], int]:
+        spec_token_ids = self._validate_draft_token_ids(
+            request, spec_token_ids[:num_spec_tokens]
+        )
+        spec_token_ids = spec_token_ids[:num_spec_tokens]
+        num_invalid_tokens = num_spec_tokens - len(spec_token_ids)
+        if num_invalid_tokens:
+            spec_token_ids.extend([-1] * num_invalid_tokens)
+        return spec_token_ids, num_invalid_tokens
 
     def update_draft_token_ids_in_output(
-        self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
+        self,
+        draft_token_ids: DraftTokenIds | None,
+        scheduler_output: SchedulerOutput,
     ) -> None:
-        num_invalid_spec_tokens: dict[str, int] = {}
-
+        num_invalid_spec_tokens = dict(scheduler_output.num_invalid_spec_tokens or {})
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        for req_id, spec_token_ids in zip(
-            draft_token_ids.req_ids,
-            draft_token_ids.draft_token_ids,
-        ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
-                continue
 
+        if draft_token_ids is not None and draft_token_ids.producer_step_id is None:
+            for req_id, spec_token_ids in zip(
+                draft_token_ids.req_ids,
+                draft_token_ids.draft_token_ids,
+            ):
+                request = self.requests.get(req_id)
+                placeholder_spec_tokens = sched_spec_tokens.get(req_id)
+                if (
+                    request is None
+                    or request.is_finished()
+                    or not placeholder_spec_tokens
+                ):
+                    continue
+                prepared_tokens, num_invalid_tokens = (
+                    self._prepare_draft_token_ids_for_output(
+                        request, spec_token_ids, len(placeholder_spec_tokens)
+                    )
+                )
+                sched_spec_tokens[req_id] = prepared_tokens
+                if num_invalid_tokens:
+                    num_invalid_spec_tokens[req_id] = num_invalid_tokens
+            scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+            return
+
+        provided_drafts: dict[tuple[str, int], list[int]] = {}
+        if draft_token_ids is not None:
+            producer_step_id = draft_token_ids.producer_step_id
+            assert producer_step_id is not None
+            provided_drafts = {
+                (req_id, producer_step_id): spec_token_ids
+                for req_id, spec_token_ids in zip(
+                    draft_token_ids.req_ids,
+                    draft_token_ids.draft_token_ids,
+                )
+            }
+
+        expected_steps = scheduler_output.scheduled_spec_decode_step_ids or {}
+        for req_id, producer_step_id in expected_steps.items():
+            key = (req_id, producer_step_id)
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
             if not placeholder_spec_tokens:
+                self._pending_draft_token_ids.pop(key, None)
                 continue
 
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                self._pending_draft_token_ids.pop(key, None)
+                continue
+
+            matched_spec_token_ids: list[int] | None = provided_drafts.get(key)
+            if matched_spec_token_ids is None:
+                matched_spec_token_ids = self._pending_draft_token_ids.pop(key, None)
+            else:
+                self._pending_draft_token_ids.pop(key, None)
+
             orig_num_spec_tokens = len(placeholder_spec_tokens)
-            # Trim drafts to scheduled number of spec tokens
-            # (needed for chunked prefill case for example).
-            del spec_token_ids[orig_num_spec_tokens:]
-            # Filter out spec tokens which do not adhere to the grammar.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
-            # Pad to original number of spec tokens.
-            num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
+            if (
+                matched_spec_token_ids is None
+                or request.status != RequestStatus.RUNNING
+            ):
+                sched_spec_tokens[req_id] = [-1] * orig_num_spec_tokens
+                num_invalid_spec_tokens[req_id] = orig_num_spec_tokens
+                logger.warning_once(
+                    "Batch-bound draft tokens were unavailable for a structured-"
+                    "output decode; using target-only decoding for affected steps."
+                )
+                logger.debug(
+                    "Missing draft tokens for request %s from producer scheduler "
+                    "step %d in consumer scheduler step %d.",
+                    req_id,
+                    producer_step_id,
+                    scheduler_output.scheduler_step_id,
+                )
+                continue
+
+            prepared_tokens, num_invalid_tokens = (
+                self._prepare_draft_token_ids_for_output(
+                    request, matched_spec_token_ids, orig_num_spec_tokens
+                )
+            )
+            sched_spec_tokens[req_id] = prepared_tokens
             if num_invalid_tokens:
-                spec_token_ids.extend([-1] * num_invalid_tokens)
                 num_invalid_spec_tokens[req_id] = num_invalid_tokens
 
-            sched_spec_tokens[req_id] = spec_token_ids
-
+        scheduler_output.scheduled_spec_decode_step_ids = None
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
 
     def get_request_counts(self) -> tuple[int, int]:
@@ -2469,6 +2615,7 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        self._discard_pending_draft_token_ids(request.request_id)
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
@@ -2588,6 +2735,22 @@ class Scheduler(SchedulerInterface):
                 and self.ec_connector.has_pending_push_work()
             )
         )
+
+    def has_structured_output_in_flight(
+        self, scheduler_output: SchedulerOutput
+    ) -> bool:
+        if self.use_v2_model_runner:
+            return False
+
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if request is not None and request.use_structured_output:
+                current_step_placeholders = self.num_sampled_tokens_per_step + len(
+                    scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+                )
+                if request.num_output_placeholders > current_step_placeholders:
+                    return True
+        return False
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

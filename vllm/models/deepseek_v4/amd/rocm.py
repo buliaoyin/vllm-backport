@@ -34,11 +34,14 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    build_query_blocks,
     build_ragged_indices_from_dense,
     lengths_to_indptr,
+    prefill_query_block_size,
     rocm_inv_rope_einsum,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
+    rocm_sparse_attn_prefill_blocked,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -391,8 +394,12 @@ class _PrefillChunkSlices:
     gather_lens: torch.Tensor
     swa_block_table: torch.Tensor
     query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
     compressed_seq_lens: torch.Tensor | None
     compressed_block_table: torch.Tensor | None
+    query_blocks: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -914,6 +921,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             nope_head_dim=self.nope_head_dim,
             rope_head_dim=self.rope_head_dim,
             output=output,
+            compress_ratio=self.compress_ratio,
             adaptive_splits=adaptive_splits,
             extra_cache_nan_free=_trust_dsv4_extra_cache_nan_free(
                 self.kv_cache_dtype,
@@ -971,6 +979,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     query_start_loc=query_start_loc[
                         num_decodes + chunk_start : num_decodes + chunk_end + 1
                     ],
+                    query_start_loc_cpu=query_start_loc_cpu[
+                        num_decodes + chunk_start : num_decodes + chunk_end + 1
+                    ],
                     compressed_seq_lens=(
                         None
                         if compressed_block_table is None
@@ -1022,6 +1033,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             compressed_block_size = 0
 
         M = N + self.window_size + self.max_num_batched_tokens
+        # Image spans need the existing bidirectional index construction.
+        block_m = (
+            prefill_query_block_size(q.shape[1], q.shape[2])
+            if current_platform.is_cuda()
+            and current_platform.is_device_capability(80)
+            and not swa_only
+            and self.compress_ratio == 128
+            and swa_metadata.prefill_left_visible is None
+            and swa_metadata.prefill_right_visible is None
+            else 0
+        )
 
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
@@ -1056,6 +1078,36 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 offset=N,
                 use_fnuz=current_platform.is_fp8_fnuz(),
             )
+
+            if block_m:
+                blocks = chunk.query_blocks.get(block_m)
+                if blocks is None:
+                    blocks = build_query_blocks(
+                        chunk.query_start_loc_cpu, block_m, q.device
+                    )
+                    chunk.query_blocks[block_m] = blocks
+                rocm_sparse_attn_prefill_blocked(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    block_req=blocks[0],
+                    block_qstart=blocks[1],
+                    query_start_loc=chunk.query_start_loc,
+                    seq_lens=chunk.seq_lens,
+                    gather_lens=chunk.gather_lens,
+                    scale=self.scale,
+                    head_dim=self.head_dim,
+                    nope_head_dim=self.nope_head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    attn_sink=self.attn_sink,
+                    top_k=top_k,
+                    row_stride=M,
+                    swa_offset=N,
+                    compress_ratio=self.compress_ratio,
+                    window_size=self.window_size,
+                    block_m=block_m,
+                    output=output[query_start:query_end],
+                )
+                continue
 
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],

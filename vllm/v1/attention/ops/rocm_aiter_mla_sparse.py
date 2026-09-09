@@ -1582,7 +1582,7 @@ def _sparse_attn_prefill_ragged_kernel(
         )
 
         scores = tl.dot(q, tl.trans(kv)) * scale
-        if EXACT_TILE:
+        if EXACT_TILE:  # noqa: SIM108 - Triton compile-time branch
             keep = valid[None, :]
         else:
             keep = head_mask[:, None] & valid[None, :]
@@ -3075,9 +3075,7 @@ def _rocm_sparse_attn_prefill_blocked_triton(
 
     if out is None:
         out = torch.empty_like(q, dtype=torch.bfloat16)
-    _sparse_attn_prefill_blocked_kernel[
-        (block_req.numel(), num_heads // block_h)
-    ](
+    _sparse_attn_prefill_blocked_kernel[(block_req.numel(), num_heads // block_h)](
         q,
         kv,
         block_req,
@@ -3177,11 +3175,9 @@ def _decode_maxnreg_kwargs() -> dict[str, int]:
     return {"maxnreg": cap} if cap > 0 else {}
 
 
-
 @functools.lru_cache
 def _exact_tile_enabled() -> bool:
     return envs.VLLM_SPARSE_PREFILL_EXACT_TILE
-
 
 
 @functools.lru_cache
@@ -3203,27 +3199,25 @@ def _sparse_block_h(num_heads: int) -> int:
     return min(16, max(8, triton.next_power_of_2(num_heads)))
 
 
-
 @functools.lru_cache
 def _use_fast_scan() -> bool:
     return envs.VLLM_SPARSE_RAGGED_FAST_SCAN
-
 
 
 @functools.lru_cache
 def prefill_query_block_size(num_heads: int, head_dim: int) -> int:
     """Query tile for the ratio-128 prefill layers; 0 means "use the old path".
 
-    BLOCK_M=8 is measured, not chosen: at the deep chunk (M=15,360, depth
-    200k) it runs 4,339 us against the per-query kernel's 12,178, and 16 is
-    unbuildable -- its q tile alone asks for 204,800 B of shared memory
-    against A100's 166,912 B limit, so 8 is the widest tile this kernel has.
+    Auto mode limits the query/head tile to 64 rows to fit SM80 shared memory.
+    This gives BLOCK_M=4 for TP1's 16-head tile and 8 for an 8-head tile.
 
     Ranks whose head count is not a multiple of the head tile, or whose head
     dim is not a power of two, keep the per-query kernel: the blocked one loads
     those two dimensions unmasked.
     """
-    block_m = _query_block_size(envs.VLLM_SPARSE_DENSE_QUERY_BLOCK, 8)
+    block_m = _query_block_size(
+        envs.VLLM_SPARSE_DENSE_QUERY_BLOCK, 64 // _sparse_block_h(num_heads)
+    )
     if block_m == 0:
         return 0
     if num_heads % _sparse_block_h(num_heads) or head_dim != triton.next_power_of_2(
@@ -3239,7 +3233,7 @@ def prefill_query_block_size(num_heads: int, head_dim: int) -> int:
     # forced env value is honored verbatim -- whoever sets it owns the trade.
     if envs.VLLM_SPARSE_DENSE_QUERY_BLOCK == -1:
         smem_limit = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
+            torch.accelerator.current_device_index()
         ).shared_memory_per_block_optin
         if smem_limit < 160 * 1024:
             return 0
@@ -3278,7 +3272,7 @@ def decode_block_tile(
     # fits A100's 163 KB but not sm86/sm89's ~99 KB. Decline rather than let
     # a forced env value hit Triton's OutOfResources at launch.
     smem_limit = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
+        torch.accelerator.current_device_index()
     ).shared_memory_per_block_optin
     if block_m * 17920 > smem_limit:
         return 0
@@ -3551,6 +3545,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     out: torch.Tensor | None = None,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    compress_ratio: int = 0,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -3615,7 +3610,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
-    block_h = 16
+    is_sm80 = current_platform.is_cuda() and current_platform.is_device_capability(80)
+    block_h = _sparse_block_h(num_heads) if is_sm80 else 16
     if out is None:
         out = torch.empty_like(q, dtype=torch.bfloat16)
     else:
@@ -3626,6 +3622,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         assert out.dtype == torch.bfloat16, (
             f"expected out dtype {torch.bfloat16}, got {out.dtype}"
         )
+    assert out.stride(-1) == 1, "Sparse decode output requires contiguous head dims"
     heads_blocks = triton.cdiv(num_heads, block_h)
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
@@ -3672,7 +3669,11 @@ def _rocm_sparse_attn_decode_ragged_triton(
         )
         return out
 
-    block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
+    block_k = (
+        64
+        if is_sm80 and compress_ratio == 4 and not envs.VLLM_DSV4_UNIFORM_DECODE_BLOCK_K
+        else 32
+    )
     if _ON_GFX950:
         inv_q = 1.0 / max(1, num_queries)
         avg_main_len = main_indices.numel() * inv_q
@@ -3693,6 +3694,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
         num_splits = _decode_num_splits(
             num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
         )
+
+    if is_sm80 and envs.VLLM_DSV4_FIXED_DECODE_SPLITS > 0:
+        num_splits = min(envs.VLLM_DSV4_FIXED_DECODE_SPLITS, 16)
 
     base_workgroups = num_queries * heads_blocks
     adaptive_splits = (
@@ -3795,7 +3799,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_K=block_k,
             NUM_SPLITS=num_splits,
             NUM_STAGES=1,
-            num_warps=4,
+            # More warps avoid spills from SM80's wide per-head accumulators.
+            num_warps=8 if is_sm80 and block_h == 16 else 4,
         )
 
     _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](
@@ -3842,6 +3847,7 @@ def _rocm_sparse_attn_decode_triton(
     out: torch.Tensor | None = None,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    compress_ratio: int = 0,
 ) -> torch.Tensor:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
@@ -3880,6 +3886,7 @@ def _rocm_sparse_attn_decode_triton(
         out=out,
         extra_cache_nan_free=extra_cache_nan_free,
         adaptive_splits=adaptive_splits,
+        compress_ratio=compress_ratio,
     )
 
 
@@ -4020,6 +4027,7 @@ def rocm_sparse_attn_decode(
     output: torch.Tensor,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    compress_ratio: int = 0,
 ) -> None:
     assert swa_k_cache.dtype == torch.uint8, (
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
@@ -4069,6 +4077,7 @@ def rocm_sparse_attn_decode(
         out=direct_out,
         extra_cache_nan_free=extra_cache_nan_free,
         adaptive_splits=adaptive_splits,
+        compress_ratio=compress_ratio,
     )
     if direct_out is None:
         output.copy_(attn_out.to(output.dtype))

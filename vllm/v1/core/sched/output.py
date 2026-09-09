@@ -286,6 +286,14 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Monotonic scheduler invocation that produced this batch.
+    scheduler_step_id: int = 0
+
+    # req_id -> scheduler step that produced the scheduled draft tokens.
+    # Entries exist only for real asynchronous draft placeholders, not for
+    # target-only padding tokens.
+    scheduled_spec_decode_step_ids: dict[str, int] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

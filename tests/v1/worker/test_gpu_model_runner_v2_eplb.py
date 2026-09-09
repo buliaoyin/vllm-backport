@@ -4,7 +4,9 @@
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
+import pytest
 import torch
 
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
@@ -93,6 +95,8 @@ def _make_runner(**overrides: Any) -> Any:
 
 def test_v2_load_model_registers_moe_with_eplb(monkeypatch):
     FakeEplbState.instances.clear()
+    offloader = Mock()
+    monkeypatch.setattr(mrv2, "get_offloader", lambda: offloader)
     model = SimpleNamespace(is_moe=True)
 
     monkeypatch.setattr(mrv2, "DeviceMemoryProfiler", FakeMemoryProfiler)
@@ -118,6 +122,7 @@ def test_v2_load_model_registers_moe_with_eplb(monkeypatch):
     runner = _make_runner(is_last_pp_rank=False)
     mrv2.GPUModelRunner.load_model(runner)
 
+    offloader.post_init.assert_called_once_with()
     assert runner.model is model
     assert runner.model_state is not None
     assert runner.eplb_state is not None
@@ -183,6 +188,7 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
         finished_req_ids=set(),
         ec_connector_output=None,
         routed_experts=None,
+        scheduler_step_id=0,
     )
     runner.req_states = SimpleNamespace()
 
@@ -200,3 +206,14 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     output = mrv2.GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
     assert events == ["receive", "postprocess_num_computed_tokens", "eplb"]
+
+
+def test_v2_execute_model_rejects_second_batch_before_sampling():
+    runner = _make_runner()
+    runner.execute_model_state = object()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"sample_tokens\(\) must be called after execute_model\(\)",
+    ):
+        runner.execute_model(SimpleNamespace(), dummy_run=False)

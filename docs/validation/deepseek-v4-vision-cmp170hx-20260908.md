@@ -6,6 +6,8 @@
 
 本机已能通过 PP4 运行模型的真实视觉推理。关闭 MTP 和启用 DSpark 3 时，中英文 OCR、自然图片、表格、计数、位置关系、多图顺序和图文混排均通过功能检查。推荐使用 V2 执行器和默认计算图；eager 模式速度明显较低。
 
+补充验证：**只使用 GPU 0、1、2 三张 CMP 170HX 也能运行视觉推理与 DSpark 3**，无需第四张 Blackwell。具体配置、结果和显存限制见“三卡补充验证”。
+
 本次 GSM8K 是测试集前 32 题抽查，**不是 1,319 题全量成绩**。视觉检查是明确答案的功能探针，**不是 OCRBench/MMMU 等标准视觉基准成绩**。
 
 ## 机器和模型
@@ -140,6 +142,63 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 ```
 
 关闭 DSpark 时删除 `--speculative-config` 参数。用于本报告探针的请求还设置 `chat_template_kwargs={"thinking": false}`。
+
+## 三卡补充验证
+
+使用当前工作区的 `9201d9936`，仅设置 `CUDA_VISIBLE_DEVICES=0,1,2`。无需新增代码修改或修改权重；环境仍为 conda `vllm-backport`。
+
+主模型采用 PP3 / TP1，43 层分为 `15,16,12`。最后一张卡还承载 DSpark 草稿模型，因此分配较少的主模型层。沿用 V2 执行器、计算图、FP8 KV、8K 上下文、最多 4 条序列和每请求最多 2 张图片，将显存利用率设为 `0.95`。实际完成启动、图捕获及请求推理，第四张卡无模型进程。
+
+| 检查 | 三卡 / DSpark 3 结果 |
+| --- | --- |
+| 单并发图文检查 | 20/20，含 19 项视觉和 1 项文本算术 |
+| 四并发图文检查 | 20/20，含 OCR、多图、图文混排和缓存复用 |
+| 四并发长前缀图片 | 4/4，每请求输入 5,635 token |
+| GSM8K 测试集前 32 题 | 32/32，19.52 秒；不是全量测试 |
+| GSM8K 草稿接受率 | 73.1% |
+| 本轮请求抢占计数 | 0 |
+
+测速沿用上文相同的三个提示，单并发、固定生成 256 token、关闭 thinking，并排除首 token 等待时间：
+
+| 配置 | 中文 token/s | 代码 token/s | 英文 token/s |
+| --- | --- | --- | --- |
+| 三张 CMP 170HX / PP3 / DSpark 3 | 71.02 | 105.90 | 78.04 |
+| 三张 CMP 170HX 加 Blackwell / PP4 / DSpark 3 | 74.70 | 107.80 | 78.97 |
+
+本轮三卡解码速度约为此前四卡的 95.1%、98.2%、98.8%。这只是相同短提示下的单轮结果，不能推断长输入或大并发吞吐量也相近。三卡本轮未单独测试关闭 MTP 的配置。
+
+显存是三卡方案的主要限制。加载模型后，各卡模型占用分别为 52.45、54.57、53.66 GiB；完成测试时 `nvidia-smi` 显示总占用分别为 60,446、63,410、61,692 MiB，包含 KV 缓存和运行时分配，**不是峰值测量**。第四张卡为 15 MiB。
+
+引擎报告 KV 容量约 20,151 token，相当于 2.46 条完整 8,192-token 请求。`max-num-seqs=4` 是调度上限，**不表示四条满 8K 请求能够同时驻留**；上述长前缀用例可复用公共前缀，也不能据此扩大容量结论。
+
+三卡实际启动命令：
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 \
+NCCL_P2P_DISABLE=1 \
+VLLM_PP_LAYER_PARTITION=15,16,12 \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+/home/bul/miniconda3/envs/vllm-backport/bin/vllm serve \
+  /home/bul/dev/models1/DeepSeek/DeepSeek-V4-Flash-Vision-Exp \
+  --served-model-name local \
+  --pipeline-parallel-size 3 \
+  --tensor-parallel-size 1 \
+  --max-model-len 8192 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 2048 \
+  --gpu-memory-utilization 0.95 \
+  --kv-cache-dtype fp8 \
+  --block-size 256 \
+  --limit-mm-per-prompt '{"image":2}' \
+  --reasoning-parser deepseek_v4 \
+  --tool-call-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --speculative-config '{"method":"dspark","model":"/home/bul/dev/models1/DeepSeek/DeepSeek-V4-Flash-Vision-Exp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","enable_adaptive_verification":false}' \
+  --host 127.0.0.1 \
+  --port 8001
+```
+
+原始记录目录中新增 `pp3/`，包含启动日志、配置、显存快照、最终指标和 `summary.json`；请求与响应分别保存于 `probes-pp3-dspark3/`、`probes-pp3-dspark3-c4/`、`long-vision-pp3-dspark3/` 和 `text-pp3-dspark3/`。验证结束后已停止服务并释放显存。
 
 ## 原始记录和范围
 

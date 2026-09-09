@@ -321,6 +321,17 @@ class ECConnectorOutput:
         )
 
 
+@dataclass
+class DraftTokenIds:
+    # [num_reqs]
+    req_ids: list[str]
+    # num_reqs x num_draft_tokens
+    draft_token_ids: list[list[int]]
+    # The producing step for async V2 batches. Synchronous V2 and V1
+    # leave it unset and update drafts before scheduling the next batch.
+    producer_step_id: int | None = None
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -375,6 +386,8 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+    # V2 drafts travel with the output of their producer batch.
+    draft_token_ids: DraftTokenIds | None = None
 
     @staticmethod
     def with_kv_conn_output_only(
@@ -427,14 +440,6 @@ class AsyncModelRunnerOutput(ABC):
         This method should only be called once per AsyncModelRunnerOutput.
         """
         pass
-
-
-@dataclass
-class DraftTokenIds:
-    # [num_reqs]
-    req_ids: list[str]
-    # num_reqs x num_draft_tokens
-    draft_token_ids: list[list[int]]
 
 
 def make_empty_encoder_model_runner_output(

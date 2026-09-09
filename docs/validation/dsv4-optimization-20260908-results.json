@@ -1,0 +1,556 @@
+{
+  "baseline": {
+    "gsm/gsm-summary.json": {
+      "count": 32,
+      "shots": 5,
+      "concurrency": 4,
+      "thinking": false,
+      "max_tokens": 4096,
+      "test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+      "passed": 32,
+      "elapsed_s": 20.319610236008884,
+      "metrics": {
+        "draft_tokens": 3252.0,
+        "accepted_tokens": 2349.0,
+        "acceptance_rate": 0.7223247232472325,
+        "mean_acceptance_length": 3.1669741697416973,
+        "prefix_hits": 15872.0
+      }
+    },
+    "vision/summary.json": {
+      "passed": 20,
+      "count": 20
+    },
+    "structured-summary.json": {
+      "passed": 20,
+      "count": 48
+    },
+    "decode_tps_median": {
+      "chinese": 71.63810596544968,
+      "code": 106.74047836882099,
+      "english": 84.10154238151738
+    }
+  },
+  "phase1-retry": {
+    "gsm/gsm-summary.json": {
+      "count": 32,
+      "shots": 5,
+      "concurrency": 4,
+      "thinking": false,
+      "max_tokens": 4096,
+      "test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+      "passed": 32,
+      "elapsed_s": 19.586983140994562,
+      "metrics": {
+        "draft_tokens": 3216.0,
+        "accepted_tokens": 2370.0,
+        "acceptance_rate": 0.7369402985074627,
+        "mean_acceptance_length": 3.2108208955223883,
+        "prefix_hits": 15872.0
+      }
+    },
+    "vision/summary.json": {
+      "passed": 20,
+      "count": 20
+    },
+    "structured-summary.json": {
+      "passed": 48,
+      "count": 48
+    },
+    "decode_tps_median": {
+      "chinese": 71.56751008723641,
+      "code": 107.09306300723763,
+      "english": 84.1982957109667
+    }
+  },
+  "optimized": {
+    "gsm/gsm-summary.json": {
+      "count": 1319,
+      "shots": 5,
+      "concurrency": 4,
+      "thinking": false,
+      "max_tokens": 4096,
+      "test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+      "passed": 1271,
+      "elapsed_s": 764.2604391589994,
+      "metrics": {
+        "draft_tokens": 123234.0,
+        "accepted_tokens": 92203.0,
+        "acceptance_rate": 0.748194491779866,
+        "mean_acceptance_length": 3.244583475339598,
+        "prefix_hits": 674816.0
+      }
+    },
+    "vision/summary.json": {
+      "passed": 20,
+      "count": 20
+    },
+    "structured-summary.json": {
+      "passed": 48,
+      "count": 48
+    },
+    "decode_tps_median": {
+      "chinese": 73.77477996010914,
+      "code": 103.4969323526737,
+      "english": 78.46435185542634
+    }
+  },
+  "mtp-off": {
+    "gsm/gsm-summary.json": {
+      "count": 1319,
+      "shots": 5,
+      "concurrency": 4,
+      "thinking": false,
+      "max_tokens": 4096,
+      "test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+      "passed": 1271,
+      "elapsed_s": 1166.6686690610077,
+      "metrics": {
+        "draft_tokens": 0,
+        "accepted_tokens": 0,
+        "acceptance_rate": null,
+        "mean_acceptance_length": null,
+        "prefix_hits": 674816.0
+      }
+    },
+    "vision/summary.json": {
+      "passed": 20,
+      "count": 20
+    },
+    "structured-summary.json": {
+      "passed": 48,
+      "count": 48
+    },
+    "decode_tps_median": {
+      "chinese": 51.9124339533505,
+      "code": 51.90319925200902,
+      "english": 51.96678885119771
+    }
+  },
+  "final-async": {
+    "gsm/gsm-summary.json": {
+      "count": 32,
+      "shots": 5,
+      "concurrency": 4,
+      "thinking": false,
+      "max_tokens": 4096,
+      "test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+      "passed": 31,
+      "elapsed_s": 19.449296786013292,
+      "metrics": {
+        "draft_tokens": 3147.0,
+        "accepted_tokens": 2333.0,
+        "acceptance_rate": 0.7413409596441055,
+        "mean_acceptance_length": 3.2240228789323164,
+        "prefix_hits": 15872.0
+      }
+    },
+    "vision/summary.json": {
+      "passed": 20,
+      "count": 20
+    },
+    "structured-summary.json": {
+      "passed": 48,
+      "count": 48
+    },
+    "decode_tps_median": {
+      "chinese": 73.75698353546039,
+      "code": 103.2518352453028,
+      "english": 78.97633542484377
+    }
+  },
+  "final-sync": {
+    "gsm/gsm-summary.json": {
+      "count": 32,
+      "shots": 5,
+      "concurrency": 4,
+      "thinking": false,
+      "max_tokens": 4096,
+      "test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+      "passed": 32,
+      "elapsed_s": 21.41208629499306,
+      "metrics": {
+        "draft_tokens": 3195.0,
+        "accepted_tokens": 2345.0,
+        "acceptance_rate": 0.7339593114241002,
+        "mean_acceptance_length": 3.2018779342723005,
+        "prefix_hits": 15872.0
+      }
+    },
+    "vision/summary.json": {
+      "passed": 20,
+      "count": 20
+    },
+    "structured-summary.json": {
+      "passed": 48,
+      "count": 48
+    },
+    "decode_tps_median": {
+      "chinese": 69.76158900614789,
+      "code": 97.64456623269491,
+      "english": 74.72316498118148
+    }
+  },
+  "paired_gsm": {
+    "paired_count": 1319,
+    "counts": {
+      "both_correct": 1264,
+      "mtp_only_correct": 7,
+      "off_only_correct": 7,
+      "both_wrong": 41
+    },
+    "different_text_count": 706,
+    "mtp_accuracy": 0.9636087945413192,
+    "off_accuracy": 0.9636087945413192,
+    "elapsed_ratio_off_over_mtp": 1.5265328535712548,
+    "off_output_tokens": 134315,
+    "off_length_finishes": 0
+  },
+  "optimized-stress": {
+    "long_vision": {
+      "passed": 6,
+      "count": 6
+    },
+    "cancelled_streams": 8,
+    "multiturn_vision_schema": {
+      "passed": 16,
+      "count": 16
+    }
+  },
+  "mtp-off-stress": {
+    "long_vision": {
+      "passed": 6,
+      "count": 6
+    },
+    "cancelled_streams": 8,
+    "multiturn_vision_schema": {
+      "passed": 16,
+      "count": 16
+    }
+  },
+  "provenance": {
+    "base_commit": "9201d9936cf7c90be518d3a5fc880c32c32202c4",
+    "source_repo": "/home/bul/dev/dsv4/vllm-dsv4-a100",
+    "source_commit": "a65c660da",
+    "python": "/home/bul/miniconda3/envs/vllm-backport/bin/python",
+    "model": "/home/bul/dev/models1/DeepSeek/DeepSeek-V4-Flash-Vision-Exp",
+    "final_source_sha256": {
+      "benchmarks/kernels/benchmark_dsv4_pp3_optimizations.py": "8a34c5c6d48efc64473cd65040f0e6fd22915def866b8adf366e2d2e91592eff",
+      "tests/distributed/test_comm_ops.py": "07cc4a4905f0aa713a2f5858a652d86e6f6622192991a73869bcbef1045be360",
+      "tests/kernels/attention/test_flashmla_sparse.py": "d3330d6e6d7e991abb4995d1bfa3d4d74faf128fa97157f5a9c085a7cbc14204",
+      "tests/kernels/attention/test_rocm_triton_attn_dsv4.py": "e485dcf1ba59a6e11495e196d6c19b4b014ef22c0f1039caca7e2473ef8eff34",
+      "tests/v1/core/test_async_scheduler.py": "0898f19d2750c146faa1d43736576ff49f5ce41b19342bcb8eabdb4a616fb0cc",
+      "tests/v1/engine/test_engine_core.py": "a796ca6fc5c90ea8b96ad759d0014bcc7d69e721c7e909c062dbe4e2699ae5ef",
+      "tests/v1/engine/test_engine_core_draft_handoff.py": "569bd376aad153a9e9f45de2c6315e9c3d00f0ca8f13e65fa5904b052c379841",
+      "tests/v1/spec_decode/test_dspark_pp.py": "74d63b567b505a815eeac9beab2136fbfcd97be0cbe91aae6c1025a837fa6541",
+      "tests/v1/structured_output/test_backend_xgrammar.py": "59ae04982a8aac6d0a67bc7a0caba49097170d7fd6fb4b9dccf0dffce3c6a5ee",
+      "tests/v1/worker/test_gpu_async_output.py": "d74170a99e4534e564b6c9dd9cf4f730abb38b528e61595e8130eaab75564ddf",
+      "tests/v1/worker/test_gpu_buffer_utils.py": "f5879297b6c87086d776a0775383d00396293ebb44eab8472e7d9c58914a558d",
+      "tests/v1/worker/test_gpu_model_runner_v2_eplb.py": "17235c8e56bf631bc97244e1fb9ede27f6c10e42289952a0c2afca5d52c98d2e",
+      "tests/v1/worker/test_gpu_worker.py": "5fcbe3d821119713ebf4f3d5cd980617bb7e4803de1a3b410290cfb622e453c2",
+      "vllm/distributed/parallel_state.py": "56e91883836551925bcfd7ecb4846cd1072f287c6155a88482ccaca769a8550e",
+      "vllm/envs.py": "e5c698a472e96cf086d37802bc5b798ef3ad90cd91629c456ecaca65e363af44",
+      "vllm/models/deepseek_v4/amd/rocm.py": "3d69ea553ebd6946d77bfe373737bb3b4e4569aab0596baafea49d55e936180d",
+      "vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py": "0fecf430ef22774fb265ab97ccc8df48a7bc0531c1e276517edac0ac08859629",
+      "vllm/models/deepseek_v4/nvidia/model.py": "c0ef0fe167ef8f8ac535a9cbb9e27bc33a86cc5b773df9c9f9d8d2de61fb1170",
+      "vllm/models/deepseek_v4/sparse_mla.py": "528ff7cbb47f3e61900c248b4c9e0191904ef3e82075c3d7c44ea03f7a82fad9",
+      "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py": "b268e5a9d8125cf5d643c209e3669ceea98eaf613ed865d488924db8f171f296",
+      "vllm/v1/core/sched/async_scheduler.py": "167abd201e4ade0e1ad33dcf2aca133a04ecbab994276c9aae69d0b3eba20b90",
+      "vllm/v1/core/sched/interface.py": "fc2086c14f832c6b9d1b4eba9bb43e80fc8ce621b7c6fe4db976b20773d8c4cd",
+      "vllm/v1/core/sched/output.py": "3471684cccb7ee0e295e796ca08871e15d60c76f068d113e936cdec89575f333",
+      "vllm/v1/core/sched/scheduler.py": "78760a1f3f9629b696ec83e53827203602b9c6db77489844cb4e487e325b3746",
+      "vllm/v1/engine/core.py": "1918e220bc2a0120995d0a7e7e9b0bf56417c23c02608f53e1b09550f2bcaaa0",
+      "vllm/v1/outputs.py": "3c3a996e6c382a48d2193466f9ba3eb60b2b68af3ae8f6dfebdd5fe296744788",
+      "vllm/v1/request.py": "5af8b07e0c347d8a62040120911de676638edbae4366f2d3cf15d6aef83f63bb",
+      "vllm/v1/worker/gpu/async_utils.py": "24d86f9852780103d5596ca7abd4bd72d9656c009f4cb95f951fa567e59aae63",
+      "vllm/v1/worker/gpu/buffer_utils.py": "90a739a8c6b0aba71abf2aa1bbc54e2ef9b1d6ad64a1c3d66171259508e3ee3b",
+      "vllm/v1/worker/gpu/model_runner.py": "d190af3d55ce335989f028fdb90ef3b768efc30dc191fca30fa2944eb5e3de14",
+      "vllm/v1/worker/gpu/pp_utils.py": "b6d0c9dca432c50b0f7f957d16043ff362a482ffa80ba96e6971a475414071a5",
+      "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py": "139d635dfabddcc8d8896dd64acd2133cccb6a824574ee2a63a1154a19c9841a",
+      "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py": "b7ee88e4846770f0b23868f5b12211714874acf8fefb998f49ef9364bed6e03e",
+      "vllm/v1/worker/gpu/structured_outputs.py": "a4e725f3fe81133336d8ba78a0bc5d16fec46e4b37abc1b49a1d442065dacdfa",
+      "vllm/v1/worker/gpu_worker.py": "7bf9c3d37438f1505ac2cb7249c0952afd6f39a3339fa6bb695432ab14dfeb12"
+    },
+    "note": "Full GSM8K runs started before restoring NoopOffloader.post_init to load_model; final restarts verify the restored lifecycle."
+  },
+  "kernel_cold_l2": {
+    "gpu": "NVIDIA CMP 170HX",
+    "torch": "2.13.0+cu130",
+    "tp": 1,
+    "heads": 64,
+    "dtype": "bfloat16",
+    "timing": "CUDA events, CUDA graph, explicit 64 MiB L2 flush outside timing, median of 30",
+    "rows": [
+      {
+        "kernel": "prefill",
+        "arm": "plain",
+        "m": 128,
+        "depth": 0,
+        "us": 95.23200243711472,
+        "tflops": 11.364472827447456,
+        "fp32_scaled_error": 0.0034563676454126835
+      },
+      {
+        "kernel": "prefill",
+        "arm": "blocked",
+        "m": 128,
+        "depth": 0,
+        "us": 69.63200122117996,
+        "tflops": 15.542587962714025,
+        "fp32_scaled_error": 0.0030417542438954115
+      },
+      {
+        "kernel": "prefill",
+        "arm": "plain",
+        "m": 512,
+        "depth": 4096,
+        "us": 500.7359981536865,
+        "tflops": 21.645349773062254,
+        "fp32_scaled_error": 0.0036109047941863537
+      },
+      {
+        "kernel": "prefill",
+        "arm": "blocked",
+        "m": 512,
+        "depth": 4096,
+        "us": 338.9439880847931,
+        "tflops": 31.977572121115546,
+        "fp32_scaled_error": 0.0036425278522074223
+      },
+      {
+        "kernel": "prefill",
+        "arm": "plain",
+        "m": 2048,
+        "depth": 4096,
+        "us": 1973.24800491333,
+        "tflops": 22.787321167961842,
+        "fp32_scaled_error": 0.0038686946500092745
+      },
+      {
+        "kernel": "prefill",
+        "arm": "blocked",
+        "m": 2048,
+        "depth": 4096,
+        "us": 1247.2319602966309,
+        "tflops": 36.05186321661121,
+        "fp32_scaled_error": 0.0040664514526724815
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 1,
+        "arm": "baseline",
+        "us": 55.296000093221664,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 1,
+        "arm": "tile",
+        "us": 118.78400295972824,
+        "max_abs_error": 0.001953125
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 1,
+        "arm": "tile_fixed16",
+        "us": 125.95200538635254,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 4,
+        "arm": "baseline",
+        "us": 96.25600278377533,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 4,
+        "arm": "tile",
+        "us": 165.8879965543747,
+        "max_abs_error": 0.001953125
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 4,
+        "arm": "tile_fixed16",
+        "us": 356.86400532722473,
+        "max_abs_error": 0.001953125
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 16,
+        "arm": "baseline",
+        "us": 272.8959918022156,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 16,
+        "arm": "tile",
+        "us": 405.5039882659912,
+        "max_abs_error": 0.001953125
+      },
+      {
+        "kernel": "decode",
+        "ratio": 4,
+        "queries": 16,
+        "arm": "tile_fixed16",
+        "us": 1254.4000148773193,
+        "max_abs_error": 0.001953125
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 1,
+        "arm": "baseline",
+        "us": 56.32000043988228,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 1,
+        "arm": "tile",
+        "us": 56.32000043988228,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 1,
+        "arm": "tile_fixed16",
+        "us": 54.27199974656105,
+        "max_abs_error": 0.00390625
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 4,
+        "arm": "baseline",
+        "us": 57.34400078654289,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 4,
+        "arm": "tile",
+        "us": 57.34400078654289,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 4,
+        "arm": "tile_fixed16",
+        "us": 137.2160017490387,
+        "max_abs_error": 0.00390625
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 16,
+        "arm": "baseline",
+        "us": 98.30400347709656,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 16,
+        "arm": "tile",
+        "us": 98.30400347709656,
+        "max_abs_error": 0.0
+      },
+      {
+        "kernel": "decode",
+        "ratio": 128,
+        "queries": 16,
+        "arm": "tile_fixed16",
+        "us": 453.6319971084595,
+        "max_abs_error": 0.00390625
+      },
+      {
+        "kernel": "compressor",
+        "ratio": 4,
+        "queries": 1,
+        "tuned": 0,
+        "us": 11.264000087976456,
+        "minimum_gbps": 2.9609374768738648,
+        "byte_exact": true
+      },
+      {
+        "kernel": "compressor",
+        "ratio": 4,
+        "queries": 1,
+        "tuned": 1,
+        "us": 11.264000087976456,
+        "minimum_gbps": 2.9609374768738648,
+        "byte_exact": true
+      },
+      {
+        "kernel": "compressor",
+        "ratio": 4,
+        "queries": 16,
+        "tuned": 0,
+        "us": 10.239999741315842,
+        "minimum_gbps": 52.11250131647252,
+        "byte_exact": true
+      },
+      {
+        "kernel": "compressor",
+        "ratio": 4,
+        "queries": 16,
+        "tuned": 1,
+        "us": 11.264000087976456,
+        "minimum_gbps": 47.374999629981836,
+        "byte_exact": true
+      },
+      {
+        "kernel": "compressor",
+        "ratio": 128,
+        "queries": 1,
+        "tuned": 0,
+        "us": 267.2640085220337,
+        "minimum_gbps": 1.9638708664983922,
+        "byte_exact": true
+      },
+      {
+        "kernel": "compressor",
+        "ratio": 128,
+        "queries": 1,
+        "tuned": 1,
+        "us": 40.95999896526337,
+        "minimum_gbps": 12.814258136215388,
+        "byte_exact": true
+      },
+      {
+        "kernel": "compressor",
+        "ratio": 128,
+        "queries": 16,
+        "tuned": 0,
+        "us": 286.72000765800476,
+        "minimum_gbps": 29.289731360557678,
+        "byte_exact": true
+      },
+      {
+        "kernel": "compressor",
+        "ratio": 128,
+        "queries": 16,
+        "tuned": 1,
+        "us": 44.544000178575516,
+        "minimum_gbps": 188.53160843958494,
+        "byte_exact": true
+      }
+    ]
+  }
+}
