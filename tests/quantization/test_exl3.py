@@ -563,3 +563,29 @@ def test_experimental_batched_fp16_prefill(rows, monkeypatch):
 
     monkeypatch.setattr(exl3, "_exl3_moe_fused", Backend(library))
     _check_moe_routing(rows, 1024, 256, monkeypatch, m_tile=None, intermediate_dim=512)
+
+
+@pytest.mark.parametrize("rows", [9, 65, 513, 2049])
+@pytest.mark.parametrize("hidden", [256, 768])
+def test_experimental_batched_int8_prefill(rows, hidden, monkeypatch):
+    """Bound expanded INT8 weight/activation error against rotated references."""
+    import os
+
+    library = os.environ.get("VLLM_EXL3_TEST_BATCHED_INT8_LIBRARY")
+    if not library or not torch.cuda.is_available():
+        pytest.skip("Requires the optional batched INT8 prefill library")
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("The prototype is built for SM80")
+    from benchmarks.kernels.exl3_prefill_int8.backend import Backend
+    from vllm.model_executor.layers.quantization import exl3
+
+    monkeypatch.setattr(exl3, "_exl3_moe_fused", Backend(library))
+    _check_moe_routing(
+        rows,
+        1024,
+        hidden,
+        monkeypatch,
+        m_tile=None,
+        intermediate_dim=512,
+        relative_limit=0.02,
+    )

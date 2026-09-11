@@ -227,6 +227,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--tokens", type=int, default=256)
     parser.add_argument("--eval-tokens", type=int, default=768)
+    parser.add_argument("--eval-batch-size", type=int, help="Defaults to --batch-size")
     parser.add_argument("--skip-perf", action="store_true")
     parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--eager", action="store_true")
@@ -238,6 +239,10 @@ def main():
     parser.add_argument("--worker-extension-cls", default="")
     parser.add_argument("--capture-routing-dir", type=Path)
     args = parser.parse_args()
+    if args.eval_batch_size is None:
+        args.eval_batch_size = args.batch_size
+    if not 1 <= args.eval_batch_size <= args.batch_size:
+        parser.error("--eval-batch-size must be between 1 and --batch-size")
     if args.profile_dir and args.backend != "vllm":
         parser.error("--profile-dir requires the vllm backend")
     if args.expected_layer_counts and (
@@ -288,6 +293,8 @@ def main():
                 "EXL3_INT8_GEMV",
                 "VLLM_EXL3_MOE_MAX_TOKENS",
                 "VLLM_EXL3_MOE_PRIORITY",
+                "VLLM_EXL3_MOE_DECODE",
+                "VLLM_EXL3_MOE_M_TILE",
                 "OMP_NUM_THREADS",
                 "VLLM_PP_LAYER_PARTITION",
                 "NCCL_P2P_DISABLE",
@@ -318,9 +325,13 @@ def main():
         result["exllamav3_version"] = __version__
         result["module_devices"] = backend.module_devices
     else:
+        result["resolved_chunk_size"] = (
+            backend.llm.llm_engine.vllm_config.scheduler_config.max_num_batched_tokens
+        )
         result["exllamav3_version"] = importlib.metadata.version("exllamav3")
         if (
-            args.event_profile
+            args.worker_extension_cls
+            or args.event_profile
             or args.profile_dir
             or args.moe_variants
             or args.moe_workspace_sizes
@@ -444,8 +455,8 @@ def main():
         save()
     if not args.skip_eval:
         start = time.perf_counter()
-        for offset in range(0, len(data["evals"]), args.batch_size):
-            batch = data["evals"][offset : offset + args.batch_size]
+        for offset in range(0, len(data["evals"]), args.eval_batch_size):
+            batch = data["evals"][offset : offset + args.eval_batch_size]
             elapsed, rows = backend.generate(
                 [r["input_ids"] for r in batch], args.eval_tokens, False
             )
@@ -471,6 +482,9 @@ def main():
             )
             result["eval_seconds"] = time.perf_counter() - start
             save()
+    if "runtime_before" in result:
+        result["runtime_after"] = backend.llm.collective_rpc("get_exl3_runtime_state")
+        save()
     print("SAVED", args.output, flush=True)
 
 
