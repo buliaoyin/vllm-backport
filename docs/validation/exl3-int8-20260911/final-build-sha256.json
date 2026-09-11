@@ -1,0 +1,11 @@
+{
+  "name": "final-build",
+  "sha256": {
+    "gemm_int8.cuh": "59684432f62dc9e4c635c2092713aea2784a04d97470b1dcc753dcf7c180e28f",
+    "moe_int8.cuh": "f63ab922f2427f8160efc8ee79ce43e4b88ab2cbb0fe747802bb759fa1986087",
+    "int8.cu": "88eaa2538e057c0f68253f4938d9d59aa1532eadae06315a3c679abbe2087cf5",
+    "build.json": "2b7ea81895107b899caea3e2a0cbeef9cb1c820c4a001ddebdcaa5e74547de12",
+    "build.log": "12032d532d13b5dc6696378663fc2c711bc658cdaf31310f825aeb3d757e46c4",
+    "int8.so": "ba4573b92ec1fcb809287d1c8335a66961de3caffcacf0b347b9b351e4326d5f"
+  }
+}

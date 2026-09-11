@@ -1,0 +1,30 @@
+[
+  {
+    "name": "build-racecheck-sm120",
+    "command": [
+      "/usr/local/cuda/bin/nvcc",
+      "--shared",
+      "--cudart",
+      "shared",
+      "-Xcompiler",
+      "-fPIC",
+      "-O3",
+      "-std=c++20",
+      "--use_fast_math",
+      "--expt-relaxed-constexpr",
+      "--expt-extended-lambda",
+      "-lineinfo",
+      "-Xptxas=-v",
+      "-gencode=arch=compute_120,code=sm_120",
+      "-I/home/bul/dev/vllm-backport/.venv/lib/python3.12/site-packages/torch/include",
+      "-I/home/bul/dev/vllm-backport/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include",
+      "-I/tmp/exl3-moe-next-20260911/pipeline",
+      "/tmp/exl3-moe-next-20260911/pipeline/pipeline.cu",
+      "-o",
+      "/tmp/exl3-moe-next-20260911/pipeline/sanitizer-sm120.so"
+    ],
+    "start": 1789111343.4620278,
+    "exit_code": 0,
+    "end": 1789111370.2482135
+  }
+]

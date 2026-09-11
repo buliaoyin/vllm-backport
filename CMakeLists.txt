@@ -320,6 +320,10 @@ endif()
 #
 # Define other extension targets
 #
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  include(csrc/libtorch_stable/quantization/exl3/CMakeLists.txt)
+endif()
+#
 
 #
 # cumem_allocator extension

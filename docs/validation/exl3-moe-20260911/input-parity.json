@@ -1,0 +1,14 @@
+{
+  "awq": {
+    "p8192_b1": true,
+    "p16384_b1": true,
+    "p32768_b1": true,
+    "p65536_b1": true
+  },
+  "nvfp4": {
+    "p8192_b1": true,
+    "p16384_b1": true,
+    "p32768_b1": true,
+    "p65536_b1": true
+  }
+}

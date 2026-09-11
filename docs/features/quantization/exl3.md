@@ -70,17 +70,39 @@ Shared experts run serially because upstream GEMMs share a device-wide lock
 workspace. Dual batch overlap is explicitly rejected.
 Do not infer support for those features from model architecture support alone.
 
-The CUDA kernels compute EXL3 products with FP16 operands; BF16 inputs and outputs
-are converted at the operation boundary. Large linear prefill batches temporarily
+The prefill kernels compute EXL3 products with FP16 operands; BF16 inputs and
+outputs are converted at the operation boundary. Large linear prefill batches temporarily
 reconstruct bounded column slices, then use GEMM. The entire model is never
 permanently expanded to FP16. MoE batches are divided by the allocated expert
-workspace capacity, which defaults to the smaller of 1024 tokens and the
+workspace capacity, which defaults to the smaller of 2048 tokens and the
 scheduler's `max_num_batched_tokens`. Each expert fits even when every token
 selects it. Batches of at least 256 tokens with more experts than concurrent
 execution groups schedule the largest experts first;
 routes, counts and all nine weight pointer tables are reordered together.
-Up to eight decode tokens use upstream batched expert GEMMs without sorting the
-routes.
+Up to eight decode tokens use the expert decode path without sorting routes.
+For BF16 activations, uniform 4-bit mul1 weights, dimensions divisible by 256 in
+[256, 8192], and up to eight selected experts per token, the default is INT8
+DP4A on SM80 and INT8 DP4A with activation residual compensation on SM120.
+Other configurations use upstream batched expert GEMMs.
+
+EXL3 defaults `max_num_batched_tokens` to 2048 when no explicit token budget is
+provided. `--max-num-batched-tokens` overrides this scheduler setting. Other
+quantization backends retain their existing defaults. The usual throughput-mode,
+unchunked-prefill and multimodal budget adjustments still apply.
+
+SM80 uses the bundled M=32, FP32-accumulating expert kernel for uniform 4-bit
+mul1 weights with dimensions divisible by 256 in [256, 8192]. Short expert tails
+retain the smaller row path. Other formats and GPU architectures use the upstream
+kernel. `VLLM_EXL3_MOE_M_TILE=16` explicitly selects the upstream implementation.
+The [component build instructions](../../../csrc/libtorch_stable/quantization/exl3/README.md)
+allow updating `_exl3_C` without rebuilding unrelated extensions.
+
+`VLLM_EXL3_MOE_DECODE=hybrid` is the default expert decode policy. Set `native`
+to use upstream expert decode, or `plain` / `residual` to override the activation
+mode on supported configurations. These policies are independent of the prefill
+M tile and `EXL3_INT8_GEMV`. Set them before process startup because decode is
+captured in CUDA Graphs. The bundled `_exl3_C` provides both M32 and expert INT8
+kernels; no experimental worker or separately loaded kernel library is needed.
 
 `VLLM_EXL3_MOE_MAX_TOKENS` sets a positive workspace/token-group limit.
 `VLLM_EXL3_MOE_PRIORITY=0` disables largest-expert-first scheduling for ablation.
@@ -89,18 +111,29 @@ parallelism, increasing the outer chunk can reduce overlap between stages, so
 benchmark both settings together for the intended input length and concurrency.
 
 Workspaces are shared across layers with the same expert dimensions on a device.
-For hidden size 4096 and intermediate size 2048, a 1024-row workspace uses
-192 MiB on the tested CMP 170HX and 552 MiB on the tested RTX PRO 6000 Blackwell.
-The corresponding 512-row sizes are 96 MiB and 276 MiB. Workspace memory grows
+For hidden size 4096 and intermediate size 2048, the default 2048-row workspace
+uses 384 MiB on the tested CMP 170HX and 1104 MiB on the tested RTX PRO 6000
+Blackwell. M32 additionally shares a roughly 4 MiB lock buffer per device.
+For these dimensions, hybrid decode adds a shared 5.25 MiB scratch on SM80
+and 9.25 MiB on SM120.
+Setting the scheduler token budget to 1024 also caps expert workspace capacity
+at 1024, halving the main workspace. Workspace memory grows
 linearly with capacity and with the extension's number of concurrent expert
 groups. See the [optimization experiments](../../validation/exl3-optimization-20260910.md)
 for kernel ablations and complete-model measurements.
 
 ExLlamaV3 controls its optional INT8 GEMV path through `EXL3_INT8_GEMV`. Use
-`EXL3_INT8_GEMV=0` for strict FP16 validation, and use the same setting in both
-engines when comparing speed or numerical accuracy. Set it before starting the process for reproducible comparisons. Mode 2 is
+both `EXL3_INT8_GEMV=0` and `VLLM_EXL3_MOE_DECODE=native` to validate without
+activation INT8. Use the same ordinary GEMV setting in both engines when comparing
+speed or numerical accuracy, and record the expert decode policy separately.
+Set these variables before starting the process. Mode 2 is
 the upstream default and uses approximate INT8 activations; its numerical error
-is evaluated separately from the stricter FP16 path.
+is evaluated separately from the stricter FP16 path. It affects eligible ordinary
+GEMVs, not the routed-expert decode policy or M32 prefill. See the
+[combined INT8 measurements](../../validation/exl3-int8-combination-20260911.md)
+for ordinary GEMV comparisons and the
+[default expert decode validation](../../validation/exl3-hybrid-default-20260911.md)
+for the separate expert policy comparison, accuracy limits and runtime defaults.
 
 ## Reproducing checks
 

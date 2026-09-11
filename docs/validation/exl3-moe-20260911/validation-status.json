@@ -1,0 +1,52 @@
+[
+  {
+    "name": "tests-sm80",
+    "command": [
+      "/home/bul/dev/vllm-backport/.venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/quantization/test_exl3.py",
+      "-q"
+    ],
+    "start": 1789109249.7618225,
+    "exit_code": 0,
+    "end": 1789109293.7270396
+  },
+  {
+    "name": "tests-sm120",
+    "command": [
+      "/home/bul/dev/vllm-backport/.venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/quantization/test_exl3.py",
+      "-q",
+      "-k",
+      "experimental_expert_int8_decode"
+    ],
+    "start": 1789109293.7275653,
+    "exit_code": 0,
+    "end": 1789109307.5723808
+  },
+  {
+    "name": "memcheck-decode",
+    "command": [
+      "/usr/local/cuda/bin/compute-sanitizer",
+      "--tool",
+      "memcheck",
+      "--error-exitcode",
+      "99",
+      "--target-processes",
+      "all",
+      "/home/bul/dev/vllm-backport/.venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/quantization/test_exl3.py",
+      "-q",
+      "-k",
+      "experimental_expert_int8_decode"
+    ],
+    "start": 1789109307.5730283,
+    "exit_code": 99,
+    "end": 1789109322.4006183
+  }
+]

@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 name = "vllm"
 authors = [{name = "vLLM Team"}]
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "csrc/libtorch_stable/quantization/exl3/LICENSE"]
 readme = "README.md"
 description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
 classifiers = [
@@ -128,6 +128,8 @@ extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizer
     "vllm/third_party/*", "vllm/entrypoints/serve/instrumentator/static/*",
     # Preserve exact identifiers in the pinned upstream patch.
     "benchmarks/kernels/exl3_m32/rows.patch",
+    # Preserve compiler-generated CUDA symbols in measurement data.
+    "docs/validation/exl3-moe-20260911/instruction-summary.json",
     "tests/entrypoints/speech_to_text/transcription/test_transcription_validation.py",
     "docs/governance/process.md", "docs/assets/contributing/vllm_bench_serve_timeline.html", 
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",

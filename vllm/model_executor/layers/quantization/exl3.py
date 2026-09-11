@@ -16,6 +16,7 @@ from torch import nn
 
 from vllm import envs
 from vllm.config import get_current_vllm_config_or_none
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -27,7 +28,11 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
+_M32_LOCK_INTS = 1024 * 1024 + 2 * 1024 + 2 + 64
 
 _DTYPES = {
     "I16": torch.int16,
@@ -47,6 +52,18 @@ def _extension():
         raise ImportError(
             "EXL3 requires exllamav3>=1.4.8 compiled for the installed PyTorch "
             "and CUDA versions. See docs/features/quantization/exl3.md."
+        ) from exc
+
+
+@lru_cache(maxsize=1)
+def _native_extension():
+    try:
+        return importlib.import_module("vllm._exl3_C")
+    except ImportError as exc:
+        raise ImportError(
+            "EXL3 native kernels require vllm._exl3_C. Build the component as "
+            "described in docs/features/quantization/exl3.md, or use the upstream "
+            "kernels with VLLM_EXL3_MOE_M_TILE=16 and VLLM_EXL3_MOE_DECODE=native."
         ) from exc
 
 
@@ -105,6 +122,8 @@ class Exl3Config(QuantizationConfig):
         self.config = config
         self.matrices: dict[str, Exl3Matrix] = {}
         self.workspaces: dict[tuple, list[torch.Tensor]] = {}
+        self.m32_locks: dict[torch.device, torch.Tensor] = {}
+        self.decode_workspaces: dict[tuple, torch.Tensor] = {}
 
     @classmethod
     def get_name(cls):
@@ -375,6 +394,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.config = config
         self.prefix = prefix.removesuffix(".routed_experts")
+        self.m32_locks = None
+        self.moe_m_tile = 16
+        self.decode_mode = 0
+        self.decode_workspace = None
         self.loaded = set()
 
     @property
@@ -400,6 +423,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if str(self.moe.activation) not in ("silu", "MoEActivation.SILU"):
             raise ValueError("EXL3 MoE currently supports SiLU activation only.")
         self.num_experts = num_experts
+        self.activation_dtype = params_dtype
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size_per_partition
         self.parts = {}
@@ -533,6 +557,56 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
             ]
         self.workspace = self.config.workspaces[key]
+        capability = current_platform.get_device_capability(device.index)
+        supports_native = (
+            tuple(self.bits) == (4, 4, 4)
+            and tuple(self.flags) == (False, True) * 3
+            and all(
+                256 <= width <= 8192 and width % 256 == 0
+                for width in (self.hidden_size, self.intermediate_size)
+            )
+        )
+        m_tile = envs.VLLM_EXL3_MOE_M_TILE
+        if m_tile not in (16, 32):
+            raise ValueError("VLLM_EXL3_MOE_M_TILE must be 16 or 32")
+        if m_tile == 32 and capability == (8, 0) and supports_native:
+            _native_extension()
+            if device not in self.config.m32_locks:
+                self.config.m32_locks[device] = torch.zeros(
+                    _M32_LOCK_INTS, dtype=torch.int32, device=device
+                )
+            self.m32_locks = self.config.m32_locks[device]
+            self.moe_m_tile = 32
+            logger.info_once("Using EXL3 M=32 FP32 MoE prefill on SM80.")
+        policy = envs.VLLM_EXL3_MOE_DECODE
+        if policy not in ("native", "hybrid", "plain", "residual"):
+            raise ValueError(
+                "VLLM_EXL3_MOE_DECODE must be native, hybrid, plain or residual"
+            )
+        if (
+            policy != "native"
+            and supports_native
+            and self.activation_dtype == torch.bfloat16
+            and capability in ((8, 0), (12, 0))
+        ):
+            _native_extension()
+            residual = policy == "residual" or (
+                policy == "hybrid" and capability == (12, 0)
+            )
+            self.decode_mode = 2 if residual else 1
+            stride = _decode_workspace_stride(
+                self.hidden_size, self.intermediate_size, residual
+            )
+            decode_key = (device, stride)
+            if decode_key not in self.config.decode_workspaces:
+                self.config.decode_workspaces[decode_key] = torch.zeros(
+                    (64, stride), device=device, dtype=torch.int32
+                )
+            self.decode_workspace = self.config.decode_workspaces[decode_key]
+            logger.info_once(
+                "Using EXL3 expert INT8 decode (%s).",
+                "residual" if residual else "plain",
+            )
 
     def apply(
         self,
@@ -552,7 +626,66 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.bits,
             self.flags,
             float(self.moe.swiglu_limit or 0.0),
+            self.m32_locks,
+            self.decode_workspace,
+            self.decode_mode,
         )
+
+
+def _decode_workspace_stride(hidden: int, intermediate: int, residual: bool) -> int:
+    stride = 0
+    for k, n in ((hidden, intermediate), (intermediate, hidden)):
+        total = k // 16
+        for grid in (16, 32, 64):
+            r = (total * (n // 256) + grid - 1) // grid
+            per = min(
+                max((max(r, min(2 * r, 32)) + 7) & ~7, 16),
+                512,
+                (total + 7) & ~7,
+            )
+            splits = (total + per - 1) // per
+            stride = max(stride, 5120 + splits * n * (2 if residual else 1))
+    # A fixed slot stride keeps counter regions separate from old partial sums
+    # when input shapes or the gate/down projection change during graph replay.
+    return stride
+
+
+def _exl3_moe_decode_int8(x, weights, ids, ptrs, workspace, limit, scratch, mode):
+    rows, hidden_size = x.shape
+    topk = ids.shape[1]
+    slots = ids.numel()
+    intermediate = workspace[2].shape[-1]
+    hidden = x.to(torch.float16).contiguous()
+    indices = ids.to(torch.int64).contiguous().flatten()
+    routing = weights.to(torch.float16).contiguous().flatten()
+    gate = torch.empty((slots, intermediate), dtype=torch.float16, device=x.device)
+    up, activated = torch.empty_like(gate), torch.empty_like(gate)
+    for i, output in enumerate((gate, up)):
+        torch.ops._exl3_C.expert_gemv(
+            hidden,
+            *ptrs[3 * i : 3 * i + 3],
+            indices,
+            output,
+            scratch,
+            rows,
+            topk,
+            mode == 2,
+        )
+    _extension().silu_mul(gate, up, activated, limit)
+    down = torch.empty((slots, hidden_size), dtype=torch.float32, device=x.device)
+    torch.ops._exl3_C.expert_gemv(
+        activated,
+        *ptrs[6:9],
+        indices,
+        down,
+        scratch,
+        rows,
+        1,
+        mode == 2,
+    )
+    output = torch.empty((rows, hidden_size), dtype=x.dtype, device=x.device)
+    torch.ops._exl3_C.expert_combine(down, routing, output)
+    return output
 
 
 def _exl3_moe_decode(x, topk_weights, topk_ids, ptrs, workspace, bits, flags, limit):
@@ -628,6 +761,7 @@ def _exl3_moe_fused(
     bits: list[int],
     flags: list[bool],
     limit: float,
+    m32_locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     ext = _extension()
     output = torch.empty_like(x)
@@ -655,20 +789,33 @@ def _exl3_moe_fused(
         order = torch.argsort(ids, stable=True)
         tokens = torch.div(order, topk_ids.shape[1], rounding_mode="floor")
         result = torch.zeros_like(hidden, dtype=torch.float32)
-        ext.exl3_moe(
-            hidden,
-            result,
-            counts,
-            tokens,
-            weights[order],
-            *workspace,
-            0,
-            *bits,
-            *chunk_ptrs,
-            *flags,
-            limit,
-            -1,
-        )
+        if m32_locks is not None:
+            torch.ops._exl3_C.moe_m32(
+                hidden,
+                result,
+                counts,
+                tokens,
+                weights[order],
+                *workspace,
+                *chunk_ptrs,
+                m32_locks,
+                limit,
+            )
+        else:
+            ext.exl3_moe(
+                hidden,
+                result,
+                counts,
+                tokens,
+                weights[order],
+                *workspace,
+                0,
+                *bits,
+                *chunk_ptrs,
+                *flags,
+                limit,
+                -1,
+            )
         output[start : start + hidden.shape[0]].copy_(result)
     return output
 
@@ -682,17 +829,53 @@ def _exl3_moe(
     bits: list[int],
     flags: list[bool],
     limit: float,
+    m32_locks: torch.Tensor | None = None,
+    decode_workspace: torch.Tensor | None = None,
+    decode_mode: int = 0,
 ) -> torch.Tensor:
+    if (
+        decode_workspace is not None
+        and decode_mode != 0
+        and x.dtype == torch.bfloat16
+        and 1 <= x.shape[0] <= 8
+        and 1 <= topk_ids.shape[1] <= 8
+    ):
+        return _exl3_moe_decode_int8(
+            x,
+            topk_weights,
+            topk_ids,
+            ptrs,
+            workspace,
+            limit,
+            decode_workspace,
+            decode_mode,
+        )
     implementation = _exl3_moe_decode if 0 < x.shape[0] <= 8 else _exl3_moe_fused
-    return implementation(
-        x, topk_weights, topk_ids, ptrs, workspace, bits, flags, limit
-    )
+    args = (x, topk_weights, topk_ids, ptrs, workspace, bits, flags, limit)
+    if implementation is _exl3_moe_fused and m32_locks is not None:
+        return implementation(*args, m32_locks)
+    return implementation(*args)
 
 
-def _exl3_moe_fake(x, topk_weights, topk_ids, ptrs, workspace, bits, flags, limit):
+def _exl3_moe_fake(
+    x,
+    topk_weights,
+    topk_ids,
+    ptrs,
+    workspace,
+    bits,
+    flags,
+    limit,
+    m32_locks=None,
+    decode_workspace=None,
+    decode_mode=0,
+):
     return torch.empty_like(x)
 
 
 direct_register_custom_op(
-    "exl3_moe", _exl3_moe, mutates_args=["workspace"], fake_impl=_exl3_moe_fake
+    "exl3_moe",
+    _exl3_moe,
+    mutates_args=["workspace", "m32_locks", "decode_workspace"],
+    fake_impl=_exl3_moe_fake,
 )

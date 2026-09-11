@@ -1017,6 +1017,7 @@ class precompiled_wheel_utils:
                         {
                             "vllm/_C.abi3.so",
                             "vllm/_C_stable_libtorch.abi3.so",
+                            "vllm/_exl3_C.abi3.so",
                             "vllm/_moe_C_stable_libtorch.abi3.so",
                             "vllm/_qutlass_C.abi3.so",
                             "vllm/_flashmla_C.abi3.so",
@@ -1368,6 +1369,7 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
+    ext_modules.append(CMakeExtension(name="vllm._exl3_C"))
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     # FA3 kernels only target SM90+; skip the target entirely when
     # TORCH_CUDA_ARCH_LIST is restricted to older archs.

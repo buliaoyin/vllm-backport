@@ -905,3 +905,39 @@ class TestDpDeviceIdSharding:
             get_physical_gpu_ids_for_local_dp_rank(
                 evar, local_dp_rank=2, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
             )
+
+
+@pytest.mark.parametrize(
+    "quantization,explicit,expected",
+    [
+        ("exl3", None, 2048),
+        ("exl3", 1024, 1024),
+        ("exl3", 4096, 4096),
+        ("awq", None, 8192),
+        (None, None, 8192),
+    ],
+)
+def test_exl3_chunk_default_preserves_explicit_and_other_backends(
+    quantization, explicit, expected, monkeypatch
+):
+    """EXL3 changes the implicit token budget, preserving caller overrides."""
+    from types import SimpleNamespace
+
+    from vllm.usage.usage_lib import UsageContext
+
+    args = EngineArgs(max_num_batched_tokens=explicit, enable_chunked_prefill=True)
+    monkeypatch.setattr(
+        args,
+        "get_batch_defaults",
+        lambda world_size: (
+            {UsageContext.LLM_CLASS: 8192},
+            {UsageContext.LLM_CLASS: 16},
+        ),
+    )
+    model = SimpleNamespace(
+        quantization=quantization, max_model_len=65536, is_multimodal_model=False
+    )
+    args._set_default_max_num_seqs_and_batched_tokens_args(
+        UsageContext.LLM_CLASS, model, SimpleNamespace(use_batched_dp_moe=False)
+    )
+    assert args.max_num_batched_tokens == expected

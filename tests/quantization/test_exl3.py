@@ -149,7 +149,9 @@ def _reference(x, weights):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
-@pytest.mark.parametrize("rows,int8_mode", [(1, 0), (1, 2), (145, 0), (1024, 0)])
+@pytest.mark.parametrize(
+    "rows,int8_mode", [(1, 0), (1, 1), (1, 2), (2, 2), (145, 0), (1024, 0)]
+)
 def test_linear_decode_and_prefill_match_rotated_reference(
     bits, rows, int8_mode, monkeypatch
 ):
@@ -178,16 +180,44 @@ def test_moe_routing_and_chunk_boundaries(rows, capacity, monkeypatch):
     _check_moe_routing(rows, capacity, 128, monkeypatch)
 
 
-def _check_moe_routing(rows, capacity, hidden_dim, monkeypatch):
-    monkeypatch.setenv("VLLM_EXL3_MOE_MAX_TOKENS", str(capacity))
+def _check_moe_routing(
+    rows,
+    capacity,
+    hidden_dim,
+    monkeypatch,
+    relative_limit=0.01,
+    dtype=torch.float16,
+    m_tile=16,
+    decode="native",
+    intermediate_dim=None,
+    topk=2,
+):
+    if capacity is None:
+        monkeypatch.delenv("VLLM_EXL3_MOE_MAX_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_EXL3_MOE_MAX_TOKENS", str(capacity))
+    if m_tile is None:
+        monkeypatch.delenv("VLLM_EXL3_MOE_M_TILE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_EXL3_MOE_M_TILE", str(m_tile))
+    if decode is None:
+        monkeypatch.delenv("VLLM_EXL3_MOE_DECODE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_EXL3_MOE_DECODE", decode)
+    intermediate_dim = intermediate_dim or hidden_dim
     pytest.importorskip("exllamav3_ext")
     torch.manual_seed(3)
     config = Exl3Config({})
     weights = {}
-    num_experts = 32 if rows == 513 else 3
+    num_experts = 32 if rows == 513 else max(3, topk)
     for expert in range(num_experts):
         for kind in ("gate_proj", "up_proj", "down_proj"):
-            weights[expert, kind] = _weights(k=hidden_dim, n=hidden_dim, device="cuda")
+            k, n = (
+                (intermediate_dim, hidden_dim)
+                if kind == "down_proj"
+                else (hidden_dim, intermediate_dim)
+            )
+            weights[expert, kind] = _weights(k=k, n=n, device="cuda")
             name = f"experts.{expert}.{kind}"
             config.matrices[name] = _spec(name, weights[expert, kind])
     moe = SimpleNamespace(
@@ -197,7 +227,7 @@ def _check_moe_routing(rows, capacity, hidden_dim, monkeypatch):
     )
     method, layer = Exl3MoEMethod(config, moe, "experts"), nn.Module()
     with torch.device("cuda"):
-        method.create_weights(layer, num_experts, hidden_dim, hidden_dim, torch.float16)
+        method.create_weights(layer, num_experts, hidden_dim, intermediate_dim, dtype)
     for expert in range(num_experts):
         for shard, kind in (
             ("w1", "gate_proj"),
@@ -208,7 +238,7 @@ def _check_moe_routing(rows, capacity, hidden_dim, monkeypatch):
                 param = getattr(layer, ("w2_" if shard == "w2" else "w13_") + key)
                 param.weight_loader(param, tensor, shard_id=shard, expert_id=expert)
     method.process_weights_after_loading(layer)
-    x = torch.randn(rows, hidden_dim, device="cuda", dtype=torch.float16)
+    x = torch.randn(rows, hidden_dim, device="cuda", dtype=dtype)
     ids = torch.stack(
         (
             torch.full((rows,), num_experts - 1, device="cuda", dtype=torch.long),
@@ -216,7 +246,18 @@ def _check_moe_routing(rows, capacity, hidden_dim, monkeypatch):
         ),
         -1,
     )
-    routing = torch.full((rows, 2), 0.5, device="cuda")
+    if topk != 2:
+        ids = (
+            torch.arange(topk, device="cuda")[None, :]
+            + torch.arange(rows, device="cuda")[:, None]
+        ) % num_experts
+    routing = torch.full((rows, topk), 1 / topk, device="cuda")
+    if dtype == torch.bfloat16 and rows == 3:
+        x[0].zero_()
+        routing[1].zero_()
+        routing[2] = torch.tensor(
+            [0.2] + [0.8 / (topk - 1)] * (topk - 1), device="cuda"
+        )
     actual = method.apply(layer, x, routing, ids)
     expected = torch.zeros_like(x, dtype=torch.float32)
     for expert in range(num_experts):
@@ -228,7 +269,7 @@ def _check_moe_routing(rows, capacity, hidden_dim, monkeypatch):
             -1, keepdim=True
         )
     relative = (actual.float() - expected).norm() / expected.norm()
-    assert relative < 0.01
+    assert relative < relative_limit
     if rows in (3, 513):
         for _ in range(3):
             method.apply(layer, x, routing, ids)
@@ -237,9 +278,85 @@ def _check_moe_routing(rows, capacity, hidden_dim, monkeypatch):
         with torch.cuda.graph(graph):
             captured = method.apply(layer, x, routing, ids)
         x.mul_(2)
-        ids[:, 1].copy_(1 - ids[:, 1])
+        ids.copy_((ids + 1) % num_experts)
+        if dtype == torch.bfloat16:
+            routing.copy_(routing.flip(1))
         graph.replay()
+        # Exercise the same scratch at another batch size before replaying.
+        if method.decode_workspace is not None:
+            method.apply(layer, x[:1], routing[:1], ids[:1])
+            graph.replay()
         torch.testing.assert_close(captured, method.apply(layer, x, routing, ids))
+    return method
+
+
+@pytest.mark.parametrize("rows", [9, 33, 513, 2049])
+def test_default_m32_routes_tails_and_workspace_overflow(rows, monkeypatch):
+    """Default M32 must compute routes and chunk overflow without upstream MoE."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("Default M32 requires SM80")
+    pytest.importorskip("vllm._exl3_C")
+
+    def reject_upstream(*args):
+        pytest.fail("Supported SM80 experts should use the default M32 kernel")
+
+    monkeypatch.setattr(_extension(), "exl3_moe", reject_upstream)
+    _check_moe_routing(rows, None, 256, monkeypatch, m_tile=None)
+
+
+@pytest.mark.parametrize(
+    "rows,topk", [(1, 2), (2, 2), (3, 2), (4, 2), (8, 2), (3, 8), (8, 8)]
+)
+@pytest.mark.parametrize("policy", [None, "native", "plain", "residual"])
+def test_expert_decode_defaults_overrides_and_shared_scratch(
+    rows, topk, policy, monkeypatch
+):
+    """Guard default dispatch, disable/override and gate/down scratch reuse."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((8, 0), (12, 0)):
+        pytest.skip("Native expert INT8 requires SM80 or SM120")
+    pytest.importorskip("vllm._exl3_C")
+    from vllm.model_executor.layers.quantization import exl3
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Unexpected expert decode fallback or opt-in")
+
+    if policy == "native":
+        monkeypatch.setattr(exl3, "_exl3_moe_decode_int8", unexpected)
+    else:
+        monkeypatch.setattr(exl3, "_exl3_moe_decode", unexpected)
+    residual = policy == "residual" or (policy is None and capability == (12, 0))
+    method = _check_moe_routing(
+        rows,
+        2048,
+        256,
+        monkeypatch,
+        relative_limit=0.01 if residual else 0.02,
+        dtype=torch.bfloat16,
+        decode=policy,
+        intermediate_dim=512,
+        topk=topk,
+    )
+    assert method.decode_mode == (0 if policy == "native" else 2 if residual else 1)
+
+
+@pytest.mark.parametrize("dtype,hidden", [(torch.float16, 256), (torch.bfloat16, 128)])
+def test_expert_decode_default_falls_back_for_unsupported_inputs(
+    dtype, hidden, monkeypatch
+):
+    """The default retains the upstream path for unsupported dtype or alignment."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.model_executor.layers.quantization import exl3
+
+    def unexpected(*args):
+        pytest.fail("Unsupported input should use upstream expert decode")
+
+    monkeypatch.setattr(exl3, "_exl3_moe_decode_int8", unexpected)
+    method = _check_moe_routing(3, 128, hidden, monkeypatch, dtype=dtype, decode=None)
+    assert method.decode_mode == 0
 
 
 @pytest.mark.parametrize("rows", [9, 16, 17, 31, 32, 33, 63, 64, 65, 129, 513, 1025])
@@ -257,6 +374,24 @@ def test_experimental_m32_tails_and_replay(rows, monkeypatch):
     extension = _extension()
     monkeypatch.setattr(extension, "exl3_moe", Launcher(extension, library))
     _check_moe_routing(rows, 1024, 256, monkeypatch)
+
+
+@pytest.mark.parametrize("rows", [9, 16, 17, 31, 32, 33, 65, 513, 1025])
+@pytest.mark.parametrize("variant", ["int8", "int8_residual"])
+def test_experimental_int8_tails_and_replay(rows, variant, monkeypatch):
+    """Bound added activation/codebook error against independently rotated weights."""
+    import os
+
+    library = os.environ.get("VLLM_EXL3_TEST_INT8_LIBRARY")
+    if not library or not torch.cuda.is_available():
+        pytest.skip("Requires the optional SM80 INT8 kernel build")
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("INT8 experiment is SM80-only")
+    from benchmarks.kernels.exl3_int8.launcher import Launcher
+
+    extension = _extension()
+    monkeypatch.setattr(extension, "exl3_moe", Launcher(extension, library, variant))
+    _check_moe_routing(rows, 1024, 256, monkeypatch, relative_limit=0.02)
 
 
 def test_shared_experts_serialize_device_wide_exl3_workspace(monkeypatch):
@@ -285,3 +420,49 @@ def test_shared_experts_serialize_device_wide_exl3_workspace(monkeypatch):
     x = torch.ones(2, 128)
     shared(x, SharedExpertsOrder.NO_OVERLAP)
     torch.testing.assert_close(shared.output, x)
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8])
+@pytest.mark.parametrize("residual", [False, True])
+def test_experimental_expert_int8_decode(rows, residual, monkeypatch):
+    """Check expert identity and graph replay against independently rotated weights."""
+    import os
+
+    library = os.environ.get("VLLM_EXL3_TEST_DECODE_LIBRARY")
+    if not library or not torch.cuda.is_available():
+        pytest.skip("Requires the optional expert INT8 decode build")
+    from benchmarks.kernels.exl3_moe_decode.launcher import Decode
+    from vllm.model_executor.layers.quantization import exl3
+
+    monkeypatch.setattr(
+        exl3, "_exl3_moe_decode", Decode(_extension(), library, residual)
+    )
+    _check_moe_routing(
+        rows,
+        1024,
+        256,
+        monkeypatch,
+        relative_limit=0.01 if residual else 0.02,
+        dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize("rows", [9, 33, 513])
+@pytest.mark.parametrize("variant", ["nobar_m32_k32_n256", "half_m32_k32_n256"])
+def test_experimental_moe_pipeline(rows, variant, monkeypatch):
+    """Bound pipeline arithmetic and synchronize reused tiles on graph replay."""
+    import os
+
+    library = os.environ.get("VLLM_EXL3_TEST_PIPELINE_LIBRARY")
+    if not library or not torch.cuda.is_available():
+        pytest.skip("Requires the optional pipeline ablation build")
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("Pipeline experiment is SM80-only")
+    from benchmarks.kernels.exl3_m32.launcher import Launcher
+
+    class Pipeline(Launcher):
+        variants = ("nobar_m32_k32_n256", "half_m32_k32_n256")
+
+    extension = _extension()
+    monkeypatch.setattr(extension, "exl3_moe", Pipeline(extension, library, variant))
+    _check_moe_routing(rows, 1024, 256, monkeypatch, relative_limit=0.02)

@@ -91,7 +91,16 @@ def run(layer, method, args, k, n):
                     launcher = None
                     extension.exl3_moe = native
                     if not variant.startswith("native"):
-                        launcher = Launcher(extension, args.row_kernel_library, variant)
+                        launcher_class = Launcher
+                        if variant.startswith("int8"):
+                            from benchmarks.kernels.exl3_int8.launcher import (
+                                Launcher as Int8Launcher,
+                            )
+
+                            launcher_class = Int8Launcher
+                        launcher = launcher_class(
+                            extension, args.row_kernel_library, variant
+                        )
                         extension.exl3_moe = launcher
                     actual = fn()
                     delta = actual.float() - reference.float()
@@ -102,8 +111,12 @@ def run(layer, method, args, k, n):
                         "relative_l2": float(delta.norm() / reference.float().norm()),
                         "max_abs": float(delta.abs().max()),
                         "finite": bool(torch.isfinite(actual).all()),
+                        "relative_l2_limit": args.row_kernel_max_relative_error,
                     }
-                    if not record["finite"] or record["relative_l2"] >= 0.001:
+                    if (
+                        not record["finite"]
+                        or record["relative_l2"] >= args.row_kernel_max_relative_error
+                    ):
                         result["records"].append(record)
                         args.output.write_text(json.dumps(result, indent=2))
                         raise AssertionError(record)

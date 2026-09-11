@@ -1,0 +1,14 @@
+{
+  "final-decode/decode.so": {
+    "rebuilt": "rebuild-decode/decode.so",
+    "instructions_identical": true,
+    "functions": 10,
+    "matched_instruction_words": 31056
+  },
+  "pipeline/pipeline.so": {
+    "rebuilt": "rebuild-prefill/pipeline.so",
+    "instructions_identical": true,
+    "functions": 8,
+    "matched_instruction_words": 137808
+  }
+}

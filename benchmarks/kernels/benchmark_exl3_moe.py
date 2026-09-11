@@ -665,12 +665,38 @@ def main():
     parser.add_argument("--routing", choices=["uniform", "hot"], default="uniform")
     parser.add_argument("--route-sample", type=Path)
     parser.add_argument("--row-kernel-library", type=Path)
+    parser.add_argument("--decode-kernel-library", type=Path)
+    parser.add_argument(
+        "--decode-rows", type=int, nargs="+", choices=range(1, 9), default=[1, 2, 4, 8]
+    )
+    parser.add_argument(
+        "--decode-grids",
+        type=int,
+        nargs="+",
+        choices=[4, 8, 16, 32, 64],
+        default=[4, 8, 16, 32, 64],
+    )
+    parser.add_argument(
+        "--decode-modes",
+        nargs="+",
+        choices=["plain", "residual"],
+        default=["plain", "residual"],
+    )
     parser.add_argument(
         "--row-kernel-variants",
         nargs="+",
-        choices=["native", "m16", "m32", "m32_predicated", "native_after"],
+        choices=[
+            "native",
+            "m16",
+            "m32",
+            "m32_predicated",
+            "native_after",
+            "int8",
+            "int8_residual",
+        ],
         default=["native", "m16", "m32", "m32_predicated", "native_after"],
     )
+    parser.add_argument("--row-kernel-max-relative-error", type=float, default=0.001)
     parser.add_argument("--hybrid-experts", type=int, nargs="+")
     parser.add_argument("--hybrid-grouped", action="store_true")
     parser.add_argument("--reuse-buffers", action="store_true")
@@ -689,6 +715,12 @@ def main():
     args = parser.parse_args()
     if args.row_kernel_library and (not args.route_sample or not args.prefill_rows):
         parser.error("--row-kernel-library requires --route-sample and --prefill-rows")
+    if args.decode_kernel_library and (
+        not args.route_sample or args.row_kernel_library
+    ):
+        parser.error(
+            "--decode-kernel-library requires --route-sample and no row kernel"
+        )
     config = Exl3Config({})
     config.maybe_update_config(str(args.checkpoint))
     k, n = config.matrices[args.prefix + ".0.gate_proj"].dimensions
@@ -715,11 +747,14 @@ def main():
                     param, handle.get_tensor(name), expert_id=int(expert), shard_id=kind
                 )
     method.process_weights_after_loading(layer)
-    if args.row_kernel_library:
+    if args.row_kernel_library or args.decode_kernel_library:
         import sys
 
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-        from benchmarks.kernels.exl3_m32.benchmark import run
+        if args.decode_kernel_library:
+            from benchmarks.kernels.exl3_moe_decode.benchmark import run
+        else:
+            from benchmarks.kernels.exl3_m32.benchmark import run
 
         run(layer, method, args, k, n)
         return

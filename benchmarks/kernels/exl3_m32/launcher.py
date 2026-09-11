@@ -17,10 +17,12 @@ class Dim3(ct.Structure):
 
 
 class Launcher:
+    variants = ("m16", "m32", "m32_predicated")
+
     def __init__(self, extension, library, variant="m32_predicated"):
         if importlib.metadata.version("exllamav3") != "1.4.8":
             raise ValueError("This experiment requires ExLlamaV3 1.4.8")
-        if variant not in ("m16", "m32", "m32_predicated"):
+        if variant not in self.variants:
             raise ValueError(f"Unknown row kernel: {variant}")
         self.original = extension.exl3_moe
         self.library = str(Path(library).resolve())

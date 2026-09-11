@@ -185,7 +185,9 @@ if TYPE_CHECKING:
     VLLM_RAY_DP_PLACEMENT_NODE_IPS: str = ""
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
-    VLLM_EXL3_MOE_MAX_TOKENS: int = 1024
+    VLLM_EXL3_MOE_MAX_TOKENS: int = 2048
+    VLLM_EXL3_MOE_M_TILE: int = 32
+    VLLM_EXL3_MOE_DECODE: str = "hybrid"
     VLLM_EXL3_MOE_PRIORITY: bool = True
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MHC_AR_INT8: bool = False
@@ -1559,8 +1561,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Maximum EXL3 tokens per fused expert group; also sizes its shared workspace.
     "VLLM_EXL3_MOE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_EXL3_MOE_MAX_TOKENS", "1024")
+        os.getenv("VLLM_EXL3_MOE_MAX_TOKENS", "2048")
     ),
+    # SM80 row reuse for supported experts; 16 selects the upstream kernel.
+    "VLLM_EXL3_MOE_M_TILE": lambda: int(os.getenv("VLLM_EXL3_MOE_M_TILE", "32")),
+    # Native FP16 expert decode, or INT8 with automatic/per-device residual policy.
+    "VLLM_EXL3_MOE_DECODE": lambda: os.getenv("VLLM_EXL3_MOE_DECODE", "hybrid"),
     # Schedule larger EXL3 experts first to reduce the final wave of work.
     "VLLM_EXL3_MOE_PRIORITY": lambda: (os.getenv("VLLM_EXL3_MOE_PRIORITY", "1") == "1"),
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.

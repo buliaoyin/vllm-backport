@@ -264,7 +264,9 @@ class Exl3ProfileWorkerExtension:
                 else fused_with_chunk
             )
 
-            def candidate(x, weights, ids, ptrs, workspace, bits, flags, limit):
+            def candidate(
+                x, weights, ids, ptrs, workspace, bits, flags, limit, m32_locks=None
+            ):
                 inputs = (
                     x,
                     weights,
@@ -443,7 +445,12 @@ class Exl3ProfileWorkerExtension:
             if not isinstance(method, Exl3MoEMethod):
                 continue
             layers.append(
-                {"prefix": method.prefix, "capacity": method.workspace[0].shape[1]}
+                {
+                    "prefix": method.prefix,
+                    "capacity": method.workspace[0].shape[1],
+                    "m_tile": method.moe_m_tile,
+                    "decode_mode": ("native", "plain", "residual")[method.decode_mode],
+                }
             )
             for tensor in method.workspace:
                 buffers[tensor.data_ptr()] = tensor.numel() * tensor.element_size()

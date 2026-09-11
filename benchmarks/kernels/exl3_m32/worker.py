@@ -3,14 +3,21 @@
 """Install row kernels on SM80 ranks for controlled, same-engine comparisons."""
 
 import hashlib
+import os
 from pathlib import Path
 
 import torch
 from exl3_profile_worker import Exl3ProfileWorkerExtension
 from kernels.exl3_m32.launcher import Launcher
 
+# Keep experimental row-kernel controls independent of the production default.
+os.environ["VLLM_EXL3_MOE_M_TILE"] = "16"
+os.environ["VLLM_EXL3_MOE_DECODE"] = "native"
+
 
 class Exl3RowsWorkerExtension(Exl3ProfileWorkerExtension):
+    launcher_class = Launcher
+
     def configure_exl3_optimization(self, options):
         from vllm.model_executor.layers.quantization.exl3 import (
             Exl3MoEMethod,
@@ -26,7 +33,7 @@ class Exl3RowsWorkerExtension(Exl3ProfileWorkerExtension):
         if not library or torch.cuda.get_device_capability() != (8, 0):
             result["row_kernel"] = "native"
             return result
-        launcher = Launcher(
+        launcher = self.launcher_class(
             extension, library, options.get("rows_variant", "m32_predicated")
         )
         methods = 0

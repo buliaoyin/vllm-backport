@@ -1,0 +1,34 @@
+[
+  {
+    "name": "rebuild-decode",
+    "command": [
+      "/home/bul/dev/vllm-backport/.venv/bin/python",
+      "/home/bul/dev/vllm-backport/benchmarks/kernels/exl3_moe_decode/build.py",
+      "--source",
+      "/home/bul/dev/exllamav3",
+      "--build-dir",
+      "/tmp/exl3-moe-next-20260911/rebuild-decode",
+      "--nvcc",
+      "/usr/local/cuda/bin/nvcc"
+    ],
+    "start": 1789111214.9778416,
+    "exit_code": 0,
+    "end": 1789111227.7140281
+  },
+  {
+    "name": "rebuild-prefill",
+    "command": [
+      "/home/bul/dev/vllm-backport/.venv/bin/python",
+      "/home/bul/dev/vllm-backport/benchmarks/kernels/exl3_moe_decode/build_prefill.py",
+      "--source",
+      "/home/bul/dev/exllamav3",
+      "--build-dir",
+      "/tmp/exl3-moe-next-20260911/rebuild-prefill",
+      "--nvcc",
+      "/usr/local/cuda/bin/nvcc"
+    ],
+    "start": 1789111227.7145748,
+    "exit_code": 0,
+    "end": 1789111269.4566734
+  }
+]

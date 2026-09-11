@@ -1,0 +1,13 @@
+{
+  "variant": "base_m32_k32_n256",
+  "diagnostic_only": true,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "capability": [
+    12,
+    0
+  ],
+  "rows": [
+    33,
+    513
+  ]
+}
