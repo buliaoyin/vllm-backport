@@ -12,11 +12,18 @@ from benchmarks.kernels.exl3_m32.launcher import Dim3
 
 
 class Launcher:
-    def __init__(self, library, variant):
+    def __init__(self, library, variant, carveout=None):
         self.library = str(Path(library).resolve())
         metadata = json.loads(Path(self.library).with_name("build.json").read_text())
         self.config = metadata["variants"][variant]
         self.variant = variant
+        self.carveout = (
+            self.config.get(
+                "preferred_carveout", 25 if self.config["minimum_blocks"] > 1 else 0
+            )
+            if carveout is None
+            else carveout
+        )
         self.binary = ct.CDLL(self.library)
         factory = getattr(self.binary, "exl3_prefill_" + variant)
         factory.argtypes, factory.restype = [], ct.c_void_p
@@ -64,8 +71,8 @@ class Launcher:
         if device not in self.plans:
             threads, shared = self.config["threads"], self.config["shared_bytes"]
             self.check(self.cuda.cudaFuncSetAttribute(self.kernel, 8, shared))
-            # Prefer L1, subject to the requested shared memory and residency.
-            self.check(self.cuda.cudaFuncSetAttribute(self.kernel, 9, 0))
+            # The smallest shared carveout can prevent a second resident block.
+            self.check(self.cuda.cudaFuncSetAttribute(self.kernel, 9, self.carveout))
             active = ct.c_int()
             self.check(
                 self.cuda.cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -108,6 +115,9 @@ class Launcher:
         if hidden.dtype != torch.float16 or output.dtype != torch.float32:
             raise ValueError("Expected FP16 input and FP32 output")
         k, n, capacity = hidden.shape[1], old[2].shape[2], old[0].shape[1]
+        fixed = self.config.get("fixed_dimensions")
+        if fixed and [k, n] != fixed:
+            raise ValueError(f"This experiment requires dimensions {fixed}")
         if any(width < 256 or width > 8192 or width % 256 for width in (k, n)):
             raise ValueError("Dimensions must be multiples of 256 in [256, 8192]")
         if hidden.shape != output.shape or hidden.shape[0] > capacity:
@@ -165,6 +175,7 @@ class Launcher:
     def metadata(self):
         return {
             "variant": self.variant,
+            "shared_carveout_percent": self.carveout,
             "config": self.config,
             "plans": {
                 str(k): {x: y for x, y in p.items() if x != "lookup"}

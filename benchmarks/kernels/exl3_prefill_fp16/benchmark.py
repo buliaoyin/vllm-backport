@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compare prefill experiments on real routes, including the complete wrapper."""
+"""Compare temporary projection reconstruction and grouped GEMM on real routes."""
 
 import argparse
 import hashlib
@@ -13,7 +13,8 @@ from types import SimpleNamespace
 import torch
 from safetensors import safe_open
 
-from benchmarks.kernels.exl3_prefill.launcher import Launcher
+from benchmarks.kernels.exl3_prefill_fp16.backend import CONFIGS, Backend
+from vllm.model_executor.layers.quantization import exl3
 from vllm.model_executor.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
 
 
@@ -81,17 +82,16 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows", type=int, nargs="+", default=[1024, 2048, 4096])
     parser.add_argument("--variants", nargs="+")
-    parser.add_argument("--carveout", type=int, choices=[0, 25, 50, 75, 100])
     parser.add_argument("--repeats", type=int, default=15)
     args = parser.parse_args()
     if torch.cuda.get_device_capability() != (8, 0):
         raise ValueError("This sweep targets SM80")
     layer, method = load_layer(args.checkpoint, args.prefix)
     sample = torch.load(args.routes, weights_only=True, map_location="cuda")
-    original = torch.ops._exl3_C.moe_m32
+    original = exl3._exl3_moe_fused
     if method.m32_locks is None:
         raise RuntimeError("Expected the supported production M32 reference")
-    configs = json.loads(args.library.with_name("build.json").read_text())["variants"]
+    configs = CONFIGS
     variants = args.variants or list(configs)
     records = []
     result = {
@@ -124,10 +124,10 @@ def main():
         for variant in ["native-before", *variants, "native-after"]:
             launcher = None
             if variant.startswith("native-"):
-                torch.ops._exl3_C.moe_m32 = original
+                exl3._exl3_moe_fused = original
             else:
-                launcher = Launcher(args.library, variant, args.carveout)
-                torch.ops._exl3_C.moe_m32 = launcher
+                launcher = Backend(args.library, variant)
+                exl3._exl3_moe_fused = launcher
             actual = run().float()
             torch.accelerator.synchronize()
             error = ((actual - reference).norm() / reference.norm()).item()
@@ -154,9 +154,9 @@ def main():
             records.append(record)
             print(rows, variant, round(ms, 4), error, flush=True)
             args.output.write_text(json.dumps(result, indent=2))
-            torch.ops._exl3_C.moe_m32 = original
+            exl3._exl3_moe_fused = original
             del launcher
-    torch.ops._exl3_C.moe_m32 = original
+    exl3._exl3_moe_fused = original
 
 
 if __name__ == "__main__":

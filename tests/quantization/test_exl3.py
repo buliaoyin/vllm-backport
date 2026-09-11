@@ -483,6 +483,25 @@ def test_experimental_moe_pipeline(rows, variant, monkeypatch):
         "m64_k16_n128",
         "lookup",
         "lookup_k16",
+        "wide_m32",
+        "wide_m64",
+        "wide_m64_single",
+        "fixed_m32",
+        "fixed_k16",
+        "fixed_wide_m32",
+        "fixed_wide_m64",
+        "cached_m32_k64",
+        "cached_m32_k128",
+        "cached_m64_k64",
+        "cached_m64_k128",
+        "cached_m32_n256_k64",
+        "cached_m32_n256_k128",
+        "cached_m64_n256_k64",
+        "cached_m64_n256_k128",
+        "adaptive64",
+        "adaptive96",
+        "adaptive128",
+        "adaptive192",
     ],
 )
 def test_experimental_prefill_residency_and_codebook(rows, variant, monkeypatch):
@@ -498,4 +517,49 @@ def test_experimental_prefill_residency_and_codebook(rows, variant, monkeypatch)
     from benchmarks.kernels.exl3_prefill.launcher import Launcher
 
     monkeypatch.setattr(torch.ops._exl3_C, "moe_m32", Launcher(library, variant))
+    hidden, intermediate = (4096, 2048) if variant.startswith("fixed_") else (256, 512)
+    _check_moe_routing(
+        rows, 1024, hidden, monkeypatch, m_tile=None, intermediate_dim=intermediate
+    )
+
+
+@pytest.mark.parametrize("rows", [9, 1024, 2048])
+@pytest.mark.parametrize("bits", [2, 4, 8])
+def test_prefill_projection_cache_preserves_quantized_outputs(rows, bits):
+    """Cached rotated weights must match reconstruction and survive graph replay."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    pytest.importorskip("exllamav3_ext")
+    from benchmarks.kernels.exl3_prefill.linear_cache import linear, reconstruct
+
+    torch.manual_seed(3)
+    w = _weights(k=256, n=512, bits=bits, device="cuda")
+    cached = reconstruct(w)
+    x = torch.randn(rows, 256, dtype=torch.bfloat16, device="cuda")
+    args = (w["trellis"], w["suh"], w["svh"], False, True)
+    torch.testing.assert_close(linear(x, *args, cached), _exl3_linear(x, *args))
+    for _ in range(3):
+        linear(x, *args, cached)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = linear(x, *args, cached)
+    x.mul_(0.5)
+    graph.replay()
+    torch.testing.assert_close(actual, _exl3_linear(x, *args))
+
+
+@pytest.mark.parametrize("rows", [9, 65, 513, 2049])
+def test_experimental_batched_fp16_prefill(rows, monkeypatch):
+    """Batched reconstruction and grouped GEMM must preserve routes and rotations."""
+    import os
+
+    library = os.environ.get("VLLM_EXL3_TEST_FP16_PREFILL_LIBRARY")
+    if not library or not torch.cuda.is_available():
+        pytest.skip("Requires the optional batched FP16 prefill library")
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("The prototype is built for SM80")
+    from benchmarks.kernels.exl3_prefill_fp16.backend import Backend
+    from vllm.model_executor.layers.quantization import exl3
+
+    monkeypatch.setattr(exl3, "_exl3_moe_fused", Backend(library))
     _check_moe_routing(rows, 1024, 256, monkeypatch, m_tile=None, intermediate_dim=512)

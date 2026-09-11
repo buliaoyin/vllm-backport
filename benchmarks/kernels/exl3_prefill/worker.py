@@ -10,6 +10,13 @@ import torch
 
 from benchmarks.exl3_profile_worker import Exl3ProfileWorkerExtension
 
+_LINEAR_CACHE = None
+if os.environ.get("VLLM_EXL3_LINEAR_CACHE_GIB"):
+    from benchmarks.kernels.exl3_prefill import linear_cache
+
+    linear_cache.install(float(os.environ["VLLM_EXL3_LINEAR_CACHE_GIB"]))
+    _LINEAR_CACHE = linear_cache.STATE
+
 _VARIANT = os.environ.get("VLLM_EXL3_EXPERIMENTAL_PREFILL")
 if _VARIANT:
     from benchmarks.kernels.exl3_prefill.launcher import Launcher
@@ -36,6 +43,7 @@ class WorkerExtension(Exl3ProfileWorkerExtension):
         result = super().get_exl3_runtime_state()
         launcher = getattr(exl3, "_prefill_experiment", None)
         result["prefill_experiment"] = launcher.metadata() if launcher else None
+        result["linear_cache"] = _LINEAR_CACHE
         return result
 
     def install_exl3_event_profile(self):
