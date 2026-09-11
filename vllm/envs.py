@@ -185,6 +185,8 @@ if TYPE_CHECKING:
     VLLM_RAY_DP_PLACEMENT_NODE_IPS: str = ""
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
+    VLLM_EXL3_MOE_MAX_TOKENS: int = 1024
+    VLLM_EXL3_MOE_PRIORITY: bool = True
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MHC_AR_INT8: bool = False
     VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS: bool = True
@@ -1555,6 +1557,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MODEL_REDIRECT_PATH": lambda: os.environ.get(
         "VLLM_MODEL_REDIRECT_PATH", None
     ),
+    # Maximum EXL3 tokens per fused expert group; also sizes its shared workspace.
+    "VLLM_EXL3_MOE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_EXL3_MOE_MAX_TOKENS", "1024")
+    ),
+    # Schedule larger EXL3 experts first to reduce the final wave of work.
+    "VLLM_EXL3_MOE_PRIORITY": lambda: (os.getenv("VLLM_EXL3_MOE_PRIORITY", "1") == "1"),
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"

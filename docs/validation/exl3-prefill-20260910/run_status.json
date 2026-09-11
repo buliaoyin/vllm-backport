@@ -1,0 +1,133 @@
+{
+  "source_sha256": "100fbfe3deb551906fae2bffc6f1572c39de8bf6315c9bad1dc96376d9e9495e",
+  "order": [
+    [
+      "exl3",
+      512
+    ],
+    [
+      "nvfp4",
+      512
+    ],
+    [
+      "awq",
+      512
+    ],
+    [
+      "awq",
+      8192
+    ],
+    [
+      "nvfp4",
+      8192
+    ],
+    [
+      "exl3",
+      8192
+    ]
+  ],
+  "runs": [
+    {
+      "name": "exl3-c512",
+      "command": [
+        "/home/bul/dev/vllm-backport/.venv/bin/python",
+        "/home/bul/dev/vllm-backport/benchmarks/benchmark_exl3.py",
+        "--backend",
+        "vllm",
+        "--pp",
+        "4",
+        "--inputs",
+        "/tmp/exl3-prefill-analysis-20260910/exl3-inputs.json.gz",
+        "--output",
+        "/tmp/exl3-prefill-analysis-20260910/exl3-c512.json",
+        "--max-model-len",
+        "16384",
+        "--kv-cache-gib",
+        "4",
+        "--chunk-size",
+        "512",
+        "--warmups",
+        "1",
+        "--tokens",
+        "32",
+        "--skip-eval",
+        "--profile-dir",
+        "/tmp/exl3-prefill-analysis-20260910/exl3-c512-profile",
+        "--profile-tokens",
+        "1"
+      ],
+      "start_utc": "2026-09-10T09:51:24.482996+00:00",
+      "exit_code": 0,
+      "elapsed_seconds": 155.85782857896993,
+      "end_utc": "2026-09-10T09:54:00.340970+00:00"
+    },
+    {
+      "name": "nvfp4-c512",
+      "command": [
+        "/home/bul/dev/vllm-backport/.venv/bin/python",
+        "/home/bul/dev/vllm-backport/benchmarks/benchmark_exl3.py",
+        "--backend",
+        "vllm",
+        "--pp",
+        "4",
+        "--inputs",
+        "/tmp/exl3-prefill-analysis-20260910/nvfp4-inputs.json.gz",
+        "--output",
+        "/tmp/exl3-prefill-analysis-20260910/nvfp4-c512.json",
+        "--max-model-len",
+        "16384",
+        "--kv-cache-gib",
+        "4",
+        "--chunk-size",
+        "512",
+        "--warmups",
+        "1",
+        "--tokens",
+        "32",
+        "--skip-eval",
+        "--profile-dir",
+        "/tmp/exl3-prefill-analysis-20260910/nvfp4-c512-profile",
+        "--profile-tokens",
+        "1"
+      ],
+      "start_utc": "2026-09-10T09:54:00.341716+00:00",
+      "exit_code": 0,
+      "elapsed_seconds": 671.0487535140128,
+      "end_utc": "2026-09-10T10:05:11.390665+00:00"
+    },
+    {
+      "name": "awq-c512",
+      "command": [
+        "/home/bul/dev/vllm-backport/.venv/bin/python",
+        "/home/bul/dev/vllm-backport/benchmarks/benchmark_exl3.py",
+        "--backend",
+        "vllm",
+        "--pp",
+        "4",
+        "--inputs",
+        "/tmp/exl3-prefill-analysis-20260910/awq-inputs.json.gz",
+        "--output",
+        "/tmp/exl3-prefill-analysis-20260910/awq-c512.json",
+        "--max-model-len",
+        "16384",
+        "--kv-cache-gib",
+        "4",
+        "--chunk-size",
+        "512",
+        "--warmups",
+        "1",
+        "--tokens",
+        "32",
+        "--skip-eval",
+        "--profile-dir",
+        "/tmp/exl3-prefill-analysis-20260910/awq-c512-profile",
+        "--profile-tokens",
+        "1"
+      ],
+      "start_utc": "2026-09-10T10:05:11.391625+00:00",
+      "exit_code": 1,
+      "elapsed_seconds": 350.2452337439754,
+      "end_utc": "2026-09-10T10:11:01.637315+00:00"
+    }
+  ]
+}

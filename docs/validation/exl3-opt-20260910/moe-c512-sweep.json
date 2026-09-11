@@ -1,0 +1,701 @@
+{
+  "answer_check_scope": "before_first_stop_token",
+  "args": {
+    "backend": "vllm",
+    "inputs": "docs/validation/exl3-prefill-20260910/exl3-inputs.json.gz",
+    "output": "/tmp/exl3-opt-20260910/moe-c512-sweep.json",
+    "pp": 4,
+    "expected_layer_counts": null,
+    "exl_memory": [
+      31,
+      40,
+      40,
+      48
+    ],
+    "max_model_len": 16384,
+    "kv_cache_gib": 4.0,
+    "exl_cache_tokens": 16384,
+    "warmups": 1,
+    "chunk_size": 512,
+    "batch_size": 4,
+    "repeats": 3,
+    "tokens": 32,
+    "eval_tokens": 768,
+    "skip_perf": false,
+    "skip_eval": true,
+    "eager": false,
+    "profile_dir": null,
+    "profile_tokens": 1,
+    "moe_workspace_sizes": [
+      128,
+      256,
+      512
+    ],
+    "capture_routing_dir": "/tmp/exl3-opt-20260910/routes"
+  },
+  "inputs_sha256": "75674b8e2e0c5b59e4730ca9f82248aa5d985e063e847733e81fea5d2874e1e4",
+  "model": "/media/bul/ext1/dev/models/zai/turboderp/GLM-5.3-Flash-exl3/4.05bpw",
+  "benchmark_source_sha256": "c411f47c645ba9342056af242e6a2146ea11f9420d7617bb2a4b3f72897e2869",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "gpu_names": [
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "EXL3_INT8_GEMV": "0",
+    "OMP_NUM_THREADS": "1",
+    "VLLM_PP_LAYER_PARTITION": "11,11,11,12",
+    "NCCL_P2P_DISABLE": "1"
+  },
+  "revision": "5fc5fa7c8cfd67640f83ff98215ae6e797b20426",
+  "perf": [
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 128,
+      "repeat": 0,
+      "seconds": 7.011892481008545,
+      "throughput": 4.563675225578663,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            785,
+            1196,
+            6801,
+            752,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            304,
+            279,
+            18104,
+            13,
+            6771,
+            752,
+            2711,
+            1526,
+            279
+          ],
+          "text": "752228The user wants me to find the access code for record_8192_0_vault in the archive. Let me search through the",
+          "ttft": 6.221635580062866,
+          "prefill": 6.218700096011162,
+          "decode": 0.7900012049940415,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.221635580062866
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 128,
+      "repeat": 1,
+      "seconds": 7.024961966963019,
+      "throughput": 4.555184803916314,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            1477,
+            279,
+            4734,
+            2615,
+            2038,
+            12601,
+            311,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            13,
+            576,
+            2038,
+            13657,
+            3055,
+            304,
+            279,
+            4743,
+            48039
+          ],
+          "text": "752228We need to find the exact access code assigned to record_8192_0_vault. The code occurs once in the six-digit",
+          "ttft": 6.232563257217407,
+          "prefill": 6.229559703031555,
+          "decode": 0.7922222649795003,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.232563257217407
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 128,
+      "repeat": 2,
+      "seconds": 7.02894536399981,
+      "throughput": 4.552603319965266,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            13,
+            576,
+            18104,
+            5610,
+            1657,
+            3589,
+            11,
+            323,
+            279,
+            64126,
+            3255
+          ],
+          "text": "752228We need to find the access code for record_8192_0_vault. The archive contains many items, and the authoritative record",
+          "ttft": 6.2368998527526855,
+          "prefill": 6.23383833799744,
+          "decode": 0.7918678059941158,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.2368998527526855
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 256,
+      "repeat": 0,
+      "seconds": 5.581529964983929,
+      "throughput": 5.733195055971027,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            785,
+            1196,
+            6801,
+            752,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            304,
+            279,
+            18104,
+            382,
+            22405,
+            518,
+            279,
+            18104,
+            11
+          ],
+          "text": "752228The user wants me to find the access code for record_8192_0_vault in the archive.\n\nLooking at the archive,",
+          "ttft": 4.787298202514648,
+          "prefill": 4.784409290004987,
+          "decode": 0.7939925719983876,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 4.787298202514648
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 256,
+      "repeat": 1,
+      "seconds": 5.590472894022241,
+      "throughput": 5.72402381813117,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            785,
+            1196,
+            6801,
+            752,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            304,
+            279,
+            18104,
+            13,
+            6771,
+            752,
+            2711,
+            1526,
+            279
+          ],
+          "text": "752228The user wants me to find the access code for record_8192_0_vault in the archive. Let me search through the",
+          "ttft": 4.796044111251831,
+          "prefill": 4.792976709955838,
+          "decode": 0.7940946629969403,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 4.796044111251831
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 256,
+      "repeat": 2,
+      "seconds": 5.594872611982282,
+      "throughput": 5.7195225377369745,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            785,
+            1196,
+            6801,
+            752,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            304,
+            279,
+            18104,
+            382,
+            22405,
+            518,
+            279,
+            18104,
+            11
+          ],
+          "text": "752228The user wants me to find the access code for record_8192_0_vault in the archive.\n\nLooking at the archive,",
+          "ttft": 4.80042839050293,
+          "prefill": 4.797074354952201,
+          "decode": 0.7945131820160896,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 4.80042839050293
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 512,
+      "repeat": 0,
+      "seconds": 4.753329441999085,
+      "throughput": 6.7321233233398425,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            1196,
+            594,
+            1537,
+            1681,
+            13,
+            14646,
+            24017,
+            10430,
+            13,
+            2657,
+            3897,
+            18104,
+            323,
+            4588,
+            24449,
+            4734,
+            2615,
+            2038,
+            12601,
+            311,
+            3255,
+            62,
+            23,
+            98729
+          ],
+          "text": "752228We need to answer user's last request. Need inspect conversation. User provided archive and asked locate exact access code assigned to record_819",
+          "ttft": 3.9588546752929688,
+          "prefill": 3.9559614500030875,
+          "decode": 0.7942101940279827,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.9588546752929688
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 512,
+      "repeat": 1,
+      "seconds": 4.741228958999272,
+      "throughput": 6.749304932692855,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            1196,
+            594,
+            1681,
+            13,
+            14646,
+            4715,
+            13,
+            2657,
+            17045,
+            25,
+            330,
+            1900,
+            220,
+            23,
+            98729,
+            17,
+            14,
+            15,
+            13,
+            4457,
+            279,
+            18104,
+            323,
+            24449
+          ],
+          "text": "752228We need to answer user's request. Need parse. User asks: \"Request 8192/0. Read the archive and locate",
+          "ttft": 3.9463584423065186,
+          "prefill": 3.9436719269724563,
+          "decode": 0.7944515600102022,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.9463584423065186
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": 512,
+      "repeat": 2,
+      "seconds": 4.756981206010096,
+      "throughput": 6.726955313502259,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            25,
+            14646,
+            311,
+            5889,
+            311,
+            1196,
+            594,
+            1681,
+            13,
+            1205,
+            1184,
+            4715,
+            1681,
+            13,
+            2657,
+            2727,
+            25,
+            330,
+            1900,
+            220,
+            23,
+            98729,
+            17,
+            14
+          ],
+          "text": "752228We need to answer: Need to respond to user's request. We need parse request. User says: \"Request 8192/",
+          "ttft": 3.9620471000671387,
+          "prefill": 3.959113969001919,
+          "decode": 0.7947172709973529,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.9620471000671387
+    }
+  ],
+  "eval": [],
+  "load_seconds": 99.6909982500365,
+  "exllamav3_version": "1.4.8",
+  "workspace_sweep": [
+    [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 128,
+        "expert_layers": 8,
+        "workspace_bytes": 25165824
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 128,
+        "expert_layers": 11,
+        "workspace_bytes": 25165824
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 128,
+        "expert_layers": 11,
+        "workspace_bytes": 25165824
+      },
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "capacity": 128,
+        "expert_layers": 12,
+        "workspace_bytes": 72351744
+      }
+    ],
+    [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 256,
+        "expert_layers": 8,
+        "workspace_bytes": 50331648
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 256,
+        "expert_layers": 11,
+        "workspace_bytes": 50331648
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 256,
+        "expert_layers": 11,
+        "workspace_bytes": 50331648
+      },
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "capacity": 256,
+        "expert_layers": 12,
+        "workspace_bytes": 144703488
+      }
+    ],
+    [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 512,
+        "expert_layers": 8,
+        "workspace_bytes": 100663296
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 512,
+        "expert_layers": 11,
+        "workspace_bytes": 100663296
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "capacity": 512,
+        "expert_layers": 11,
+        "workspace_bytes": 100663296
+      },
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "capacity": 512,
+        "expert_layers": 12,
+        "workspace_bytes": 289406976
+      }
+    ]
+  ],
+  "routing_samples": [
+    [
+      "/tmp/exl3-opt-20260910/routes/layer-3.pt"
+    ],
+    [],
+    [
+      "/tmp/exl3-opt-20260910/routes/layer-22.pt"
+    ],
+    [
+      "/tmp/exl3-opt-20260910/routes/layer-44.pt"
+    ]
+  ]
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "capacity": null,
+    "label": "production-before"
+  },
+  {
+    "capacity": 128,
+    "priority": false,
+    "label": "legacy-settings"
+  },
+  {
+    "capacity": 512,
+    "priority": true,
+    "label": "production-after"
+  }
+]

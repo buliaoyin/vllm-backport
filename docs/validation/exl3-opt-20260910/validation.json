@@ -1,0 +1,199 @@
+{
+  "production_source_matches_long_and_eval_run": true,
+  "source_sha256": {
+    "vllm/model_executor/layers/quantization/exl3.py": "2969673dacf150b11aa63cbef251a091f8b8e6c20bd4a04beaa6df58acc28915",
+    "vllm/envs.py": "11654d9a02c051e454312aefd959b60d92adc815951f3adb7e240c5e6c1e3848",
+    "tests/quantization/test_exl3.py": "ee03db39d595b404b244e6881e850f35b6672f1bad7c85388eb3e8ec42ff0f66"
+  },
+  "gpu_tests": {
+    "0": 37,
+    "3": 37
+  },
+  "micro_cases": 394,
+  "micro_max_relative_l2": 0.002072333823889494,
+  "perf": {
+    "retrieval": 369,
+    "retrieval_passed": 369,
+    "generated_tokens_valid": true,
+    "zero_cache_hits": true
+  },
+  "model_repeats_verified": [
+    "moe-c512-sweep",
+    "moe-c1024-variants",
+    "equal-c1024",
+    "pp19-c1024",
+    "pp21-c1024",
+    "pp21-c512",
+    "pp21-c2048",
+    "reuse-model",
+    "long-final",
+    "long-c2048",
+    "tile-model",
+    "nvfp4-pp21-c1024",
+    "awq-pp18-c1024",
+    "exl3-pp18-c1024"
+  ],
+  "gsm8k": {
+    "correct": 63,
+    "total": 64,
+    "truncated": 0,
+    "single_question_controls": {
+      "eval-pp21": {
+        "correct": 28,
+        "total": 32,
+        "variants": [
+          {
+            "repeat": 0,
+            "variant": {
+              "capacity": 1024,
+              "priority": true
+            },
+            "predicted12": "13"
+          },
+          {
+            "repeat": 0,
+            "variant": {
+              "capacity": 1024,
+              "priority": false
+            },
+            "predicted12": "12"
+          },
+          {
+            "repeat": 0,
+            "variant": {
+              "capacity": 128,
+              "priority": false
+            },
+            "predicted12": "13"
+          },
+          {
+            "repeat": 0,
+            "variant": {
+              "capacity": 128,
+              "priority": true
+            },
+            "predicted12": "13"
+          },
+          {
+            "repeat": 1,
+            "variant": {
+              "capacity": 1024,
+              "priority": true
+            },
+            "predicted12": "12"
+          },
+          {
+            "repeat": 1,
+            "variant": {
+              "capacity": 1024,
+              "priority": false
+            },
+            "predicted12": "12"
+          },
+          {
+            "repeat": 1,
+            "variant": {
+              "capacity": 128,
+              "priority": false
+            },
+            "predicted12": "12"
+          },
+          {
+            "repeat": 1,
+            "variant": {
+              "capacity": 128,
+              "priority": true
+            },
+            "predicted12": "13"
+          }
+        ]
+      },
+      "eval-equal": {
+        "correct": 30,
+        "total": 32,
+        "variants": [
+          {
+            "repeat": 0,
+            "variant": {
+              "capacity": 1024,
+              "priority": true
+            },
+            "predicted12": "12"
+          },
+          {
+            "repeat": 0,
+            "variant": {
+              "capacity": 1024,
+              "priority": false
+            },
+            "predicted12": "13"
+          },
+          {
+            "repeat": 0,
+            "variant": {
+              "capacity": 128,
+              "priority": false
+            },
+            "predicted12": "13"
+          },
+          {
+            "repeat": 0,
+            "variant": {
+              "capacity": 128,
+              "priority": true
+            },
+            "predicted12": "13"
+          },
+          {
+            "repeat": 1,
+            "variant": {
+              "capacity": 1024,
+              "priority": true
+            },
+            "predicted12": "13"
+          },
+          {
+            "repeat": 1,
+            "variant": {
+              "capacity": 1024,
+              "priority": false
+            },
+            "predicted12": "13"
+          },
+          {
+            "repeat": 1,
+            "variant": {
+              "capacity": 128,
+              "priority": false
+            },
+            "predicted12": "12"
+          },
+          {
+            "repeat": 1,
+            "variant": {
+              "capacity": 128,
+              "priority": true
+            },
+            "predicted12": "13"
+          }
+        ]
+      }
+    }
+  },
+  "lint": "pre-commit passed",
+  "types": "mypy-3.12 passed",
+  "expected_failures": [
+    {
+      "experiment": "awq-pp21-c1024",
+      "reason": "GPU3 allocation of 4.5 GiB failed during model construction; 21-layer placement exceeds memory; no performance samples"
+    },
+    {
+      "experiment": "eval-entrypoint-failure",
+      "reason": "Temporary helper lacked multiprocessing main guard; fixed and all controls completed"
+    },
+    {
+      "experiment": "hybrid-gpu0-capture-failure",
+      "reason": "CUDA graph-incompatible boolean indexing in experimental helper; replaced with index_fill_ and rerun"
+    }
+  ]
+}

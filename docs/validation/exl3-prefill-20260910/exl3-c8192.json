@@ -1,0 +1,252 @@
+{
+  "answer_check_scope": "before_first_stop_token",
+  "args": {
+    "backend": "vllm",
+    "inputs": "/tmp/exl3-prefill-analysis-20260910/exl3-inputs.json.gz",
+    "output": "/tmp/exl3-prefill-analysis-20260910/exl3-c8192.json",
+    "pp": 4,
+    "expected_layer_counts": null,
+    "exl_memory": [
+      31,
+      40,
+      40,
+      48
+    ],
+    "max_model_len": 16384,
+    "kv_cache_gib": 4.0,
+    "exl_cache_tokens": 16384,
+    "warmups": 1,
+    "chunk_size": 8192,
+    "batch_size": 4,
+    "repeats": 3,
+    "tokens": 32,
+    "eval_tokens": 768,
+    "skip_perf": false,
+    "skip_eval": true,
+    "eager": false,
+    "profile_dir": "/tmp/exl3-prefill-analysis-20260910/exl3-c8192-profile",
+    "profile_tokens": 1
+  },
+  "inputs_sha256": "75674b8e2e0c5b59e4730ca9f82248aa5d985e063e847733e81fea5d2874e1e4",
+  "model": "/media/bul/ext1/dev/models/zai/turboderp/GLM-5.3-Flash-exl3/4.05bpw",
+  "benchmark_source_sha256": "5120dbd94e925dd89e0f8e7e12e93ac34e46705d2a35ec597b64043e81856412",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "gpu_names": [
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "EXL3_INT8_GEMV": "0",
+    "OMP_NUM_THREADS": "1",
+    "VLLM_PP_LAYER_PARTITION": "11,11,11,12",
+    "NCCL_P2P_DISABLE": "1"
+  },
+  "revision": "5fc5fa7c8cfd67640f83ff98215ae6e797b20426",
+  "perf": [
+    {
+      "case": "p8192_b1",
+      "repeat": 0,
+      "seconds": 17.000837032974232,
+      "throughput": 1.8822602638878259,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            1477,
+            279,
+            4734,
+            2615,
+            2038,
+            12601,
+            311,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            13,
+            576,
+            2038,
+            13657,
+            3055,
+            304,
+            279,
+            5383,
+            13
+          ],
+          "text": "752228We need to find the exact access code assigned to record_8192_0_vault. The code occurs once in the pattern.",
+          "ttft": 16.2111599445343,
+          "prefill": 16.207414656004403,
+          "decode": 0.7897366749821231,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 16.2111599445343
+    },
+    {
+      "case": "p8192_b1",
+      "repeat": 1,
+      "seconds": 17.03866433800431,
+      "throughput": 1.8780814836891182,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            1477,
+            279,
+            4734,
+            2615,
+            2038,
+            12601,
+            311,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            13,
+            576,
+            2038,
+            13657,
+            3055,
+            304,
+            279,
+            5383,
+            330
+          ],
+          "text": "752228We need to find the exact access code assigned to record_8192_0_vault. The code occurs once in the pattern \"",
+          "ttft": 16.248852491378784,
+          "prefill": 16.245747109001968,
+          "decode": 0.7899627540027723,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 16.248852491378784
+    },
+    {
+      "case": "p8192_b1",
+      "repeat": 2,
+      "seconds": 17.04716625198489,
+      "throughput": 1.8771448302308937,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            279,
+            1196,
+            594,
+            1681,
+            13,
+            14646,
+            4715,
+            13,
+            2657,
+            2727,
+            330,
+            1900,
+            220,
+            23,
+            98729,
+            17,
+            14,
+            15,
+            13,
+            4457,
+            279,
+            18104,
+            323,
+            24449
+          ],
+          "text": "752228We need to answer the user's request. Need parse. User says \"Request 8192/0. Read the archive and locate",
+          "ttft": 16.257834672927856,
+          "prefill": 16.25431797199417,
+          "decode": 0.7895893180393614,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 16.257834672927856
+    }
+  ],
+  "eval": [],
+  "load_seconds": 280.10360753000714,
+  "exllamav3_version": "1.4.8",
+  "profile": {
+    "seconds": 16.23921160097234,
+    "rows": [
+      {
+        "prompt_tokens": 8192,
+        "new_tokens": 1,
+        "token_ids": [
+          100899
+        ],
+        "text": "75",
+        "ttft": 16.231309413909912,
+        "prefill": 16.228576975001488,
+        "decode": 0.0,
+        "cached_tokens": 0,
+        "finish_reason": "length"
+      }
+    ]
+  }
+}

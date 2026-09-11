@@ -184,6 +184,8 @@ datas = "datas"
 ser = "ser"
 ure = "ure"
 VALU = "VALU"
+# EXL3 Hadamard input scale vector
+suh = "suh"
 # Walsh-Hadamard Transform
 wht = "wht"
 WHT = "WHT"

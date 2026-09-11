@@ -1,0 +1,527 @@
+{
+  "answer_check_scope": "before_first_stop_token",
+  "args": {
+    "backend": "vllm",
+    "inputs": "/tmp/exl3-prefill-analysis-20260910/nvfp4-inputs.json.gz",
+    "output": "/tmp/exl3-prefill-analysis-20260910/nvfp4-c8192.json",
+    "pp": 4,
+    "expected_layer_counts": null,
+    "exl_memory": [
+      31,
+      40,
+      40,
+      48
+    ],
+    "max_model_len": 16384,
+    "kv_cache_gib": 4.0,
+    "exl_cache_tokens": 16384,
+    "warmups": 1,
+    "chunk_size": 8192,
+    "batch_size": 4,
+    "repeats": 3,
+    "tokens": 32,
+    "eval_tokens": 768,
+    "skip_perf": false,
+    "skip_eval": true,
+    "eager": false,
+    "profile_dir": "/tmp/exl3-prefill-analysis-20260910/nvfp4-c8192-profile",
+    "profile_tokens": 1
+  },
+  "inputs_sha256": "9d1ca6e6e4afe18bd2029b38a74c5c90351f5802e51a9fee541a599c58983191",
+  "model": "/media/bul/ext1/dev/models/zai/LibertAIDAI/GLM-5.3-Flash-NVFP4",
+  "benchmark_source_sha256": "5a158e15cab9d1314b2e270d0e8f460dbd3fe3f2cedfd28c907e6d11c60dd334",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "gpu_names": [
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "EXL3_INT8_GEMV": "0",
+    "OMP_NUM_THREADS": "1",
+    "VLLM_PP_LAYER_PARTITION": "11,11,11,12",
+    "NCCL_P2P_DISABLE": "1"
+  },
+  "revision": "5fc5fa7c8cfd67640f83ff98215ae6e797b20426",
+  "perf": [
+    {
+      "case": "p8192_b1",
+      "repeat": 0,
+      "seconds": 3.8272376710083336,
+      "throughput": 8.36112171512181,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            4226,
+            1196,
+            17045,
+            13,
+            14646,
+            4715,
+            13,
+            2379,
+            3897,
+            18104,
+            448,
+            1657,
+            3589,
+            11,
+            1681,
+            220,
+            23,
+            98729,
+            17,
+            14,
+            15,
+            13,
+            14646,
+            24449,
+            4734,
+            2615
+          ],
+          "text": "752228We need answer user asks. Need parse. They provided archive with many items, request 8192/0. Need locate exact access",
+          "ttft": 3.231266736984253,
+          "prefill": 3.227756801992655,
+          "decode": 0.595985738968011,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.231266736984253
+    },
+    {
+      "case": "p8192_b1",
+      "repeat": 1,
+      "seconds": 3.8288290179916658,
+      "throughput": 8.357646645914983,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            4226,
+            1196,
+            17045,
+            25,
+            1205,
+            1184,
+            4226,
+            1196,
+            17045,
+            25,
+            1205,
+            1184,
+            4226,
+            3681,
+            30,
+            14646,
+            4715,
+            13,
+            2657,
+            2727,
+            330,
+            1654,
+            1184,
+            4226,
+            1196,
+            17045
+          ],
+          "text": "752228We need answer user asks: We need answer user asks: We need answer previous? Need parse. User says \"We need answer user asks",
+          "ttft": 3.2322633266448975,
+          "prefill": 3.229612251976505,
+          "decode": 0.5963268810301088,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.2322633266448975
+    },
+    {
+      "case": "p8192_b1",
+      "repeat": 2,
+      "seconds": 3.8277311230194755,
+      "throughput": 8.360043840999221,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            4226,
+            1196,
+            17045,
+            13,
+            14646,
+            4715,
+            13,
+            2379,
+            3897,
+            18104,
+            448,
+            1657,
+            3589,
+            11,
+            1681,
+            220,
+            23,
+            98729,
+            17,
+            14,
+            15,
+            13,
+            14646,
+            24449,
+            4734,
+            2615
+          ],
+          "text": "752228We need answer user asks. Need parse. They provided archive with many items, request 8192/0. Need locate exact access",
+          "ttft": 3.231801748275757,
+          "prefill": 3.228762899991125,
+          "decode": 0.5961348720011301,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.231801748275757
+    }
+  ],
+  "eval": [],
+  "load_seconds": 325.78520646796096,
+  "exllamav3_version": "1.4.8",
+  "profile": {
+    "seconds": 3.237266101001296,
+    "rows": [
+      {
+        "prompt_tokens": 8192,
+        "new_tokens": 1,
+        "token_ids": [
+          100899
+        ],
+        "text": "75",
+        "ttft": 3.229625940322876,
+        "prefill": 3.227213508973364,
+        "decode": 0.0,
+        "cached_tokens": 0,
+        "finish_reason": "length"
+      }
+    ]
+  },
+  "event_profile_install": [
+    {
+      "gpu": "NVIDIA CMP 170HX",
+      "quant_methods": {
+        "UnquantizedEmbeddingMethod": 1,
+        "UnquantizedLinearMethod": 105,
+        "ModelOptNvFp4FusedMoE": 8
+      }
+    },
+    {
+      "gpu": "NVIDIA CMP 170HX",
+      "quant_methods": {
+        "UnquantizedLinearMethod": 107,
+        "ModelOptNvFp4FusedMoE": 11
+      }
+    },
+    {
+      "gpu": "NVIDIA CMP 170HX",
+      "quant_methods": {
+        "UnquantizedLinearMethod": 107,
+        "ModelOptNvFp4FusedMoE": 11
+      }
+    },
+    {
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "quant_methods": {
+        "UnquantizedLinearMethod": 118,
+        "ModelOptNvFp4FusedMoE": 12
+      }
+    }
+  ],
+  "event_profile": {
+    "seconds": 3.2660069139674306,
+    "rows": [
+      {
+        "prompt_tokens": 8192,
+        "new_tokens": 1,
+        "token_ids": [
+          100899
+        ],
+        "text": "75",
+        "ttft": 3.2584519386291504,
+        "prefill": 3.255667478952091,
+        "decode": 0.0,
+        "cached_tokens": 0,
+        "finish_reason": "length"
+      }
+    ],
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "timer": "CUDA events on current stream, including wrapper launch gaps",
+        "nested_labels_are_not_additive": true,
+        "timings_ms": {
+          "moe_runner_inclusive": [
+            40.47052764892578,
+            42.6956787109375,
+            41.69830322265625,
+            41.10950469970703,
+            40.372222900390625,
+            40.68659210205078,
+            41.9502067565918,
+            41.7341423034668
+          ],
+          "routed_experts_inclusive": [
+            37.87776184082031,
+            39.86636734008789,
+            38.89254379272461,
+            38.38054275512695,
+            37.786624908447266,
+            37.96684646606445,
+            39.16185760498047,
+            38.94374465942383
+          ],
+          "marlin_gemm": [
+            23.30112075805664,
+            13.632512092590332,
+            24.938495635986328,
+            13.966336250305176,
+            24.388608932495117,
+            13.551615715026855,
+            23.89299201965332,
+            13.536255836486816,
+            23.49260711669922,
+            13.351936340332031,
+            23.664640426635742,
+            13.353983879089355,
+            24.50534439086914,
+            13.700096130371094,
+            24.413183212280273,
+            13.576191902160645
+          ]
+        },
+        "routing": []
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "timer": "CUDA events on current stream, including wrapper launch gaps",
+        "nested_labels_are_not_additive": true,
+        "timings_ms": {
+          "moe_runner_inclusive": [
+            40.16640090942383,
+            42.54719924926758,
+            42.501121520996094,
+            41.23955154418945,
+            40.56166458129883,
+            41.816062927246094,
+            41.93689727783203,
+            41.94303894042969,
+            40.806400299072266,
+            41.443328857421875,
+            42.14476776123047
+          ],
+          "routed_experts_inclusive": [
+            37.607425689697266,
+            39.73427200317383,
+            39.68819046020508,
+            38.48499298095703,
+            37.975040435791016,
+            39.03180694580078,
+            39.151615142822266,
+            39.13011169433594,
+            38.18291091918945,
+            38.69184112548828,
+            39.35948944091797
+          ],
+          "marlin_gemm": [
+            23.10860824584961,
+            13.551615715026855,
+            24.89651107788086,
+            13.86905574798584,
+            24.89139175415039,
+            13.829119682312012,
+            24.04863929748535,
+            13.479935646057129,
+            23.517183303833008,
+            13.503487586975098,
+            24.426496505737305,
+            13.641728401184082,
+            24.52889633178711,
+            13.65401554107666,
+            24.51456069946289,
+            13.645824432373047,
+            23.573503494262695,
+            13.649920463562012,
+            24.253440856933594,
+            13.47379207611084,
+            24.611839294433594,
+            13.77996826171875
+          ]
+        },
+        "routing": []
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "timer": "CUDA events on current stream, including wrapper launch gaps",
+        "nested_labels_are_not_additive": true,
+        "timings_ms": {
+          "moe_runner_inclusive": [
+            40.28416061401367,
+            40.09574508666992,
+            41.38905715942383,
+            41.73721694946289,
+            41.61433410644531,
+            40.10291290283203,
+            41.27334213256836,
+            41.86316680908203,
+            41.25900650024414,
+            40.399871826171875,
+            42.473472595214844
+          ],
+          "routed_experts_inclusive": [
+            37.73235321044922,
+            37.49375915527344,
+            38.65190505981445,
+            38.968318939208984,
+            38.8485107421875,
+            37.49068832397461,
+            38.50649642944336,
+            39.0748176574707,
+            38.4901123046875,
+            37.797889709472656,
+            39.64518356323242
+          ],
+          "marlin_gemm": [
+            23.29497528076172,
+            13.495295524597168,
+            23.235584259033203,
+            13.305855751037598,
+            24.135679244995117,
+            13.559807777404785,
+            24.419328689575195,
+            13.587455749511719,
+            24.2923526763916,
+            13.601792335510254,
+            23.234560012817383,
+            13.301759719848633,
+            24.12236785888672,
+            13.423616409301758,
+            24.46233558654785,
+            13.65401554107666,
+            24.11827278137207,
+            13.413375854492188,
+            23.398399353027344,
+            13.447168350219727,
+            24.854528427124023,
+            13.826047897338867
+          ]
+        },
+        "routing": []
+      },
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "timer": "CUDA events on current stream, including wrapper launch gaps",
+        "nested_labels_are_not_additive": true,
+        "timings_ms": {
+          "moe_runner_inclusive": [
+            12.556703567504883,
+            12.48089599609375,
+            12.653023719787598,
+            12.767583847045898,
+            12.98851203918457,
+            13.159423828125,
+            13.121888160705566,
+            13.100383758544922,
+            13.212096214294434,
+            13.242879867553711,
+            13.318528175354004,
+            13.239007949829102
+          ],
+          "routed_experts_inclusive": [
+            11.387871742248535,
+            11.308128356933594,
+            11.480128288269043,
+            11.594783782958984,
+            11.767935752868652,
+            11.930624008178711,
+            11.896415710449219,
+            11.861984252929688,
+            11.9716157913208,
+            11.998368263244629,
+            12.081119537353516,
+            11.988991737365723
+          ],
+          "marlin_gemm": [
+            6.882431983947754,
+            3.649631977081299,
+            6.831039905548096,
+            3.6249279975891113,
+            6.933504104614258,
+            3.6836800575256348,
+            7.011295795440674,
+            3.7265279293060303,
+            7.157760143280029,
+            3.751904010772705,
+            7.271488189697266,
+            3.802527904510498,
+            7.21619176864624,
+            3.8093440532684326,
+            7.223296165466309,
+            3.776384115219116,
+            7.287903785705566,
+            3.8112640380859375,
+            7.314367771148682,
+            3.821536064147949,
+            7.351615905761719,
+            3.862528085708618,
+            7.324672222137451,
+            3.8246400356292725
+          ]
+        },
+        "routing": []
+      }
+    ]
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "routing": "/tmp/exl3-opt-20260910/routes/layer-44.pt",
+  "scope": "full GPU wrapper; CUDA graph events",
+  "selection": "Optimistic cache: union of top H experts from both measured chunks is decoded before timing; calibration uses measured input",
+  "rows": [
+    {
+      "hot_experts": 0,
+      "cached_experts": [],
+      "cache_bytes": 0,
+      "relative_l2": 5.909766514378134e-06,
+      "median_ms": 13.934176445007324,
+      "min_ms": 13.843135833740234,
+      "max_ms": 14.155424118041992
+    },
+    {
+      "hot_experts": 2,
+      "cached_experts": [
+        100,
+        163,
+        192
+      ],
+      "cache_bytes": 151105536,
+      "relative_l2": 0.00017765974916983396,
+      "median_ms": 14.423711776733398,
+      "min_ms": 14.008895874023438,
+      "max_ms": 14.573216438293457
+    },
+    {
+      "hot_experts": 4,
+      "cached_experts": [
+        25,
+        63,
+        100,
+        163,
+        192
+      ],
+      "cache_bytes": 251842560,
+      "relative_l2": 0.00021438352996483445,
+      "median_ms": 15.006336212158203,
+      "min_ms": 14.918208122253418,
+      "max_ms": 15.098591804504395
+    },
+    {
+      "hot_experts": 8,
+      "cached_experts": [
+        25,
+        63,
+        100,
+        128,
+        163,
+        192,
+        199,
+        210,
+        259
+      ],
+      "cache_bytes": 453316608,
+      "relative_l2": 0.0004527878190856427,
+      "median_ms": 16.452735900878906,
+      "min_ms": 16.329248428344727,
+      "max_ms": 16.49849510192871
+    }
+  ]
+}

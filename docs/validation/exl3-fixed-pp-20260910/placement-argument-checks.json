@@ -1,0 +1,21 @@
+[
+  {
+    "counts": [
+      "11",
+      "11",
+      "11"
+    ],
+    "exit_code": 2,
+    "error": "benchmark_exl3.py: error: --expected-layer-counts requires one positive count per rank"
+  },
+  {
+    "counts": [
+      "11",
+      "11",
+      "11",
+      "0"
+    ],
+    "exit_code": 2,
+    "error": "benchmark_exl3.py: error: --expected-layer-counts requires one positive count per rank"
+  }
+]

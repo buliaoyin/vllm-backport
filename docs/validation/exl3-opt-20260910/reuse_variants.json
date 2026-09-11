@@ -1,0 +1,32 @@
+[
+  {
+    "name": "priority-reference",
+    "capacity": 1024,
+    "longest_first": true
+  },
+  {
+    "name": "reuse-buffers",
+    "capacity": 1024,
+    "longest_first": true,
+    "reuse_buffers": true
+  },
+  {
+    "name": "priority-split2-blackwell",
+    "capacity": 1024,
+    "longest_first": true,
+    "splits": 2,
+    "split_threshold": 128,
+    "blackwell_only": true
+  },
+  {
+    "name": "priority-groups8",
+    "capacity": 1024,
+    "longest_first": true,
+    "groups": 8
+  },
+  {
+    "name": "priority-reference-repeat",
+    "capacity": 1024,
+    "longest_first": true
+  }
+]

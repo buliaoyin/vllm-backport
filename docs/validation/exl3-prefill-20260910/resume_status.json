@@ -1,0 +1,40 @@
+{
+  "reason": "Remaining 8192-chunk comparisons, followed by EXL3 512 event probe. Initial AWQ clean timings succeeded; profiling RPC needed explicit local pickle support.",
+  "runs": [
+    {
+      "name": "exl3-c8192",
+      "command": [
+        "/home/bul/dev/vllm-backport/.venv/bin/python",
+        "/home/bul/dev/vllm-backport/benchmarks/benchmark_exl3.py",
+        "--backend",
+        "vllm",
+        "--pp",
+        "4",
+        "--inputs",
+        "/tmp/exl3-prefill-analysis-20260910/exl3-inputs.json.gz",
+        "--output",
+        "/tmp/exl3-prefill-analysis-20260910/exl3-c8192.json",
+        "--max-model-len",
+        "16384",
+        "--kv-cache-gib",
+        "4",
+        "--chunk-size",
+        "8192",
+        "--warmups",
+        "1",
+        "--tokens",
+        "32",
+        "--skip-eval",
+        "--profile-dir",
+        "/tmp/exl3-prefill-analysis-20260910/exl3-c8192-profile",
+        "--profile-tokens",
+        "1"
+      ],
+      "source_sha256": "5120dbd94e925dd89e0f8e7e12e93ac34e46705d2a35ec597b64043e81856412",
+      "start_utc": "2026-09-10T10:12:56.062689+00:00",
+      "exit_code": 1,
+      "elapsed_seconds": 378.52782357495744,
+      "end_utc": "2026-09-10T10:19:14.590694+00:00"
+    }
+  ]
+}

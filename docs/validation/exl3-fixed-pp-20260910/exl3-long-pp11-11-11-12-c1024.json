@@ -1,0 +1,1268 @@
+{
+  "answer_check_scope": "before_first_stop_token",
+  "args": {
+    "backend": "vllm",
+    "inputs": "/tmp/exl3-fixed-pp-20260910/exl3-long-b1-inputs.json.gz",
+    "output": "/tmp/exl3-fixed-pp-20260910/exl3-long-pp11-11-11-12-c1024.json",
+    "pp": 4,
+    "expected_layer_counts": [
+      11,
+      11,
+      11,
+      12
+    ],
+    "exl_memory": [
+      31,
+      40,
+      40,
+      48
+    ],
+    "max_model_len": 66560,
+    "kv_cache_gib": 8.0,
+    "exl_cache_tokens": 16384,
+    "warmups": 1,
+    "chunk_size": 1024,
+    "batch_size": 4,
+    "repeats": 3,
+    "tokens": 32,
+    "eval_tokens": 768,
+    "skip_perf": false,
+    "skip_eval": true,
+    "eager": false,
+    "profile_dir": null,
+    "event_profile": false,
+    "profile_tokens": 1,
+    "moe_workspace_sizes": null,
+    "moe_variants": null,
+    "capture_routing_dir": null
+  },
+  "inputs_sha256": "b90111cf1d1d832c09b8c22ed4b51b7f616f448f49fec5884173c0948978993a",
+  "model": "/media/bul/ext1/dev/models/zai/turboderp/GLM-5.3-Flash-exl3/4.05bpw",
+  "benchmark_source_sha256": "7ba40ccdb18f882c3d5e3bf2750532b89eb21e45683eb7d4158c39ca8ce350ba",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "gpu_names": [
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "EXL3_INT8_GEMV": "0",
+    "VLLM_EXL3_MOE_MAX_TOKENS": "1024",
+    "VLLM_EXL3_MOE_PRIORITY": "1",
+    "OMP_NUM_THREADS": "1",
+    "VLLM_PP_LAYER_PARTITION": "11,11,11,12",
+    "NCCL_P2P_DISABLE": "1"
+  },
+  "revision": "5fc5fa7c8cfd67640f83ff98215ae6e797b20426",
+  "perf": [
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 0,
+      "seconds": 4.2127053560107015,
+      "throughput": 7.596068866848781,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            1196,
+            594,
+            1537,
+            1681,
+            13,
+            14646,
+            24017,
+            10430,
+            13,
+            2657,
+            3897,
+            18104,
+            323,
+            4588,
+            24449,
+            4734,
+            2615,
+            2038,
+            12601,
+            311,
+            3255,
+            62,
+            23,
+            98729
+          ],
+          "text": "752228We need to answer user's last request. Need inspect conversation. User provided archive and asked locate exact access code assigned to record_819",
+          "ttft": 3.425652027130127,
+          "prefill": 3.4220868549891748,
+          "decode": 0.7869442189694382,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.425652027130127
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 1,
+      "seconds": 4.214633942989167,
+      "throughput": 7.592592958928355,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            13,
+            576,
+            18104,
+            5610,
+            1657,
+            3589,
+            11,
+            323,
+            279,
+            2038,
+            13657
+          ],
+          "text": "752228We need to find the access code for record_8192_0_vault. The archive contains many items, and the code occurs",
+          "ttft": 3.4276676177978516,
+          "prefill": 3.424866781977471,
+          "decode": 0.7867181380279362,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.4276676177978516
+    },
+    {
+      "case": "p8192_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 2,
+      "seconds": 4.219273514987435,
+      "throughput": 7.584244037825856,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            1196,
+            594,
+            1537,
+            1681,
+            13,
+            14646,
+            24017,
+            9929,
+            13,
+            2657,
+            17045,
+            25,
+            330,
+            1900,
+            220,
+            23,
+            98729,
+            17,
+            14,
+            15,
+            13,
+            4457,
+            279,
+            18104
+          ],
+          "text": "752228We need to answer user's last request. Need inspect prompt. User asks: \"Request 8192/0. Read the archive",
+          "ttft": 3.4323084354400635,
+          "prefill": 3.4294417460332625,
+          "decode": 0.7867414989741519,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 3.4323084354400635
+    },
+    {
+      "case": "p16384_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 0,
+      "seconds": 7.001692680991255,
+      "throughput": 4.570323414347521,
+      "rows": [
+        {
+          "prompt_tokens": 16384,
+          "new_tokens": 32,
+          "token_ids": [
+            23,
+            99367,
+            23,
+            102650,
+            154827,
+            1654,
+            1184,
+            311,
+            1477,
+            279,
+            4734,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            114491,
+            104029,
+            62,
+            15,
+            2273,
+            945,
+            13,
+            576,
+            2038,
+            13657,
+            3055,
+            304,
+            279,
+            18104,
+            13,
+            576
+          ],
+          "text": "814872We need to find the exact access code for record_16384_0_vault. The code occurs once in the archive. The",
+          "ttft": 6.208988428115845,
+          "prefill": 6.204403566021938,
+          "decode": 0.7924871699651703,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.208988428115845
+    },
+    {
+      "case": "p16384_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 1,
+      "seconds": 7.011657783004921,
+      "throughput": 4.563827983385416,
+      "rows": [
+        {
+          "prompt_tokens": 16384,
+          "new_tokens": 32,
+          "token_ids": [
+            23,
+            99367,
+            23,
+            102650,
+            154827,
+            785,
+            1196,
+            17045,
+            25,
+            330,
+            785,
+            1196,
+            17045,
+            25,
+            330,
+            785,
+            1196,
+            17045,
+            25,
+            23966,
+            17174,
+            1112,
+            576,
+            1196,
+            17045,
+            25,
+            330,
+            785,
+            1196,
+            17045,
+            25,
+            330
+          ],
+          "text": "814872The user asks: \"The user asks: \"The user asks: nested quotes... The user asks: \"The user asks: \"",
+          "ttft": 6.218782901763916,
+          "prefill": 6.214494902989827,
+          "decode": 0.7927581030526198,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.218782901763916
+    },
+    {
+      "case": "p16384_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 2,
+      "seconds": 7.020511981041636,
+      "throughput": 4.558072130125779,
+      "rows": [
+        {
+          "prompt_tokens": 16384,
+          "new_tokens": 32,
+          "token_ids": [
+            23,
+            99367,
+            23,
+            102650,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            279,
+            1196,
+            594,
+            1681,
+            13,
+            14646,
+            470,
+            1172,
+            4743,
+            48039,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            114491,
+            104029,
+            62,
+            15,
+            2273,
+            945,
+            13,
+            758
+          ],
+          "text": "814872We need to answer the user's request. Need return only six-digit access code for record_16384_0_vault. In",
+          "ttft": 6.227468252182007,
+          "prefill": 6.2231590889859945,
+          "decode": 0.7927085200208239,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.227468252182007
+    },
+    {
+      "case": "p32768_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 0,
+      "seconds": 12.662744998000562,
+      "throughput": 2.527098192773587,
+      "rows": [
+        {
+          "prompt_tokens": 32768,
+          "new_tokens": 32,
+          "token_ids": [
+            24,
+            99695,
+            19,
+            98668,
+            154827,
+            785,
+            1196,
+            6801,
+            752,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            18,
+            99951,
+            101840,
+            62,
+            15,
+            2273,
+            945,
+            304,
+            279,
+            18104,
+            13,
+            21083,
+            518,
+            279,
+            18104
+          ],
+          "text": "980410The user wants me to find the access code for record_32768_0_vault in the archive. Looking at the archive",
+          "ttft": 11.867554903030396,
+          "prefill": 11.86048665404087,
+          "decode": 0.7947881610016339,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true
+        }
+      ],
+      "max_ttft": 11.867554903030396
+    },
+    {
+      "case": "p32768_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 1,
+      "seconds": 12.68382873403607,
+      "throughput": 2.5228975154899786,
+      "rows": [
+        {
+          "prompt_tokens": 32768,
+          "new_tokens": 32,
+          "token_ids": [
+            24,
+            99695,
+            19,
+            98668,
+            154827,
+            785,
+            1196,
+            6801,
+            752,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            18,
+            99951,
+            101840,
+            62,
+            15,
+            2273,
+            945,
+            304,
+            279,
+            18104,
+            13,
+            21083,
+            518,
+            279,
+            18104
+          ],
+          "text": "980410The user wants me to find the access code for record_32768_0_vault in the archive. Looking at the archive",
+          "ttft": 11.88680362701416,
+          "prefill": 11.879935896024108,
+          "decode": 0.7968169450177811,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true
+        }
+      ],
+      "max_ttft": 11.88680362701416
+    },
+    {
+      "case": "p32768_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 2,
+      "seconds": 12.738270625006407,
+      "throughput": 2.5121149441731148,
+      "rows": [
+        {
+          "prompt_tokens": 32768,
+          "new_tokens": 32,
+          "token_ids": [
+            24,
+            99695,
+            19,
+            98668,
+            154827,
+            785,
+            1196,
+            6801,
+            752,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            18,
+            99951,
+            101840,
+            62,
+            15,
+            2273,
+            945,
+            304,
+            279,
+            18104,
+            13,
+            21083,
+            518,
+            279,
+            18104
+          ],
+          "text": "980410The user wants me to find the access code for record_32768_0_vault in the archive. Looking at the archive",
+          "ttft": 11.941174745559692,
+          "prefill": 11.93415826902492,
+          "decode": 0.7969876209972426,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true
+        }
+      ],
+      "max_ttft": 11.941174745559692
+    },
+    {
+      "case": "p65536_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 0,
+      "seconds": 24.20732779899845,
+      "throughput": 1.3219137719663532,
+      "rows": [
+        {
+          "prompt_tokens": 65536,
+          "new_tokens": 32,
+          "token_ids": [
+            22,
+            100702,
+            19,
+            100632,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            1196,
+            594,
+            1681,
+            13,
+            14646,
+            24017,
+            9929,
+            13,
+            2657,
+            17045,
+            330,
+            1900,
+            220,
+            21,
+            101130,
+            100632,
+            14,
+            15,
+            13,
+            4457,
+            279,
+            18104,
+            323
+          ],
+          "text": "733436We need to answer user's request. Need inspect prompt. User asks \"Request 65536/0. Read the archive and",
+          "ttft": 23.403608560562134,
+          "prefill": 23.39137358003063,
+          "decode": 0.8035996590042487,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true
+        }
+      ],
+      "max_ttft": 23.403608560562134
+    },
+    {
+      "case": "p65536_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 1,
+      "seconds": 24.22827291302383,
+      "throughput": 1.3207709899453255,
+      "rows": [
+        {
+          "prompt_tokens": 65536,
+          "new_tokens": 32,
+          "token_ids": [
+            22,
+            100702,
+            19,
+            100632,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            1196,
+            594,
+            3405,
+            13,
+            14646,
+            4715,
+            13,
+            2657,
+            17045,
+            25,
+            330,
+            1900,
+            220,
+            21,
+            101130,
+            100632,
+            14,
+            15,
+            13,
+            4457,
+            279,
+            18104,
+            323
+          ],
+          "text": "733436We need to answer user's question. Need parse. User asks: \"Request 65536/0. Read the archive and",
+          "ttft": 23.42434811592102,
+          "prefill": 23.41221104504075,
+          "decode": 0.8038911969633773,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true
+        }
+      ],
+      "max_ttft": 23.42434811592102
+    },
+    {
+      "case": "p65536_b1",
+      "workspace_capacity": null,
+      "variant": {
+        "capacity": null
+      },
+      "repeat": 2,
+      "seconds": 24.296237498056144,
+      "throughput": 1.3170763581217135,
+      "rows": [
+        {
+          "prompt_tokens": 65536,
+          "new_tokens": 32,
+          "token_ids": [
+            22,
+            100702,
+            19,
+            100632,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            279,
+            1196,
+            594,
+            1681,
+            13,
+            576,
+            1196,
+            17045,
+            25,
+            330,
+            1900,
+            220,
+            21,
+            101130,
+            100632,
+            14,
+            15,
+            13,
+            4457,
+            279,
+            18104,
+            323,
+            24449
+          ],
+          "text": "733436We need to answer the user's request. The user asks: \"Request 65536/0. Read the archive and locate",
+          "ttft": 23.490318059921265,
+          "prefill": 23.479463767958805,
+          "decode": 0.806032809021417,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true
+        }
+      ],
+      "max_ttft": 23.490318059921265
+    }
+  ],
+  "eval": [],
+  "load_seconds": 102.21023954096017,
+  "exllamav3_version": "1.4.8",
+  "runtime_before": [
+    {
+      "gpu": "NVIDIA CMP 170HX",
+      "pp_rank": 0,
+      "decoder_layers": [
+        {
+          "name": "language_model.model.layers.0",
+          "index": 0,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.1",
+          "index": 1,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.2",
+          "index": 2,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.3",
+          "index": 3,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.4",
+          "index": 4,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.5",
+          "index": 5,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.6",
+          "index": 6,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.7",
+          "index": 7,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.8",
+          "index": 8,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.9",
+          "index": 9,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.10",
+          "index": 10,
+          "type": "Glm5NextDecoderLayer"
+        }
+      ],
+      "priority": true,
+      "workspace_bytes": 201326592,
+      "layers": [
+        {
+          "prefix": "language_model.model.layers.3.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.4.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.5.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.6.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.7.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.8.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.9.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.10.mlp.experts",
+          "capacity": 1024
+        }
+      ]
+    },
+    {
+      "gpu": "NVIDIA CMP 170HX",
+      "pp_rank": 1,
+      "decoder_layers": [
+        {
+          "name": "language_model.model.layers.11",
+          "index": 11,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.12",
+          "index": 12,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.13",
+          "index": 13,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.14",
+          "index": 14,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.15",
+          "index": 15,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.16",
+          "index": 16,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.17",
+          "index": 17,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.18",
+          "index": 18,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.19",
+          "index": 19,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.20",
+          "index": 20,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.21",
+          "index": 21,
+          "type": "Glm5NextDecoderLayer"
+        }
+      ],
+      "priority": true,
+      "workspace_bytes": 201326592,
+      "layers": [
+        {
+          "prefix": "language_model.model.layers.11.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.12.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.13.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.14.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.15.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.16.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.17.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.18.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.19.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.20.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.21.mlp.experts",
+          "capacity": 1024
+        }
+      ]
+    },
+    {
+      "gpu": "NVIDIA CMP 170HX",
+      "pp_rank": 2,
+      "decoder_layers": [
+        {
+          "name": "language_model.model.layers.22",
+          "index": 22,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.23",
+          "index": 23,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.24",
+          "index": 24,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.25",
+          "index": 25,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.26",
+          "index": 26,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.27",
+          "index": 27,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.28",
+          "index": 28,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.29",
+          "index": 29,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.30",
+          "index": 30,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.31",
+          "index": 31,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.32",
+          "index": 32,
+          "type": "Glm5NextDecoderLayer"
+        }
+      ],
+      "priority": true,
+      "workspace_bytes": 201326592,
+      "layers": [
+        {
+          "prefix": "language_model.model.layers.22.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.23.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.24.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.25.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.26.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.27.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.28.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.29.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.30.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.31.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.32.mlp.experts",
+          "capacity": 1024
+        }
+      ]
+    },
+    {
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "pp_rank": 3,
+      "decoder_layers": [
+        {
+          "name": "language_model.model.layers.33",
+          "index": 33,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.34",
+          "index": 34,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.35",
+          "index": 35,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.36",
+          "index": 36,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.37",
+          "index": 37,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.38",
+          "index": 38,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.39",
+          "index": 39,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.40",
+          "index": 40,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.41",
+          "index": 41,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.42",
+          "index": 42,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.43",
+          "index": 43,
+          "type": "Glm5NextDecoderLayer"
+        },
+        {
+          "name": "language_model.model.layers.44",
+          "index": 44,
+          "type": "Glm5NextDecoderLayer"
+        }
+      ],
+      "priority": true,
+      "workspace_bytes": 578813952,
+      "layers": [
+        {
+          "prefix": "language_model.model.layers.33.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.34.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.35.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.36.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.37.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.38.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.39.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.40.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.41.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.42.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.43.mlp.experts",
+          "capacity": 1024
+        },
+        {
+          "prefix": "language_model.model.layers.44.mlp.experts",
+          "capacity": 1024
+        }
+      ]
+    }
+  ]
+}

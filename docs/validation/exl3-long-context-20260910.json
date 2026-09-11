@@ -1,0 +1,3954 @@
+{
+  "protocol": {
+    "started_utc": "2026-09-10T07:30:19.084847+00:00",
+    "base_revision": "5fc5fa7c8cfd67640f83ff98215ae6e797b20426",
+    "original_revision": "6ff3a17ea7f3d0026b273d43239398d57f71b788",
+    "source_sha256": {
+      "benchmarks/benchmark_exl3.py": "28d53d5707277f54ec0d26e73854f510d3ab2363e4bf0d53b68653e3de0a3211",
+      "benchmarks/prepare_exl3_long_inputs.py": "6c9f10c15cc6c11f0be273239cc7a1bd2672c57a2e8b04df06a7bfeedbc5cf45",
+      "vllm/model_executor/layers/quantization/exl3.py": "cb7325d7d2cef4f82e90c88f32e4cef0347ffea9581706d47f773fe5ae3c04f3",
+      "vllm/models/glm5next/nvidia/model.py": "a0e13a7b3c1fb52dea687e14d921124ef3efc3afd9ab228337778a0b0b4dac4a",
+      "vllm/models/glm5next/nvidia/kda.py": "92f7201618c291faf23bf9acdcab3905c69973deda0a1bad31e058313d72d2e2"
+    },
+    "source_snapshots": {
+      "dense_vllm_benchmark": {
+        "file": "benchmark_before_progress.py",
+        "sha256": "28d53d5707277f54ec0d26e73854f510d3ab2363e4bf0d53b68653e3de0a3211"
+      },
+      "remaining_benchmarks": {
+        "file": "benchmark_with_progress.py",
+        "sha256": "ed5c3dc4e36542424af5d6c61eb12b6e7485c245b22d2d21f75d50013337e33d",
+        "difference": "Adds a CPU progress log every 30 seconds in the original engine wrapper; inference code and parameters unchanged."
+      },
+      "input_generator": {
+        "file": "prepare_inputs.py",
+        "sha256": "6c9f10c15cc6c11f0be273239cc7a1bd2672c57a2e8b04df06a7bfeedbc5cf45"
+      },
+      "benchmark_after_scoring_fix": {
+        "file": "benchmark_after_scoring_fix.py",
+        "sha256": "c288040475dd95a9765968b2b8d0b8f229608620f23a61a4e5ff4bf7eba326f1",
+        "difference": "Scores only the response before the first stop token. Applied after all measured runs; GPU execution and measurements unchanged."
+      }
+    },
+    "lengths": [
+      8192,
+      16384,
+      32768,
+      65536
+    ],
+    "batches": [
+      1,
+      4
+    ],
+    "warmups": 1,
+    "repeats": 3,
+    "generated_tokens": 32,
+    "max_model_len": 66560,
+    "chunk_size": 512,
+    "int8_gemv": 0,
+    "prefix_cache": false,
+    "vllm_kv_cache_gib": {
+      "dense": 32,
+      "moe": 8
+    },
+    "exllamav3_cache_tokens": 266240,
+    "needle_fraction": [
+      0.1,
+      0.35,
+      0.65,
+      0.9
+    ],
+    "metric": "Single request: input tokens / start-to-first-token wall time. Batch 4: maximum request TTFT. 32 output tokens also check unique six-digit code retrieval.",
+    "hardware": "index, name, memory.total [MiB], compute_cap\n0, NVIDIA CMP 170HX, 65344 MiB, 8.0\n1, NVIDIA CMP 170HX, 65344 MiB, 8.0\n2, NVIDIA CMP 170HX, 65344 MiB, 8.0\n3, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 12.0\n",
+    "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tNODE\tNODE\tNODE\t0-63\t0\t\tN/A\nGPU1\tNODE\t X \tNODE\tNODE\t0-63\t0\t\tN/A\nGPU2\tNODE\tNODE\t X \tNODE\t0-63\t0\t\tN/A\nGPU3\tNODE\tNODE\tNODE\t X \t0-63\t0\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n",
+    "input_integrity": {
+      "dense": {
+        "sha256": "baad7e8bd6ab3e947c9d80d9f44b572b378a2fbd0d18c3953a14297a19695900",
+        "cases": [
+          {
+            "name": "p8192_b1",
+            "expected_strings": [
+              "752228"
+            ],
+            "needle_offsets": [
+              819
+            ],
+            "target_keys": [
+              "record_8192_0_vault"
+            ]
+          },
+          {
+            "name": "p8192_b4",
+            "expected_strings": [
+              "752228",
+              "567955",
+              "714477",
+              "207701"
+            ],
+            "needle_offsets": [
+              819,
+              2867,
+              5324,
+              7372
+            ],
+            "target_keys": [
+              "record_8192_0_vault",
+              "record_8192_1_vault",
+              "record_8192_2_vault",
+              "record_8192_3_vault"
+            ]
+          },
+          {
+            "name": "p16384_b1",
+            "expected_strings": [
+              "814872"
+            ],
+            "needle_offsets": [
+              1638
+            ],
+            "target_keys": [
+              "record_16384_0_vault"
+            ]
+          },
+          {
+            "name": "p16384_b4",
+            "expected_strings": [
+              "814872",
+              "655835",
+              "669901",
+              "804915"
+            ],
+            "needle_offsets": [
+              1638,
+              5734,
+              10649,
+              14745
+            ],
+            "target_keys": [
+              "record_16384_0_vault",
+              "record_16384_1_vault",
+              "record_16384_2_vault",
+              "record_16384_3_vault"
+            ]
+          },
+          {
+            "name": "p32768_b1",
+            "expected_strings": [
+              "980410"
+            ],
+            "needle_offsets": [
+              3276
+            ],
+            "target_keys": [
+              "record_32768_0_vault"
+            ]
+          },
+          {
+            "name": "p32768_b4",
+            "expected_strings": [
+              "980410",
+              "720190",
+              "979592",
+              "750729"
+            ],
+            "needle_offsets": [
+              3276,
+              11468,
+              21299,
+              29491
+            ],
+            "target_keys": [
+              "record_32768_0_vault",
+              "record_32768_1_vault",
+              "record_32768_2_vault",
+              "record_32768_3_vault"
+            ]
+          },
+          {
+            "name": "p65536_b1",
+            "expected_strings": [
+              "733436"
+            ],
+            "needle_offsets": [
+              6553
+            ],
+            "target_keys": [
+              "record_65536_0_vault"
+            ]
+          },
+          {
+            "name": "p65536_b4",
+            "expected_strings": [
+              "733436",
+              "784692",
+              "944745",
+              "542425"
+            ],
+            "needle_offsets": [
+              6553,
+              22937,
+              42598,
+              58982
+            ],
+            "target_keys": [
+              "record_65536_0_vault",
+              "record_65536_1_vault",
+              "record_65536_2_vault",
+              "record_65536_3_vault"
+            ]
+          }
+        ]
+      },
+      "moe": {
+        "sha256": "3fcadda875bcccd1dc82c8549b3ec7f20c3f054d42de4d2fa7d02e1b2f9b8837",
+        "cases": [
+          {
+            "name": "p8192_b1",
+            "expected_strings": [
+              "752228"
+            ],
+            "needle_offsets": [
+              819
+            ],
+            "target_keys": [
+              "record_8192_0_vault"
+            ]
+          },
+          {
+            "name": "p8192_b4",
+            "expected_strings": [
+              "752228",
+              "567955",
+              "714477",
+              "207701"
+            ],
+            "needle_offsets": [
+              819,
+              2867,
+              5324,
+              7372
+            ],
+            "target_keys": [
+              "record_8192_0_vault",
+              "record_8192_1_vault",
+              "record_8192_2_vault",
+              "record_8192_3_vault"
+            ]
+          },
+          {
+            "name": "p16384_b1",
+            "expected_strings": [
+              "814872"
+            ],
+            "needle_offsets": [
+              1638
+            ],
+            "target_keys": [
+              "record_16384_0_vault"
+            ]
+          },
+          {
+            "name": "p16384_b4",
+            "expected_strings": [
+              "814872",
+              "655835",
+              "669901",
+              "804915"
+            ],
+            "needle_offsets": [
+              1638,
+              5734,
+              10649,
+              14745
+            ],
+            "target_keys": [
+              "record_16384_0_vault",
+              "record_16384_1_vault",
+              "record_16384_2_vault",
+              "record_16384_3_vault"
+            ]
+          },
+          {
+            "name": "p32768_b1",
+            "expected_strings": [
+              "980410"
+            ],
+            "needle_offsets": [
+              3276
+            ],
+            "target_keys": [
+              "record_32768_0_vault"
+            ]
+          },
+          {
+            "name": "p32768_b4",
+            "expected_strings": [
+              "980410",
+              "720190",
+              "979592",
+              "750729"
+            ],
+            "needle_offsets": [
+              3276,
+              11468,
+              21299,
+              29491
+            ],
+            "target_keys": [
+              "record_32768_0_vault",
+              "record_32768_1_vault",
+              "record_32768_2_vault",
+              "record_32768_3_vault"
+            ]
+          },
+          {
+            "name": "p65536_b1",
+            "expected_strings": [
+              "733436"
+            ],
+            "needle_offsets": [
+              6553
+            ],
+            "target_keys": [
+              "record_65536_0_vault"
+            ]
+          },
+          {
+            "name": "p65536_b4",
+            "expected_strings": [
+              "733436",
+              "784692",
+              "944745",
+              "542425"
+            ],
+            "needle_offsets": [
+              6553,
+              22937,
+              42598,
+              58982
+            ],
+            "target_keys": [
+              "record_65536_0_vault",
+              "record_65536_1_vault",
+              "record_65536_2_vault",
+              "record_65536_3_vault"
+            ]
+          }
+        ]
+      }
+    },
+    "warmup_generated_tokens": 16,
+    "actual_vllm_cache_capacity_tokens": {
+      "dense": 505250,
+      "moe": 1881832
+    },
+    "answer_scoring": {
+      "scope": "tokens before the first configured stop token",
+      "raw_checks_preserved": true,
+      "reason": "When fixed-length generation continues past a stop token, hidden special markers can concatenate the answer with a later turn and cause a false word-boundary mismatch. All runs are rescored consistently from token IDs."
+    },
+    "completed_utc": "2026-09-10T09:28:37.299606+00:00",
+    "scoring_tokenizers_version": "0.23.1",
+    "tokenizer_sha256": {
+      "dense": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+      "moe": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d"
+    },
+    "final_source_sha256": {
+      "vllm/model_executor/layers/quantization/exl3.py": "cb7325d7d2cef4f82e90c88f32e4cef0347ffea9581706d47f773fe5ae3c04f3",
+      "vllm/model_executor/layers/quantization/__init__.py": "6e989be892f799458fb38b61a425f4cd329e82f67cf574b6a66138a8b5d072a8",
+      "vllm/model_executor/layers/fused_moe/fused_moe_method_base.py": "7fa540f02bc2ffabb290facef1c0f8af8c586ebb16bc9a66a4afab0db75c80c0",
+      "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": "4f02cec37781da1cb30e70ce742b2dc8a52f9fe5723d43f4388a05438539d09d",
+      "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": "232ba6d28828bf8fb51f452a54d95c0209e2a6000356ddb661f7e3ac718009f1",
+      "vllm/model_executor/model_loader/default_loader.py": "27da62c9291868b4abebcd3ac3e9a30aba3e8db8fc6a46fac8da87e4c37bd07b",
+      "vllm/models/glm5next/nvidia/kda.py": "92f7201618c291faf23bf9acdcab3905c69973deda0a1bad31e058313d72d2e2",
+      "vllm/models/glm5next/nvidia/model.py": "a0e13a7b3c1fb52dea687e14d921124ef3efc3afd9ab228337778a0b0b4dac4a",
+      "benchmarks/benchmark_exl3.py": "c288040475dd95a9765968b2b8d0b8f229608620f23a61a4e5ff4bf7eba326f1",
+      "benchmarks/prepare_exl3_long_inputs.py": "6c9f10c15cc6c11f0be273239cc7a1bd2672c57a2e8b04df06a7bfeedbc5cf45"
+    }
+  },
+  "runs": {
+    "dense-vllm": {
+      "load_seconds": 82.13074051903095,
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "exllamav3_version": "1.4.8",
+      "args": {
+        "backend": "vllm",
+        "inputs": "/tmp/exl3-long-results/dense-inputs.json.gz",
+        "output": "/tmp/exl3-long-results/dense-vllm.json",
+        "pp": 1,
+        "expected_layer_counts": null,
+        "exl_memory": [
+          31,
+          40,
+          40,
+          48
+        ],
+        "max_model_len": 66560,
+        "kv_cache_gib": 32.0,
+        "exl_cache_tokens": 266240,
+        "warmups": 1,
+        "chunk_size": 512,
+        "batch_size": 4,
+        "repeats": 3,
+        "tokens": 32,
+        "eval_tokens": 768,
+        "skip_perf": false,
+        "skip_eval": true,
+        "eager": false
+      },
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "3",
+        "EXL3_INT8_GEMV": "0",
+        "OMP_NUM_THREADS": "1",
+        "VLLM_PP_LAYER_PARTITION": null,
+        "NCCL_P2P_DISABLE": null
+      },
+      "benchmark_source_sha256": "28d53d5707277f54ec0d26e73854f510d3ab2363e4bf0d53b68653e3de0a3211",
+      "cases": {
+        "p8192_b1": {
+          "length": 8192,
+          "batch": 1,
+          "max_ttft_seconds": [
+            2.2525854110717773,
+            2.2625837326049805,
+            2.265697717666626
+          ],
+          "median_max_ttft_seconds": 2.2625837326049805,
+          "median_batch_input_tokens_per_max_ttft": 3620.6394848283935,
+          "prefill_seconds": [
+            2.249350652040448,
+            2.259422925999388,
+            2.2626963880029507
+          ],
+          "median_prefill_seconds": 2.259422925999388,
+          "median_prefill_input_tps": 3625.704557448674
+        },
+        "p8192_b4": {
+          "length": 8192,
+          "batch": 4,
+          "max_ttft_seconds": [
+            9.310896396636963,
+            9.381752490997314,
+            9.438246965408325
+          ],
+          "median_max_ttft_seconds": 9.381752490997314,
+          "median_batch_input_tokens_per_max_ttft": 3492.73763419404
+        },
+        "p16384_b1": {
+          "length": 16384,
+          "batch": 1,
+          "max_ttft_seconds": [
+            4.795551776885986,
+            4.806004047393799,
+            4.818573713302612
+          ],
+          "median_max_ttft_seconds": 4.806004047393799,
+          "median_batch_input_tokens_per_max_ttft": 3409.0691223792705,
+          "prefill_seconds": [
+            4.791033788002096,
+            4.801872301963158,
+            4.814793472003657
+          ],
+          "median_prefill_seconds": 4.801872301963158,
+          "median_prefill_input_tps": 3412.0024377369846
+        },
+        "p16384_b4": {
+          "length": 16384,
+          "batch": 4,
+          "max_ttft_seconds": [
+            19.872997760772705,
+            19.96267819404602,
+            20.016895532608032
+          ],
+          "median_max_ttft_seconds": 19.96267819404602,
+          "median_batch_input_tokens_per_max_ttft": 3282.926236798551
+        },
+        "p32768_b1": {
+          "length": 32768,
+          "batch": 1,
+          "max_ttft_seconds": [
+            10.329689025878906,
+            10.327289581298828,
+            10.31965708732605
+          ],
+          "median_max_ttft_seconds": 10.327289581298828,
+          "median_batch_input_tokens_per_max_ttft": 3172.9525682457797,
+          "prefill_seconds": [
+            10.32260568602942,
+            10.320736177032813,
+            10.312787438044325
+          ],
+          "median_prefill_seconds": 10.320736177032813,
+          "median_prefill_input_tps": 3174.967312207831
+        },
+        "p32768_b4": {
+          "length": 32768,
+          "batch": 4,
+          "max_ttft_seconds": [
+            42.227827310562134,
+            42.22278118133545,
+            42.22701811790466
+          ],
+          "median_max_ttft_seconds": 42.22701811790466,
+          "median_batch_input_tokens_per_max_ttft": 3103.9842698346774
+        },
+        "p65536_b1": {
+          "length": 65536,
+          "batch": 1,
+          "max_ttft_seconds": [
+            22.826802730560303,
+            22.822084665298462,
+            22.81661629676819
+          ],
+          "median_max_ttft_seconds": 22.822084665298462,
+          "median_batch_input_tokens_per_max_ttft": 2871.6044551201358,
+          "prefill_seconds": [
+            22.814847969042603,
+            22.81023704697145,
+            22.8051171900006
+          ],
+          "median_prefill_seconds": 22.81023704697145,
+          "median_prefill_input_tps": 2873.09596410798
+        },
+        "p65536_b4": {
+          "length": 65536,
+          "batch": 4,
+          "max_ttft_seconds": [
+            93.36733531951904,
+            93.35682988166809,
+            93.36948895454407
+          ],
+          "median_max_ttft_seconds": 93.36733531951904,
+          "median_batch_input_tokens_per_max_ttft": 2807.6628630655277
+        }
+      },
+      "checks_passed": 60,
+      "checks_total": 60,
+      "failed_checks": [],
+      "cross_request_code_leaks": [],
+      "original_full_output_checks_passed": 60,
+      "response_checks": [
+        {
+          "case": "p8192_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        }
+      ],
+      "scoring_policy": "Decode tokens before the first configured stop token, then match the expected whole six-digit code. Raw full-output checks are preserved."
+    },
+    "dense-exllamav3": {
+      "load_seconds": 7.8723275599768385,
+      "torch": "2.8.0+cu128",
+      "cuda": "12.8",
+      "exllamav3_version": "1.4.8",
+      "args": {
+        "backend": "exllamav3",
+        "inputs": "/tmp/exl3-long-results/dense-inputs.json.gz",
+        "output": "/tmp/exl3-long-results/dense-exllamav3.json",
+        "pp": 1,
+        "expected_layer_counts": null,
+        "exl_memory": [
+          31,
+          40,
+          40,
+          48
+        ],
+        "max_model_len": 66560,
+        "kv_cache_gib": 32.0,
+        "exl_cache_tokens": 266240,
+        "warmups": 1,
+        "chunk_size": 512,
+        "batch_size": 4,
+        "repeats": 3,
+        "tokens": 32,
+        "eval_tokens": 768,
+        "skip_perf": false,
+        "skip_eval": true,
+        "eager": false
+      },
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "3",
+        "EXL3_INT8_GEMV": "0",
+        "OMP_NUM_THREADS": "1",
+        "VLLM_PP_LAYER_PARTITION": null,
+        "NCCL_P2P_DISABLE": null
+      },
+      "benchmark_source_sha256": "ed5c3dc4e36542424af5d6c61eb12b6e7485c245b22d2d21f75d50013337e33d",
+      "cases": {
+        "p8192_b1": {
+          "length": 8192,
+          "batch": 1,
+          "max_ttft_seconds": [
+            2.5135178565979004,
+            2.524906873703003,
+            2.53263258934021
+          ],
+          "median_max_ttft_seconds": 2.524906873703003,
+          "median_batch_input_tokens_per_max_ttft": 3244.4760974434257,
+          "prefill_seconds": [
+            2.5113978385925293,
+            2.522841691970825,
+            2.5305588245391846
+          ],
+          "median_prefill_seconds": 2.522841691970825,
+          "median_prefill_input_tps": 3247.1320043868745
+        },
+        "p8192_b4": {
+          "length": 8192,
+          "batch": 4,
+          "max_ttft_seconds": [
+            10.257109642028809,
+            10.335148096084595,
+            10.391978979110718
+          ],
+          "median_max_ttft_seconds": 10.335148096084595,
+          "median_batch_input_tokens_per_max_ttft": 3170.539956985614
+        },
+        "p16384_b1": {
+          "length": 16384,
+          "batch": 1,
+          "max_ttft_seconds": [
+            5.379178524017334,
+            5.3992462158203125,
+            5.408471345901489
+          ],
+          "median_max_ttft_seconds": 5.3992462158203125,
+          "median_batch_input_tokens_per_max_ttft": 3034.4976585793215,
+          "prefill_seconds": [
+            5.376865386962891,
+            5.397087574005127,
+            5.406275510787964
+          ],
+          "median_prefill_seconds": 5.397087574005127,
+          "median_prefill_input_tps": 3035.7113490084785
+        },
+        "p16384_b4": {
+          "length": 16384,
+          "batch": 4,
+          "max_ttft_seconds": [
+            21.750142335891724,
+            21.73421025276184,
+            21.72183322906494
+          ],
+          "median_max_ttft_seconds": 21.73421025276184,
+          "median_batch_input_tokens_per_max_ttft": 3015.3384566468026
+        },
+        "p32768_b1": {
+          "length": 32768,
+          "batch": 1,
+          "max_ttft_seconds": [
+            11.602169275283813,
+            11.60837721824646,
+            11.594720125198364
+          ],
+          "median_max_ttft_seconds": 11.602169275283813,
+          "median_batch_input_tokens_per_max_ttft": 2824.2994238849724,
+          "prefill_seconds": [
+            11.599777698516846,
+            11.606087446212769,
+            11.592355251312256
+          ],
+          "median_prefill_seconds": 11.599777698516846,
+          "median_prefill_input_tps": 2824.881722016943
+        },
+        "p32768_b4": {
+          "length": 32768,
+          "batch": 4,
+          "max_ttft_seconds": [
+            46.300053358078,
+            46.31742238998413,
+            46.30499482154846
+          ],
+          "median_max_ttft_seconds": 46.30499482154846,
+          "median_batch_input_tokens_per_max_ttft": 2830.623359426539
+        },
+        "p65536_b1": {
+          "length": 65536,
+          "batch": 1,
+          "max_ttft_seconds": [
+            26.335092306137085,
+            26.325355052947998,
+            26.315101861953735
+          ],
+          "median_max_ttft_seconds": 26.325355052947998,
+          "median_batch_input_tokens_per_max_ttft": 2489.463100048904,
+          "prefill_seconds": [
+            26.332577228546143,
+            26.322933435440063,
+            26.312682151794434
+          ],
+          "median_prefill_seconds": 26.322933435440063,
+          "median_prefill_input_tps": 2489.6921219184924
+        },
+        "p65536_b4": {
+          "length": 65536,
+          "batch": 4,
+          "max_ttft_seconds": [
+            104.41844844818115,
+            104.45369386672974,
+            104.67859053611755
+          ],
+          "median_max_ttft_seconds": 104.45369386672974,
+          "median_batch_input_tokens_per_max_ttft": 2509.6671098531374
+        }
+      },
+      "checks_passed": 60,
+      "checks_total": 60,
+      "failed_checks": [],
+      "cross_request_code_leaks": [],
+      "original_full_output_checks_passed": 60,
+      "response_checks": [
+        {
+          "case": "p8192_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 6,
+          "stop_token": 248046,
+          "original_full_output_matched": true
+        }
+      ],
+      "scoring_policy": "Decode tokens before the first configured stop token, then match the expected whole six-digit code. Raw full-output checks are preserved."
+    },
+    "moe-vllm": {
+      "load_seconds": 120.75799495104002,
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "exllamav3_version": "1.4.8",
+      "args": {
+        "backend": "vllm",
+        "inputs": "/tmp/exl3-long-results/moe-inputs.json.gz",
+        "output": "/tmp/exl3-long-results/moe-vllm.json",
+        "pp": 4,
+        "expected_layer_counts": null,
+        "exl_memory": [
+          31,
+          40,
+          40,
+          48
+        ],
+        "max_model_len": 66560,
+        "kv_cache_gib": 8.0,
+        "exl_cache_tokens": 266240,
+        "warmups": 1,
+        "chunk_size": 512,
+        "batch_size": 4,
+        "repeats": 3,
+        "tokens": 32,
+        "eval_tokens": 768,
+        "skip_perf": false,
+        "skip_eval": true,
+        "eager": false
+      },
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "EXL3_INT8_GEMV": "0",
+        "OMP_NUM_THREADS": "1",
+        "VLLM_PP_LAYER_PARTITION": "11,11,11,12",
+        "NCCL_P2P_DISABLE": "1"
+      },
+      "benchmark_source_sha256": "ed5c3dc4e36542424af5d6c61eb12b6e7485c245b22d2d21f75d50013337e33d",
+      "cases": {
+        "p8192_b1": {
+          "length": 8192,
+          "batch": 1,
+          "max_ttft_seconds": [
+            6.201707601547241,
+            6.217928171157837,
+            6.228003740310669
+          ],
+          "median_max_ttft_seconds": 6.217928171157837,
+          "median_batch_input_tokens_per_max_ttft": 1317.4806421854455,
+          "prefill_seconds": [
+            6.19821864599362,
+            6.215029452985618,
+            6.224867062002886
+          ],
+          "median_prefill_seconds": 6.215029452985618,
+          "median_prefill_input_tps": 1318.0951211847712
+        },
+        "p8192_b4": {
+          "length": 8192,
+          "batch": 4,
+          "max_ttft_seconds": [
+            23.22819447517395,
+            23.267120122909546,
+            23.413602113723755
+          ],
+          "median_max_ttft_seconds": 23.267120122909546,
+          "median_batch_input_tokens_per_max_ttft": 1408.3393143157234
+        },
+        "p16384_b1": {
+          "length": 16384,
+          "batch": 1,
+          "max_ttft_seconds": [
+            11.80470085144043,
+            11.80527400970459,
+            11.79409408569336
+          ],
+          "median_max_ttft_seconds": 11.80470085144043,
+          "median_batch_input_tokens_per_max_ttft": 1387.9216598699998,
+          "prefill_seconds": [
+            11.800887416990008,
+            11.801211810030509,
+            11.790054612967651
+          ],
+          "median_prefill_seconds": 11.800887416990008,
+          "median_prefill_input_tps": 1388.3701641294856
+        },
+        "p16384_b4": {
+          "length": 16384,
+          "batch": 4,
+          "max_ttft_seconds": [
+            45.809499740600586,
+            45.79711031913757,
+            45.85658288002014
+          ],
+          "median_max_ttft_seconds": 45.809499740600586,
+          "median_batch_input_tokens_per_max_ttft": 1430.6202942861648
+        },
+        "p32768_b1": {
+          "length": 32768,
+          "batch": 1,
+          "max_ttft_seconds": [
+            22.941993474960327,
+            22.9607412815094,
+            22.94220757484436
+          ],
+          "median_max_ttft_seconds": 22.94220757484436,
+          "median_batch_input_tokens_per_max_ttft": 1428.2845228865165,
+          "prefill_seconds": [
+            22.934595672995783,
+            22.953851327998564,
+            22.935983714996837
+          ],
+          "median_prefill_seconds": 22.935983714996837,
+          "median_prefill_input_tps": 1428.672099142381
+        },
+        "p32768_b4": {
+          "length": 32768,
+          "batch": 4,
+          "max_ttft_seconds": [
+            90.46389961242676,
+            90.51328825950623,
+            90.48627805709839
+          ],
+          "median_max_ttft_seconds": 90.48627805709839,
+          "median_batch_input_tokens_per_max_ttft": 1448.529023564118
+        },
+        "p65536_b1": {
+          "length": 65536,
+          "batch": 1,
+          "max_ttft_seconds": [
+            44.93610072135925,
+            44.93308472633362,
+            44.911882162094116
+          ],
+          "median_max_ttft_seconds": 44.93308472633362,
+          "median_batch_input_tokens_per_max_ttft": 1458.5243901937536,
+          "prefill_seconds": [
+            44.92587427602848,
+            44.92295387899503,
+            44.903340969001874
+          ],
+          "median_prefill_seconds": 44.92295387899503,
+          "median_prefill_input_tps": 1458.8533108603788
+        },
+        "p65536_b4": {
+          "length": 65536,
+          "batch": 4,
+          "max_ttft_seconds": [
+            178.70920777320862,
+            178.73923754692078,
+            178.76789593696594
+          ],
+          "median_max_ttft_seconds": 178.73923754692078,
+          "median_batch_input_tokens_per_max_ttft": 1466.6281651290174
+        }
+      },
+      "checks_passed": 60,
+      "checks_total": 60,
+      "failed_checks": [],
+      "cross_request_code_leaks": [],
+      "original_full_output_checks_passed": 1,
+      "response_checks": [
+        {
+          "case": "p8192_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 2,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 2,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 2,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": false
+        }
+      ],
+      "scoring_policy": "Decode tokens before the first configured stop token, then match the expected whole six-digit code. Raw full-output checks are preserved."
+    },
+    "moe-exllamav3": {
+      "load_seconds": 39.643480684026144,
+      "torch": "2.8.0+cu128",
+      "cuda": "12.8",
+      "exllamav3_version": "1.4.8",
+      "args": {
+        "backend": "exllamav3",
+        "inputs": "/tmp/exl3-long-results/moe-inputs.json.gz",
+        "output": "/tmp/exl3-long-results/moe-exllamav3.json",
+        "pp": 4,
+        "expected_layer_counts": [
+          11,
+          11,
+          11,
+          12
+        ],
+        "exl_memory": [
+          32.0,
+          41.0,
+          41.0,
+          49.0
+        ],
+        "max_model_len": 66560,
+        "kv_cache_gib": 8.0,
+        "exl_cache_tokens": 266240,
+        "warmups": 1,
+        "chunk_size": 512,
+        "batch_size": 4,
+        "repeats": 3,
+        "tokens": 32,
+        "eval_tokens": 768,
+        "skip_perf": false,
+        "skip_eval": true,
+        "eager": false
+      },
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "EXL3_INT8_GEMV": "0",
+        "OMP_NUM_THREADS": "1",
+        "VLLM_PP_LAYER_PARTITION": null,
+        "NCCL_P2P_DISABLE": null
+      },
+      "benchmark_source_sha256": "ed5c3dc4e36542424af5d6c61eb12b6e7485c245b22d2d21f75d50013337e33d",
+      "cases": {
+        "p8192_b1": {
+          "length": 8192,
+          "batch": 1,
+          "max_ttft_seconds": [
+            10.119694232940674,
+            10.121379137039185,
+            10.136232376098633
+          ],
+          "median_max_ttft_seconds": 10.121379137039185,
+          "median_batch_input_tokens_per_max_ttft": 809.3758655894411,
+          "prefill_seconds": [
+            10.117777585983276,
+            10.119465112686157,
+            10.134325742721558
+          ],
+          "median_prefill_seconds": 10.119465112686157,
+          "median_prefill_input_tps": 809.5289532378731
+        },
+        "p8192_b4": {
+          "length": 8192,
+          "batch": 4,
+          "max_ttft_seconds": [
+            40.80820608139038,
+            40.818294525146484,
+            40.83998894691467
+          ],
+          "median_max_ttft_seconds": 40.818294525146484,
+          "median_batch_input_tokens_per_max_ttft": 802.7772933975224
+        },
+        "p16384_b1": {
+          "length": 16384,
+          "batch": 1,
+          "max_ttft_seconds": [
+            20.085317373275757,
+            20.099400758743286,
+            20.0817973613739
+          ],
+          "median_max_ttft_seconds": 20.085317373275757,
+          "median_batch_input_tokens_per_max_ttft": 815.7202445702703,
+          "prefill_seconds": [
+            20.08318042755127,
+            20.097326278686523,
+            20.07969045639038
+          ],
+          "median_prefill_seconds": 20.08318042755127,
+          "median_prefill_input_tps": 815.8070410761973
+        },
+        "p16384_b4": {
+          "length": 16384,
+          "batch": 4,
+          "max_ttft_seconds": [
+            80.61002230644226,
+            80.78732132911682,
+            80.76467037200928
+          ],
+          "median_max_ttft_seconds": 80.76467037200928,
+          "median_batch_input_tokens_per_max_ttft": 811.4439110335662
+        },
+        "p32768_b1": {
+          "length": 32768,
+          "batch": 1,
+          "max_ttft_seconds": [
+            39.82274675369263,
+            39.82011795043945,
+            39.81162786483765
+          ],
+          "median_max_ttft_seconds": 39.82011795043945,
+          "median_batch_input_tokens_per_max_ttft": 822.9006262810021,
+          "prefill_seconds": [
+            39.820518493652344,
+            39.81797122955322,
+            39.8094916343689
+          ],
+          "median_prefill_seconds": 39.81797122955322,
+          "median_prefill_input_tps": 822.9449916242675
+        },
+        "p32768_b4": {
+          "length": 32768,
+          "batch": 4,
+          "max_ttft_seconds": [
+            160.01850509643555,
+            160.16471195220947,
+            160.0943512916565
+          ],
+          "median_max_ttft_seconds": 160.0943512916565,
+          "median_batch_input_tokens_per_max_ttft": 818.7172060881512
+        },
+        "p65536_b1": {
+          "length": 65536,
+          "batch": 1,
+          "max_ttft_seconds": [
+            78.53469681739807,
+            78.50571179389954,
+            78.50577163696289
+          ],
+          "median_max_ttft_seconds": 78.50577163696289,
+          "median_batch_input_tokens_per_max_ttft": 834.7921258969407,
+          "prefill_seconds": [
+            78.53235363960266,
+            78.50343632698059,
+            78.50347208976746
+          ],
+          "median_prefill_seconds": 78.50347208976746,
+          "median_prefill_input_tps": 834.8165788776914
+        },
+        "p65536_b4": {
+          "length": 65536,
+          "batch": 4,
+          "max_ttft_seconds": [
+            315.270455121994,
+            315.3934154510498,
+            315.22581124305725
+          ],
+          "median_max_ttft_seconds": 315.270455121994,
+          "median_batch_input_tokens_per_max_ttft": 831.48926815411
+        }
+      },
+      "checks_passed": 60,
+      "checks_total": 60,
+      "failed_checks": [],
+      "cross_request_code_leaks": [],
+      "original_full_output_checks_passed": 60,
+      "response_checks": [
+        {
+          "case": "p8192_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "567955",
+          "answer_text": "567955",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "714477",
+          "answer_text": "714477",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p8192_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "207701",
+          "answer_text": "207701",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "814872",
+          "answer_text": "814872",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "655835",
+          "answer_text": "655835",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "669901",
+          "answer_text": "669901",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p16384_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "804915",
+          "answer_text": "804915",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 2,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 2,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "980410",
+          "answer_text": "980410",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "720190",
+          "answer_text": "720190",
+          "matched": true,
+          "stop_index": 2,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "979592",
+          "answer_text": "979592",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p32768_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "750729",
+          "answer_text": "750729",
+          "matched": true,
+          "stop_index": 3,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 0,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 1,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b1",
+          "repeat": 2,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 0,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 1,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 0,
+          "expected": "733436",
+          "answer_text": "733436",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 1,
+          "expected": "784692",
+          "answer_text": "784692",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 2,
+          "expected": "944745",
+          "answer_text": "944745",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        },
+        {
+          "case": "p65536_b4",
+          "repeat": 2,
+          "request": 3,
+          "expected": "542425",
+          "answer_text": "542425",
+          "matched": true,
+          "stop_index": 4,
+          "stop_token": 154827,
+          "original_full_output_matched": true
+        }
+      ],
+      "scoring_policy": "Decode tokens before the first configured stop token, then match the expected whole six-digit code. Raw full-output checks are preserved.",
+      "module_devices": [
+        [
+          "model.language_model.embed_tokens",
+          "cpu"
+        ],
+        [
+          "hc_expand",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.0",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.1",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.2",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.3",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.4",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.5",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.6",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.7",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.8",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.9",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.10",
+          "cuda:0"
+        ],
+        [
+          "model.language_model.layers.11",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.12",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.13",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.14",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.15",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.16",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.17",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.18",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.19",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.20",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.21",
+          "cuda:1"
+        ],
+        [
+          "model.language_model.layers.22",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.23",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.24",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.25",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.26",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.27",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.28",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.29",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.30",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.31",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.32",
+          "cuda:2"
+        ],
+        [
+          "model.language_model.layers.33",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.34",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.35",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.36",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.37",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.38",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.39",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.40",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.41",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.42",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.43",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.layers.44",
+          "cuda:3"
+        ],
+        [
+          "hc_head",
+          "cuda:3"
+        ],
+        [
+          "model.language_model.norm",
+          "cuda:3"
+        ],
+        [
+          "lm_head",
+          "cuda:3"
+        ]
+      ]
+    }
+  },
+  "artifacts": {
+    "benchmark_after_scoring_fix.py": {
+      "bytes": 14242,
+      "sha256": "c288040475dd95a9765968b2b8d0b8f229608620f23a61a4e5ff4bf7eba326f1"
+    },
+    "benchmark_before_progress.py": {
+      "bytes": 12819,
+      "sha256": "28d53d5707277f54ec0d26e73854f510d3ab2363e4bf0d53b68653e3de0a3211"
+    },
+    "benchmark_with_progress.py": {
+      "bytes": 13390,
+      "sha256": "ed5c3dc4e36542424af5d6c61eb12b6e7485c245b22d2d21f75d50013337e33d"
+    },
+    "dense-exllamav3.json": {
+      "bytes": 47831,
+      "sha256": "3c47a59d9b9e14d85ee7a47775210190894be80893d238ec41682ed51a7e3f7f"
+    },
+    "dense-inputs.json.gz": {
+      "bytes": 195471,
+      "sha256": "baad7e8bd6ab3e947c9d80d9f44b572b378a2fbd0d18c3953a14297a19695900"
+    },
+    "dense-original.log.gz": {
+      "bytes": 1120,
+      "sha256": "26509ce2b90a471910de5a36fa6f23950d323d497f3e3bbf2f1d9870536b63e6"
+    },
+    "dense-vllm.json": {
+      "bytes": 30643,
+      "sha256": "13fb7800dde48c5b75e7ac6d1a6e2553550de601ed039fa4dbc408d3af7cd606"
+    },
+    "dense-vllm.log.gz": {
+      "bytes": 6704,
+      "sha256": "7d74d43aa05d916447abbf8e03870150686000a65c5b54d27522493123bfdfce"
+    },
+    "moe-exllamav3.json": {
+      "bytes": 36990,
+      "sha256": "5a13d6280ff0a8b3e6a4442f6f5778ca4e9e386c80113486b8e2b6609f3a47d1"
+    },
+    "moe-inputs.json.gz": {
+      "bytes": 232608,
+      "sha256": "3fcadda875bcccd1dc82c8549b3ec7f20c3f054d42de4d2fa7d02e1b2f9b8837"
+    },
+    "moe-original.log.gz": {
+      "bytes": 1283,
+      "sha256": "cb459d3cd23f4cf21751c25e8c122ec27678d115f10ce3a03a67d4888b7ac54a"
+    },
+    "moe-vllm.json": {
+      "bytes": 33863,
+      "sha256": "62a334d52ad384d05574674776fea00153d45332e3ccfebc28f6fb1d536c8713"
+    },
+    "moe-vllm.log.gz": {
+      "bytes": 8490,
+      "sha256": "bfb1a6eab9633bdc58b8d8df9630c5c9ba504c5ced446794aed2d2b1dcd53f9e"
+    },
+    "prepare_inputs.py": {
+      "bytes": 4557,
+      "sha256": "6c9f10c15cc6c11f0be273239cc7a1bd2672c57a2e8b04df06a7bfeedbc5cf45"
+    },
+    "protocol.json": {
+      "bytes": 7873,
+      "sha256": "d609e8876c086ebfd8b448358cd424f44dd7863888d4cb9e6f2019788d9fedbd"
+    },
+    "validation-mypy312.log.gz": {
+      "bytes": 54,
+      "sha256": "96d05a596b9bbec5e366cb69e9b23422e9195be9ba8cf176e9ef5641f36d50f7"
+    },
+    "validation-precommit.log.gz": {
+      "bytes": 696,
+      "sha256": "f26f25183c21f13e7d637627373cbc396cf5d583648f7f53a8f74a80bad94f21"
+    },
+    "validation_checks.json": {
+      "bytes": 4145,
+      "sha256": "d45b423968d8efefb234febe5af4e882878deb19aee494985fbfd27acbc5ba47"
+    }
+  },
+  "interpretation": "Prefill stage wall time includes first-token work and engine overhead; batch metric is maximum per-request TTFT. Retrieval matching is a basic functional check, with repeated prompts, not a broad long-context accuracy benchmark.",
+  "validation_checks": "exl3-long-20260910/validation_checks.json"
+}

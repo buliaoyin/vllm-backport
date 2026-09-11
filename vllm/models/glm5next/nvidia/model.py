@@ -326,7 +326,11 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                quant_config=(
+                    quant_config
+                    if quant_config is not None and quant_config.get_name() == "exl3"
+                    else None
+                ),
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=config.mla_nope,
@@ -749,6 +753,7 @@ class Glm5NextModel(nn.Module):
             (".wk_weights_proj", ".wk", 0),
             (".wk_weights_proj", ".weights_proj", 1),
             # KDA: merge q, k, v, b, f_a, g_a projections into one GEMM
+            (".in_proj_qkvbfg_a", ".qkv_proj", (0, 1, 2)),
             (".in_proj_qkvbfg_a", ".q_proj", 0),
             (".in_proj_qkvbfg_a", ".k_proj", 1),
             (".in_proj_qkvbfg_a", ".v_proj", 2),
@@ -926,7 +931,12 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
-    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "in_proj_qkvbfg_a": ["qkv_proj", "b_proj", "f_a_proj", "g_a_proj"],
+    }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1095,7 +1105,12 @@ class Glm5NextForConditionalGeneration(
                 # the tower
                 # and yields NaN image features. Mirrors the MLA/KDA proj
                 # pattern (quant_config=None for BF16 submodules).
-                quant_config=None,
+                quant_config=(
+                    vllm_config.quant_config
+                    if vllm_config.quant_config is not None
+                    and vllm_config.quant_config.get_name() == "exl3"
+                    else None
+                ),
                 prefix=maybe_prefix(prefix, "visual"),
             )
 

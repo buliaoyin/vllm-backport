@@ -1,0 +1,252 @@
+{
+  "answer_check_scope": "before_first_stop_token",
+  "args": {
+    "backend": "vllm",
+    "inputs": "/tmp/exl3-prefill-analysis-20260910/nvfp4-inputs.json.gz",
+    "output": "/tmp/exl3-prefill-analysis-20260910/nvfp4-c512.json",
+    "pp": 4,
+    "expected_layer_counts": null,
+    "exl_memory": [
+      31,
+      40,
+      40,
+      48
+    ],
+    "max_model_len": 16384,
+    "kv_cache_gib": 4.0,
+    "exl_cache_tokens": 16384,
+    "warmups": 1,
+    "chunk_size": 512,
+    "batch_size": 4,
+    "repeats": 3,
+    "tokens": 32,
+    "eval_tokens": 768,
+    "skip_perf": false,
+    "skip_eval": true,
+    "eager": false,
+    "profile_dir": "/tmp/exl3-prefill-analysis-20260910/nvfp4-c512-profile",
+    "profile_tokens": 1
+  },
+  "inputs_sha256": "9d1ca6e6e4afe18bd2029b38a74c5c90351f5802e51a9fee541a599c58983191",
+  "model": "/media/bul/ext1/dev/models/zai/LibertAIDAI/GLM-5.3-Flash-NVFP4",
+  "benchmark_source_sha256": "100fbfe3deb551906fae2bffc6f1572c39de8bf6315c9bad1dc96376d9e9495e",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "gpu_names": [
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "EXL3_INT8_GEMV": "0",
+    "OMP_NUM_THREADS": "1",
+    "VLLM_PP_LAYER_PARTITION": "11,11,11,12",
+    "NCCL_P2P_DISABLE": "1"
+  },
+  "revision": "5fc5fa7c8cfd67640f83ff98215ae6e797b20426",
+  "perf": [
+    {
+      "case": "p8192_b1",
+      "repeat": 0,
+      "seconds": 2.534293927019462,
+      "throughput": 12.62679109902403,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            4226,
+            1196,
+            17045,
+            13,
+            14646,
+            4715,
+            13,
+            2379,
+            3897,
+            18104,
+            448,
+            1657,
+            3589,
+            323,
+            22803,
+            64126,
+            3255,
+            1555,
+            25,
+            330,
+            7133,
+            21263,
+            3255,
+            25,
+            3255,
+            62
+          ],
+          "text": "752228We need answer user asks. Need parse. They provided archive with many items and embedded authoritative record line: \"Authoritative record: record_",
+          "ttft": 1.9360342025756836,
+          "prefill": 1.93269332498312,
+          "decode": 0.5980232680449262,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 1.9360342025756836
+    },
+    {
+      "case": "p8192_b1",
+      "repeat": 1,
+      "seconds": 2.5330291540012695,
+      "throughput": 12.633095813149872,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            4226,
+            1196,
+            17045,
+            13,
+            14646,
+            4715,
+            13,
+            2379,
+            3410,
+            18104,
+            448,
+            1657,
+            3589,
+            11,
+            1681,
+            220,
+            23,
+            98729,
+            17,
+            14,
+            15,
+            13,
+            14646,
+            24449,
+            4734,
+            2615
+          ],
+          "text": "752228We need answer user asks. Need parse. They provide archive with many items, request 8192/0. Need locate exact access",
+          "ttft": 1.9348633289337158,
+          "prefill": 1.9319491400383413,
+          "decode": 0.5980966039933264,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 1.9348633289337158
+    },
+    {
+      "case": "p8192_b1",
+      "repeat": 2,
+      "seconds": 2.537336726032663,
+      "throughput": 12.611648927667026,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            4226,
+            1196,
+            17045,
+            13,
+            14646,
+            4715,
+            13,
+            2379,
+            3410,
+            18104,
+            448,
+            1657,
+            3589,
+            11,
+            1681,
+            220,
+            23,
+            98729,
+            17,
+            14,
+            15,
+            13,
+            14646,
+            24449,
+            4734,
+            2615
+          ],
+          "text": "752228We need answer user asks. Need parse. They provide archive with many items, request 8192/0. Need locate exact access",
+          "ttft": 1.9389512538909912,
+          "prefill": 1.9359937330009416,
+          "decode": 0.5982503200066276,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 1.9389512538909912
+    }
+  ],
+  "eval": [],
+  "load_seconds": 642.5002096669632,
+  "exllamav3_version": "1.4.8",
+  "profile": {
+    "seconds": 1.9586356100044213,
+    "rows": [
+      {
+        "prompt_tokens": 8192,
+        "new_tokens": 1,
+        "token_ids": [
+          100899
+        ],
+        "text": "75",
+        "ttft": 1.9512622356414795,
+        "prefill": 1.948903066047933,
+        "decode": 0.0,
+        "cached_tokens": 0,
+        "finish_reason": "length"
+      }
+    ]
+  }
+}

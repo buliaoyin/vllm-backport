@@ -1,0 +1,64 @@
+{
+  "gpu": "NVIDIA CMP 170HX",
+  "routing": "/tmp/exl3-opt-20260910/routes/layer-3.pt",
+  "scope": "full GPU wrapper; CUDA graph events",
+  "selection": "Optimistic cache: union of top H experts from both measured chunks is decoded before timing; calibration uses measured input",
+  "rows": [
+    {
+      "hot_experts": 0,
+      "cached_experts": [],
+      "cache_bytes": 0,
+      "relative_l2": 1.3511116776498966e-05,
+      "median_ms": 44.230655670166016,
+      "min_ms": 44.214271545410156,
+      "max_ms": 44.269569396972656
+    },
+    {
+      "hot_experts": 2,
+      "cached_experts": [
+        109,
+        186,
+        238
+      ],
+      "cache_bytes": 151105536,
+      "relative_l2": 7.393524720100686e-05,
+      "median_ms": 45.71750259399414,
+      "min_ms": 45.694976806640625,
+      "max_ms": 45.73081588745117
+    },
+    {
+      "hot_experts": 4,
+      "cached_experts": [
+        109,
+        186,
+        238,
+        253
+      ],
+      "cache_bytes": 201474048,
+      "relative_l2": 0.00011278210149612278,
+      "median_ms": 47.00262451171875,
+      "min_ms": 46.98419189453125,
+      "max_ms": 47.02412796020508
+    },
+    {
+      "hot_experts": 8,
+      "cached_experts": [
+        54,
+        109,
+        112,
+        181,
+        186,
+        228,
+        238,
+        246,
+        253,
+        255
+      ],
+      "cache_bytes": 503685120,
+      "relative_l2": 0.000350254267686978,
+      "median_ms": 49.49913787841797,
+      "min_ms": 49.477630615234375,
+      "max_ms": 49.905662536621094
+    }
+  ]
+}

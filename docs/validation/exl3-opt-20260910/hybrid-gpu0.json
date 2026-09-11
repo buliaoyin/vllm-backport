@@ -1,0 +1,92 @@
+{
+  "gpu": "NVIDIA CMP 170HX",
+  "routing": "/tmp/exl3-opt-20260910/routes/layer-3.pt",
+  "timer": "CUDA graph events",
+  "hot_selection": "GPU top-k per chunk, no host sync",
+  "rows": [
+    {
+      "tokens": 2048,
+      "chunk": 512,
+      "hot_experts": 0,
+      "relative_l2": 4.011931196146179e-06,
+      "median_ms": 52.87014389038086
+    },
+    {
+      "tokens": 2048,
+      "chunk": 512,
+      "hot_experts": 2,
+      "relative_l2": 8.288059325423092e-05,
+      "median_ms": 56.262657165527344
+    },
+    {
+      "tokens": 2048,
+      "chunk": 512,
+      "hot_experts": 4,
+      "relative_l2": 0.00014784697850700468,
+      "median_ms": 58.645503997802734
+    },
+    {
+      "tokens": 2048,
+      "chunk": 512,
+      "hot_experts": 8,
+      "relative_l2": 0.0003005230682902038,
+      "median_ms": 65.9783706665039
+    },
+    {
+      "tokens": 2048,
+      "chunk": 1024,
+      "hot_experts": 0,
+      "relative_l2": 4.862728928856086e-06,
+      "median_ms": 45.70111846923828
+    },
+    {
+      "tokens": 2048,
+      "chunk": 1024,
+      "hot_experts": 2,
+      "relative_l2": 7.293487578863278e-05,
+      "median_ms": 48.099327087402344
+    },
+    {
+      "tokens": 2048,
+      "chunk": 1024,
+      "hot_experts": 4,
+      "relative_l2": 0.00011212263052584603,
+      "median_ms": 50.04800033569336
+    },
+    {
+      "tokens": 2048,
+      "chunk": 1024,
+      "hot_experts": 8,
+      "relative_l2": 0.00035004952223971486,
+      "median_ms": 55.133182525634766
+    },
+    {
+      "tokens": 2048,
+      "chunk": 2048,
+      "hot_experts": 0,
+      "relative_l2": 5.23329981660936e-06,
+      "median_ms": 40.68044662475586
+    },
+    {
+      "tokens": 2048,
+      "chunk": 2048,
+      "hot_experts": 2,
+      "relative_l2": 9.183592192130163e-05,
+      "median_ms": 42.76838302612305
+    },
+    {
+      "tokens": 2048,
+      "chunk": 2048,
+      "hot_experts": 4,
+      "relative_l2": 0.00011217349674552679,
+      "median_ms": 44.411903381347656
+    },
+    {
+      "tokens": 2048,
+      "chunk": 2048,
+      "hot_experts": 8,
+      "relative_l2": 0.0003549268876668066,
+      "median_ms": 49.372161865234375
+    }
+  ]
+}

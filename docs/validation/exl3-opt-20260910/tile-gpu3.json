@@ -1,0 +1,348 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "routing": "/tmp/exl3-opt-20260910/routes/layer-44.pt",
+  "rows": [
+    {
+      "library": null,
+      "tile_k": 32,
+      "tile_n": 256,
+      "shared": "fixed",
+      "group_mode": "native",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 5.831502221553819e-06,
+      "median_ms": 14.016127586364746,
+      "min_ms": 13.662848472595215,
+      "max_ms": 14.169759750366211,
+      "plan": {}
+    },
+    {
+      "library": null,
+      "tile_k": 32,
+      "tile_n": 256,
+      "shared": "fixed",
+      "group_mode": "default",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 5.6261246754729655e-06,
+      "median_ms": 14.241951942443848,
+      "min_ms": 14.170880317687988,
+      "max_ms": 14.28758430480957,
+      "plan": {
+        "threads": 512,
+        "shared_bytes": 92160,
+        "required_shared_bytes": 31744,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": null,
+      "tile_k": 32,
+      "tile_n": 256,
+      "shared": "needed",
+      "group_mode": "default",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 5.6305907492060214e-06,
+      "median_ms": 13.610143661499023,
+      "min_ms": 13.574784278869629,
+      "max_ms": 13.635104179382324,
+      "plan": {
+        "threads": 512,
+        "shared_bytes": 31744,
+        "required_shared_bytes": 31744,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": null,
+      "tile_k": 32,
+      "tile_n": 256,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 5.630583927995758e-06,
+      "median_ms": 13.64851188659668,
+      "min_ms": 13.606592178344727,
+      "max_ms": 13.693375587463379,
+      "plan": {
+        "threads": 512,
+        "shared_bytes": 31744,
+        "required_shared_bytes": 31744,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": null,
+      "tile_k": 32,
+      "tile_n": 128,
+      "shared": "needed",
+      "group_mode": "default",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 5.785690518678166e-06,
+      "median_ms": 17.15622329711914,
+      "min_ms": 17.077951431274414,
+      "max_ms": 17.41993522644043,
+      "plan": {
+        "threads": 512,
+        "shared_bytes": 17408,
+        "required_shared_bytes": 17408,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": null,
+      "tile_k": 32,
+      "tile_n": 128,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 5.982426955597475e-06,
+      "median_ms": 17.196704864501953,
+      "min_ms": 17.1496639251709,
+      "max_ms": 17.24095916748047,
+      "plan": {
+        "threads": 512,
+        "shared_bytes": 17408,
+        "required_shared_bytes": 17408,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": "moe_k16.so",
+      "tile_k": 16,
+      "tile_n": 256,
+      "shared": "needed",
+      "group_mode": "default",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 0.0005939484108239412,
+      "median_ms": 15.084192276000977,
+      "min_ms": 15.063679695129395,
+      "max_ms": 15.094623565673828,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 24064,
+        "required_shared_bytes": 24064,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": "moe_k16.so",
+      "tile_k": 16,
+      "tile_n": 256,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 0.000593947886954993,
+      "median_ms": 15.184639930725098,
+      "min_ms": 15.170080184936523,
+      "max_ms": 15.208352088928223,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 24064,
+        "required_shared_bytes": 24064,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": "moe_k16.so",
+      "tile_k": 16,
+      "tile_n": 256,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 11,
+      "width": 16,
+      "relative_l2": 0.0011777316685765982,
+      "median_ms": 15.188608169555664,
+      "min_ms": 15.159968376159668,
+      "max_ms": 15.201919555664062,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 24064,
+        "required_shared_bytes": 24064,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 11
+      }
+    },
+    {
+      "library": "moe_k16.so",
+      "tile_k": 16,
+      "tile_n": 128,
+      "shared": "needed",
+      "group_mode": "default",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 0.0005939483526162803,
+      "median_ms": 22.78668785095215,
+      "min_ms": 22.76051139831543,
+      "max_ms": 22.799072265625,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 12800,
+        "required_shared_bytes": 12800,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": "moe_k16.so",
+      "tile_k": 16,
+      "tile_n": 128,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 23,
+      "width": 8,
+      "relative_l2": 0.0005939466063864529,
+      "median_ms": 22.911584854125977,
+      "min_ms": 22.899295806884766,
+      "max_ms": 22.93929672241211,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 12800,
+        "required_shared_bytes": 12800,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": "moe_k16.so",
+      "tile_k": 16,
+      "tile_n": 128,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 11,
+      "width": 16,
+      "relative_l2": 0.0005939524271525443,
+      "median_ms": 23.0611515045166,
+      "min_ms": 23.042943954467773,
+      "max_ms": 23.092992782592773,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 12800,
+        "required_shared_bytes": 12800,
+        "active_blocks_per_sm": 1,
+        "sms": 188,
+        "max_groups": 11
+      }
+    },
+    {
+      "library": "moe_k16_minblocks2.so",
+      "tile_k": 16,
+      "tile_n": 256,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 47,
+      "width": 8,
+      "relative_l2": 0.0005939521943219006,
+      "median_ms": 17.329631805419922,
+      "min_ms": 17.27609634399414,
+      "max_ms": 17.40764808654785,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 24064,
+        "required_shared_bytes": 24064,
+        "active_blocks_per_sm": 2,
+        "sms": 188,
+        "max_groups": 47
+      }
+    },
+    {
+      "library": "moe_k16_minblocks2.so",
+      "tile_k": 16,
+      "tile_n": 256,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 23,
+      "width": 16,
+      "relative_l2": 0.0011777308536693454,
+      "median_ms": 14.559871673583984,
+      "min_ms": 14.374048233032227,
+      "max_ms": 14.629535675048828,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 24064,
+        "required_shared_bytes": 24064,
+        "active_blocks_per_sm": 2,
+        "sms": 188,
+        "max_groups": 23
+      }
+    },
+    {
+      "library": "moe_k16_minblocks2.so",
+      "tile_k": 16,
+      "tile_n": 128,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 47,
+      "width": 8,
+      "relative_l2": 0.00059395597781986,
+      "median_ms": 22.9751033782959,
+      "min_ms": 22.944351196289062,
+      "max_ms": 23.023839950561523,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 12800,
+        "required_shared_bytes": 12800,
+        "active_blocks_per_sm": 2,
+        "sms": 188,
+        "max_groups": 47
+      }
+    },
+    {
+      "library": "moe_k16_minblocks2.so",
+      "tile_k": 16,
+      "tile_n": 128,
+      "shared": "needed",
+      "group_mode": "resident",
+      "groups": 23,
+      "width": 16,
+      "relative_l2": 0.000593948585446924,
+      "median_ms": 17.998464584350586,
+      "min_ms": 17.8919677734375,
+      "max_ms": 18.050687789916992,
+      "plan": {
+        "threads": 256,
+        "shared_bytes": 12800,
+        "required_shared_bytes": 12800,
+        "active_blocks_per_sm": 2,
+        "sms": 188,
+        "max_groups": 23
+      }
+    }
+  ],
+  "timer": "CUDA graph events; all wrapper GPU operations included",
+  "reference": "native K32/N256, 128-token chunks",
+  "kernel_abi": "ExLlamaV3 1.4.8 at 6ff3a17",
+  "shape": [
+    2048,
+    4096,
+    2048
+  ],
+  "bits": [
+    4,
+    4,
+    4
+  ]
+}

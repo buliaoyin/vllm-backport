@@ -1,0 +1,41 @@
+{
+  "uses_worker_extension_rpc": true,
+  "runs": [
+    {
+      "name": "awq-c8192",
+      "command": [
+        "/home/bul/dev/vllm-backport/.venv/bin/python",
+        "/home/bul/dev/vllm-backport/benchmarks/benchmark_exl3.py",
+        "--backend",
+        "vllm",
+        "--pp",
+        "4",
+        "--inputs",
+        "/tmp/exl3-prefill-analysis-20260910/awq-inputs.json.gz",
+        "--output",
+        "/tmp/exl3-prefill-analysis-20260910/awq-c8192.json",
+        "--max-model-len",
+        "16384",
+        "--kv-cache-gib",
+        "4",
+        "--chunk-size",
+        "8192",
+        "--warmups",
+        "1",
+        "--tokens",
+        "32",
+        "--skip-eval",
+        "--profile-dir",
+        "/tmp/exl3-prefill-analysis-20260910/awq-c8192-profile",
+        "--profile-tokens",
+        "1"
+      ],
+      "source_sha256": "7b7410be464b60ee06f9f918319dfd7b61537b564eef960efd9fd982f2f520c2",
+      "helper_sha256": "a5169226a9f3b18e7658799203f776553161cf89ee9ccaa4a246b94f84fb6045",
+      "start_utc": "2026-09-10T10:31:08.560708+00:00",
+      "exit_code": 1,
+      "elapsed_seconds": 58.78319501300575,
+      "end_utc": "2026-09-10T10:32:07.344247+00:00"
+    }
+  ]
+}

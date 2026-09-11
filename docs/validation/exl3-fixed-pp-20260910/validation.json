@@ -1,0 +1,82 @@
+{
+  "source_hashes_unchanged": true,
+  "runs": [
+    {
+      "name": "exl3-pp11-11-11-12-c512",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 0,
+      "measured_requests": 9
+    },
+    {
+      "name": "nvfp4-pp11-11-11-12-c512",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 0,
+      "measured_requests": 3
+    },
+    {
+      "name": "awq-pp11-11-11-12-c512",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 3842,
+      "measured_requests": 3
+    },
+    {
+      "name": "awq-pp11-11-11-12-c1024",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 222,
+      "measured_requests": 3
+    },
+    {
+      "name": "nvfp4-pp11-11-11-12-c1024",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 0,
+      "measured_requests": 3
+    },
+    {
+      "name": "exl3-pp11-11-11-12-c1024",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 0,
+      "measured_requests": 3
+    },
+    {
+      "name": "exl3-long-pp11-11-11-12-c1024",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 0,
+      "measured_requests": 12
+    },
+    {
+      "name": "nvfp4-long-pp11-11-11-12-c1024",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 0,
+      "measured_requests": 12
+    },
+    {
+      "name": "awq-long-pp11-11-11-12-c1024",
+      "decoder_layer_indices_verified": true,
+      "all_retrieval_checks_passed": true,
+      "no_allocation_retries_during_timing": true,
+      "allocation_retry_messages_before_timing": 222,
+      "measured_requests": 12
+    }
+  ],
+  "inputs_identical_across_formats": {
+    "8k": true,
+    "long": true
+  },
+  "production_matches_previous_final_snapshot": true
+}

@@ -1,0 +1,10 @@
+{
+  "reason": "Missing main guard in temporary evaluation helper caused multiprocessing spawn bootstrap failure",
+  "terminated_owned_pids": [
+    1382922,
+    1382989,
+    1382992,
+    1382920
+  ],
+  "fixed": true
+}

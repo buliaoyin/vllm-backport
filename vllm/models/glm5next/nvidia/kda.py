@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
-
 import torch
 from torch import nn
 
@@ -152,10 +151,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
+        # FP8 checkpoints keep KDA projections BF16 and omit their scales.
         saved_quant_config = vllm_config.quant_config
         try:
-            vllm_config.quant_config = None
+            if saved_quant_config is None or saved_quant_config.get_name() != "exl3":
+                vllm_config.quant_config = None
             super().__init__(config, vllm_config, prefix)
         finally:
             vllm_config.quant_config = saved_quant_config

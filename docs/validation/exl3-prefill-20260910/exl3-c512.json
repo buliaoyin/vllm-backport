@@ -1,0 +1,252 @@
+{
+  "answer_check_scope": "before_first_stop_token",
+  "args": {
+    "backend": "vllm",
+    "inputs": "/tmp/exl3-prefill-analysis-20260910/exl3-inputs.json.gz",
+    "output": "/tmp/exl3-prefill-analysis-20260910/exl3-c512.json",
+    "pp": 4,
+    "expected_layer_counts": null,
+    "exl_memory": [
+      31,
+      40,
+      40,
+      48
+    ],
+    "max_model_len": 16384,
+    "kv_cache_gib": 4.0,
+    "exl_cache_tokens": 16384,
+    "warmups": 1,
+    "chunk_size": 512,
+    "batch_size": 4,
+    "repeats": 3,
+    "tokens": 32,
+    "eval_tokens": 768,
+    "skip_perf": false,
+    "skip_eval": true,
+    "eager": false,
+    "profile_dir": "/tmp/exl3-prefill-analysis-20260910/exl3-c512-profile",
+    "profile_tokens": 1
+  },
+  "inputs_sha256": "75674b8e2e0c5b59e4730ca9f82248aa5d985e063e847733e81fea5d2874e1e4",
+  "model": "/media/bul/ext1/dev/models/zai/turboderp/GLM-5.3-Flash-exl3/4.05bpw",
+  "benchmark_source_sha256": "100fbfe3deb551906fae2bffc6f1572c39de8bf6315c9bad1dc96376d9e9495e",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "gpu_names": [
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA CMP 170HX",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "EXL3_INT8_GEMV": "0",
+    "OMP_NUM_THREADS": "1",
+    "VLLM_PP_LAYER_PARTITION": "11,11,11,12",
+    "NCCL_P2P_DISABLE": "1"
+  },
+  "revision": "5fc5fa7c8cfd67640f83ff98215ae6e797b20426",
+  "perf": [
+    {
+      "case": "p8192_b1",
+      "repeat": 0,
+      "seconds": 6.991727394983172,
+      "throughput": 4.576837481244078,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            785,
+            1196,
+            6801,
+            752,
+            311,
+            1477,
+            279,
+            2615,
+            2038,
+            369,
+            3255,
+            62,
+            23,
+            98729,
+            17,
+            62,
+            15,
+            2273,
+            945,
+            304,
+            279,
+            18104,
+            382,
+            22405,
+            518,
+            279,
+            18104,
+            11
+          ],
+          "text": "752228The user wants me to find the access code for record_8192_0_vault in the archive.\n\nLooking at the archive,",
+          "ttft": 6.2016355991363525,
+          "prefill": 6.198044225980993,
+          "decode": 0.7900009390432388,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.2016355991363525
+    },
+    {
+      "case": "p8192_b1",
+      "repeat": 1,
+      "seconds": 7.006455734022893,
+      "throughput": 4.567216466466788,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            1196,
+            594,
+            1681,
+            13,
+            14646,
+            4715,
+            13,
+            2657,
+            17045,
+            25,
+            330,
+            1900,
+            220,
+            23,
+            98729,
+            17,
+            14,
+            15,
+            13,
+            4457,
+            279,
+            18104,
+            323,
+            24449
+          ],
+          "text": "752228We need to answer user's request. Need parse. User asks: \"Request 8192/0. Read the archive and locate",
+          "ttft": 6.2159035205841064,
+          "prefill": 6.213006662961561,
+          "decode": 0.790171024040319,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.2159035205841064
+    },
+    {
+      "case": "p8192_b1",
+      "repeat": 2,
+      "seconds": 7.012626082985662,
+      "throughput": 4.563197812248936,
+      "rows": [
+        {
+          "prompt_tokens": 8192,
+          "new_tokens": 32,
+          "token_ids": [
+            100899,
+            17,
+            123886,
+            154827,
+            1654,
+            1184,
+            311,
+            4226,
+            25,
+            1205,
+            1184,
+            311,
+            4226,
+            25,
+            1205,
+            1184,
+            311,
+            4226,
+            25,
+            1205,
+            10430,
+            13,
+            1205,
+            10430,
+            13,
+            1205,
+            10430,
+            13,
+            1205,
+            10430,
+            13,
+            1205
+          ],
+          "text": "752228We need to answer: We need to answer: We need to answer: We conversation. We conversation. We conversation. We conversation. We",
+          "ttft": 6.220521926879883,
+          "prefill": 6.216673857008573,
+          "decode": 0.7923294059582986,
+          "cached_tokens": 0,
+          "finish_reason": "length"
+        }
+      ],
+      "checks": [
+        {
+          "expected": "752228",
+          "answer_text": "752228",
+          "matched": true
+        }
+      ],
+      "max_ttft": 6.220521926879883
+    }
+  ],
+  "eval": [],
+  "load_seconds": 100.77493615797721,
+  "exllamav3_version": "1.4.8",
+  "profile": {
+    "seconds": 6.240838182042353,
+    "rows": [
+      {
+        "prompt_tokens": 8192,
+        "new_tokens": 1,
+        "token_ids": [
+          100899
+        ],
+        "text": "75",
+        "ttft": 6.232745885848999,
+        "prefill": 6.229975514987018,
+        "decode": 0.0,
+        "cached_tokens": 0,
+        "finish_reason": "length"
+      }
+    ]
+  }
+}

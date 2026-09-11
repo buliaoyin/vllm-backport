@@ -1,0 +1,38 @@
+[
+  {
+    "name": "tile-gpu0",
+    "exit_code": 0,
+    "command": [
+      ".venv/bin/python",
+      "/tmp/exl3-opt-20260910/tile_benchmark.py",
+      "--checkpoint",
+      "/home/bul/dev/models1/zai/turboderp/GLM-5.3-Flash-exl3/4.05bpw",
+      "--prefix",
+      "model.language_model.layers.3.mlp.experts",
+      "--route-sample",
+      "/tmp/exl3-opt-20260910/routes/layer-3.pt",
+      "--prefill-rows",
+      "2048",
+      "--output",
+      "/tmp/exl3-opt-20260910/tile-gpu0.json"
+    ]
+  },
+  {
+    "name": "tile-gpu3",
+    "exit_code": 0,
+    "command": [
+      ".venv/bin/python",
+      "/tmp/exl3-opt-20260910/tile_benchmark.py",
+      "--checkpoint",
+      "/home/bul/dev/models1/zai/turboderp/GLM-5.3-Flash-exl3/4.05bpw",
+      "--prefix",
+      "model.language_model.layers.44.mlp.experts",
+      "--route-sample",
+      "/tmp/exl3-opt-20260910/routes/layer-44.pt",
+      "--prefill-rows",
+      "2048",
+      "--output",
+      "/tmp/exl3-opt-20260910/tile-gpu3.json"
+    ]
+  }
+]

@@ -330,7 +330,11 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        weights = self._get_weights_iterator(primary_weights)
+        if model_config.quantization == "exl3":
+            # ExLlama's converter may embed calibration inputs in the checkpoint.
+            weights = ((name, value) for name, value in weights if name != "input_ids")
+        yield from weights
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],

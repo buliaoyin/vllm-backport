@@ -1,0 +1,5 @@
+index, uuid, pci.bus_id, name, driver_version, memory.total [MiB], power.limit [W], clocks.max.sm [MHz], clocks.max.memory [MHz]
+0, GPU-eb6f7876-fcdc-6a18-02d2-e8c99c9bf6fd, 00000000:01:00.0, NVIDIA CMP 170HX, 610.57.04, 65344 MiB, 260.00 W, 1695 MHz, 1728 MHz
+1, GPU-4c13eb2a-5269-a898-4eba-60f460d4ab1c, 00000000:41:00.0, NVIDIA CMP 170HX, 610.57.04, 65344 MiB, 260.00 W, 1695 MHz, 1728 MHz
+2, GPU-cad9a053-13d8-5700-2202-69a154a1f679, 00000000:81:00.0, NVIDIA CMP 170HX, 610.57.04, 65344 MiB, 260.00 W, 1695 MHz, 1728 MHz
+3, GPU-360cf87d-894a-7f20-479e-b36f9ef196e8, 00000000:C5:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 610.57.04, 97887 MiB, 500.00 W, 3090 MHz, 14001 MHz

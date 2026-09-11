@@ -33,6 +33,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self.moe_kernel: mk.FusedMoEKernel | None = None
 
     @property
+    def supports_multi_stream(self) -> bool:
+        """Whether kernels can overlap shared experts or another microbatch."""
+        return True
+
+    @property
     def supports_internal_mk(self) -> bool:
         # NOTE(rob): temporary attribute to indicate support for
         # completed migration to the new internal MK interface.

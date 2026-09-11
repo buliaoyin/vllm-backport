@@ -43,6 +43,7 @@ class SharedExperts(torch.nn.Module):
         moe_config: FusedMoEConfig,
         enable_dbo: bool,
         mk_can_overlap_shared_experts: Callable[[], bool],
+        disable_overlap: bool = False,
     ):
         super().__init__()
 
@@ -56,12 +57,13 @@ class SharedExperts(torch.nn.Module):
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
+        self._disable_overlap = disable_overlap
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
-        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
+        if disable_overlap or envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
             logger.debug_once("Disabling MoE shared_experts cuda stream")
             self._stream = None
         else:
@@ -77,6 +79,8 @@ class SharedExperts(torch.nn.Module):
 
     @property
     def _disable_shared_experts_overlap(self) -> bool:
+        if self._disable_overlap:
+            return True
         # Disable shared expert overlap if:
         #   - we are using eplb with non-safe backend, because of correctness issues
         #   - we are using flashinfer with DP, since there nothing to gain

@@ -1,0 +1,137 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "torch": "2.13.0+cu130",
+  "prefix": "model.language_model.layers.3.mlp.experts",
+  "checkpoint": "/home/bul/dev/models1/zai/turboderp/GLM-5.3-Flash-exl3/4.05bpw",
+  "expand_workspace": true,
+  "shape": {
+    "hidden": 4096,
+    "intermediate": 2048,
+    "experts": 288,
+    "topk": 8
+  },
+  "seed": 20260910,
+  "routing": "uniform",
+  "cold_l2": true,
+  "timer": "CUDA graph events (CUPTI unavailable on CMP)",
+  "scope": "full expert wrapper GPU work, excludes Python replay dispatch",
+  "graph_calls_per_sample": 1,
+  "samples": 15,
+  "flops": "6 * tokens * topk * hidden * intermediate (useful GEMM only)",
+  "rows": [
+    {
+      "tokens": 512,
+      "chunks": [
+        {
+          "workspace_rows": 128,
+          "workspace_bytes": 72351744,
+          "chunk": 128,
+          "max_tokens_per_expert": 10,
+          "active_expert_visits": 1123,
+          "rows_in_16row_tiles": 17968,
+          "relative_l2": 5.40755718247965e-06,
+          "median_ms": 11.809439659118652,
+          "min_ms": 11.731583595275879,
+          "max_ms": 11.832991600036621,
+          "useful_tflops": 17.45708824116942
+        },
+        {
+          "workspace_rows": 512,
+          "workspace_bytes": 289406976,
+          "chunk": 512,
+          "max_tokens_per_expert": 27,
+          "active_expert_visits": 288,
+          "rows_in_16row_tiles": 5792,
+          "relative_l2": 4.563088623399381e-06,
+          "median_ms": 3.724992036819458,
+          "min_ms": 3.7167680263519287,
+          "max_ms": 3.7546560764312744,
+          "useful_tflops": 55.34466333625401
+        },
+        {
+          "workspace_rows": 512,
+          "workspace_bytes": 289406976,
+          "chunk": 2048,
+          "max_tokens_per_expert": 27,
+          "active_expert_visits": 288,
+          "rows_in_16row_tiles": 5792,
+          "relative_l2": 4.587798230204498e-06,
+          "median_ms": 3.761823892593384,
+          "min_ms": 3.753632068634033,
+          "max_ms": 3.7761600017547607,
+          "useful_tflops": 54.802786120292126
+        },
+        {
+          "workspace_rows": 512,
+          "workspace_bytes": 289406976,
+          "chunk": 8192,
+          "max_tokens_per_expert": 27,
+          "active_expert_visits": 288,
+          "rows_in_16row_tiles": 5792,
+          "relative_l2": 4.563062248053029e-06,
+          "median_ms": 3.760512113571167,
+          "min_ms": 3.751584053039551,
+          "max_ms": 3.7904961109161377,
+          "useful_tflops": 54.82190297007761
+        }
+      ]
+    },
+    {
+      "tokens": 8192,
+      "chunks": [
+        {
+          "workspace_rows": 128,
+          "workspace_bytes": 72351744,
+          "chunk": 128,
+          "max_tokens_per_expert": 13,
+          "active_expert_visits": 17934,
+          "rows_in_16row_tiles": 286944,
+          "relative_l2": 2.8316790121607482e-06,
+          "median_ms": 190.32643127441406,
+          "min_ms": 190.12777709960938,
+          "max_ms": 190.50767517089844,
+          "useful_tflops": 17.330934338658135
+        },
+        {
+          "workspace_rows": 512,
+          "workspace_bytes": 289406976,
+          "chunk": 512,
+          "max_tokens_per_expert": 31,
+          "active_expert_visits": 4608,
+          "rows_in_16row_tiles": 92608,
+          "relative_l2": 5.812288691231515e-06,
+          "median_ms": 61.082271575927734,
+          "min_ms": 61.00649642944336,
+          "max_ms": 61.15599822998047,
+          "useful_tflops": 54.001509738022555
+        },
+        {
+          "workspace_rows": 2048,
+          "workspace_bytes": 1157627904,
+          "chunk": 2048,
+          "max_tokens_per_expert": 81,
+          "active_expert_visits": 1152,
+          "rows_in_16row_tiles": 74224,
+          "relative_l2": 4.387145054352004e-06,
+          "median_ms": 44.25737762451172,
+          "min_ms": 44.19456100463867,
+          "max_ms": 44.337825775146484,
+          "useful_tflops": 74.53073499549426
+        },
+        {
+          "workspace_rows": 8192,
+          "workspace_bytes": 4630511616,
+          "chunk": 8192,
+          "max_tokens_per_expert": 272,
+          "active_expert_visits": 288,
+          "rows_in_16row_tiles": 67664,
+          "relative_l2": 4.812237875739811e-06,
+          "median_ms": 39.4615364074707,
+          "min_ms": 39.37654495239258,
+          "max_ms": 39.55161666870117,
+          "useful_tflops": 83.58860763220396
+        }
+      ]
+    }
+  ]
+}
