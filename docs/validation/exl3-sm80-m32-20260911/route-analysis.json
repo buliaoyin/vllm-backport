@@ -1,0 +1,191 @@
+[
+  {
+    "layer": 3,
+    "chunk": 512,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.3.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.6610716591349257,
+    "m32_padding_efficiency_if_forced": 0.4807511737089202,
+    "mixed_16_32_padding_efficiency": 0.6610716591349257,
+    "m16_weight_decode_passes": 1549,
+    "mixed_16_32_weight_decode_passes": 1065,
+    "decode_pass_reduction": 0.31245965138799225,
+    "expert_visits_over_16": 398,
+    "fraction_rows_in_experts_over_16": 0.8494873046875,
+    "max_count": 103,
+    "mean_count": 14.222222328186035,
+    "source_sha256": "3a2a8fd282d77f472411878d263661ed9cd74d328aa913ab6346bd085b2530c0"
+  },
+  {
+    "layer": 3,
+    "chunk": 1024,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.3.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.7739984882842026,
+    "m32_padding_efficiency_if_forced": 0.6251526251526252,
+    "mixed_16_32_padding_efficiency": 0.7739984882842026,
+    "m16_weight_decode_passes": 1323,
+    "mixed_16_32_weight_decode_passes": 819,
+    "decode_pass_reduction": 0.38095238095238093,
+    "expert_visits_over_16": 264,
+    "fraction_rows_in_experts_over_16": 0.9365234375,
+    "max_count": 205,
+    "mean_count": 28.44444465637207,
+    "source_sha256": "3a2a8fd282d77f472411878d263661ed9cd74d328aa913ab6346bd085b2530c0"
+  },
+  {
+    "layer": 3,
+    "chunk": 2048,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.3.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.8729752770673487,
+    "m32_padding_efficiency_if_forced": 0.7496339677891655,
+    "mixed_16_32_padding_efficiency": 0.8729752770673487,
+    "m16_weight_decode_passes": 1173,
+    "mixed_16_32_weight_decode_passes": 683,
+    "decode_pass_reduction": 0.41773231031543057,
+    "expert_visits_over_16": 152,
+    "fraction_rows_in_experts_over_16": 0.95733642578125,
+    "max_count": 367,
+    "mean_count": 56.88888931274414,
+    "source_sha256": "3a2a8fd282d77f472411878d263661ed9cd74d328aa913ab6346bd085b2530c0"
+  },
+  {
+    "layer": 22,
+    "chunk": 512,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.22.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.649746192893401,
+    "m32_padding_efficiency_if_forced": 0.4421416234887737,
+    "mixed_16_32_padding_efficiency": 0.649746192893401,
+    "m16_weight_decode_passes": 1576,
+    "mixed_16_32_weight_decode_passes": 1158,
+    "decode_pass_reduction": 0.26522842639593913,
+    "expert_visits_over_16": 275,
+    "fraction_rows_in_experts_over_16": 0.767578125,
+    "max_count": 271,
+    "mean_count": 14.222222328186035,
+    "source_sha256": "0e66004ce7ae7cc695e7fb82a0913fdc204f15bf8ec4b23ac70fce0cecc42ae6"
+  },
+  {
+    "layer": 22,
+    "chunk": 1024,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.22.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.7913446676970634,
+    "m32_padding_efficiency_if_forced": 0.624390243902439,
+    "mixed_16_32_padding_efficiency": 0.7913446676970634,
+    "m16_weight_decode_passes": 1294,
+    "mixed_16_32_weight_decode_passes": 820,
+    "decode_pass_reduction": 0.366306027820711,
+    "expert_visits_over_16": 232,
+    "fraction_rows_in_experts_over_16": 0.89324951171875,
+    "max_count": 460,
+    "mean_count": 28.44444465637207,
+    "source_sha256": "0e66004ce7ae7cc695e7fb82a0913fdc204f15bf8ec4b23ac70fce0cecc42ae6"
+  },
+  {
+    "layer": 22,
+    "chunk": 2048,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.22.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.8767123287671232,
+    "m32_padding_efficiency_if_forced": 0.7687687687687688,
+    "mixed_16_32_padding_efficiency": 0.8767123287671232,
+    "m16_weight_decode_passes": 1168,
+    "mixed_16_32_weight_decode_passes": 666,
+    "decode_pass_reduction": 0.4297945205479452,
+    "expert_visits_over_16": 174,
+    "fraction_rows_in_experts_over_16": 0.9678955078125,
+    "max_count": 867,
+    "mean_count": 56.88888931274414,
+    "source_sha256": "0e66004ce7ae7cc695e7fb82a0913fdc204f15bf8ec4b23ac70fce0cecc42ae6"
+  },
+  {
+    "layer": 44,
+    "chunk": 512,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.44.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.6408010012515645,
+    "m32_padding_efficiency_if_forced": 0.43463497453310695,
+    "mixed_16_32_padding_efficiency": 0.6408010012515645,
+    "m16_weight_decode_passes": 1598,
+    "mixed_16_32_weight_decode_passes": 1178,
+    "decode_pass_reduction": 0.26282853566958697,
+    "expert_visits_over_16": 276,
+    "fraction_rows_in_experts_over_16": 0.7657470703125,
+    "max_count": 199,
+    "mean_count": 14.222222328186035,
+    "source_sha256": "2b4abbd86ec07b51b47b0b636d51d803a883c0e0c0c9d1da8565c42712c83705"
+  },
+  {
+    "layer": 44,
+    "chunk": 1024,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.44.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.7852760736196319,
+    "m32_padding_efficiency_if_forced": 0.6153846153846154,
+    "mixed_16_32_padding_efficiency": 0.7852760736196319,
+    "m16_weight_decode_passes": 1304,
+    "mixed_16_32_weight_decode_passes": 832,
+    "decode_pass_reduction": 0.3619631901840491,
+    "expert_visits_over_16": 231,
+    "fraction_rows_in_experts_over_16": 0.88848876953125,
+    "max_count": 391,
+    "mean_count": 28.44444465637207,
+    "source_sha256": "2b4abbd86ec07b51b47b0b636d51d803a883c0e0c0c9d1da8565c42712c83705"
+  },
+  {
+    "layer": 44,
+    "chunk": 2048,
+    "shape": [
+      2048,
+      4096
+    ],
+    "prefix": "language_model.model.layers.44.mlp.experts",
+    "assignments": 16384,
+    "m16_padding_efficiency": 0.8797250859106529,
+    "m32_padding_efficiency_if_forced": 0.7607726597325408,
+    "mixed_16_32_padding_efficiency": 0.8797250859106529,
+    "m16_weight_decode_passes": 1164,
+    "mixed_16_32_weight_decode_passes": 673,
+    "decode_pass_reduction": 0.42182130584192434,
+    "expert_visits_over_16": 164,
+    "fraction_rows_in_experts_over_16": 0.9515380859375,
+    "max_count": 701,
+    "mean_count": 56.88888931274414,
+    "source_sha256": "2b4abbd86ec07b51b47b0b636d51d803a883c0e0c0c9d1da8565c42712c83705"
+  }
+]

@@ -27,7 +27,8 @@ class VllmBackend:
         from vllm import LLM
 
         extension = (
-            args.profile_dir
+            args.worker_extension_cls
+            or args.profile_dir
             or args.event_profile
             or args.moe_workspace_sizes
             or args.moe_variants
@@ -51,7 +52,12 @@ class VllmBackend:
             limit_mm_per_prompt={"image": 0, "video": 0},
             compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8]},
             worker_extension_cls=(
-                "exl3_profile_worker.Exl3ProfileWorkerExtension" if extension else ""
+                args.worker_extension_cls
+                or (
+                    "exl3_profile_worker.Exl3ProfileWorkerExtension"
+                    if extension
+                    else ""
+                )
             ),
             profiler_config=(
                 {
@@ -229,6 +235,7 @@ def main():
     parser.add_argument("--profile-tokens", type=int, default=1)
     parser.add_argument("--moe-workspace-sizes", type=int, nargs="+")
     parser.add_argument("--moe-variants", type=Path)
+    parser.add_argument("--worker-extension-cls", default="")
     parser.add_argument("--capture-routing-dir", type=Path)
     args = parser.parse_args()
     if args.profile_dir and args.backend != "vllm":

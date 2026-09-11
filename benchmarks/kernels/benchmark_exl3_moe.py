@@ -664,6 +664,13 @@ def main():
     parser.add_argument("--expand-workspace", action="store_true")
     parser.add_argument("--routing", choices=["uniform", "hot"], default="uniform")
     parser.add_argument("--route-sample", type=Path)
+    parser.add_argument("--row-kernel-library", type=Path)
+    parser.add_argument(
+        "--row-kernel-variants",
+        nargs="+",
+        choices=["native", "m16", "m32", "m32_predicated", "native_after"],
+        default=["native", "m16", "m32", "m32_predicated", "native_after"],
+    )
     parser.add_argument("--hybrid-experts", type=int, nargs="+")
     parser.add_argument("--hybrid-grouped", action="store_true")
     parser.add_argument("--reuse-buffers", action="store_true")
@@ -680,6 +687,8 @@ def main():
         "--prefill-chunks", type=int, nargs="+", default=[128, 512, 2048]
     )
     args = parser.parse_args()
+    if args.row_kernel_library and (not args.route_sample or not args.prefill_rows):
+        parser.error("--row-kernel-library requires --route-sample and --prefill-rows")
     config = Exl3Config({})
     config.maybe_update_config(str(args.checkpoint))
     k, n = config.matrices[args.prefix + ".0.gate_proj"].dimensions
@@ -706,6 +715,14 @@ def main():
                     param, handle.get_tensor(name), expert_id=int(expert), shard_id=kind
                 )
     method.process_weights_after_loading(layer)
+    if args.row_kernel_library:
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from benchmarks.kernels.exl3_m32.benchmark import run
+
+        run(layer, method, args, k, n)
+        return
     if args.hybrid_experts:
         hybrid_ablation(layer, method, args, k, n)
         return

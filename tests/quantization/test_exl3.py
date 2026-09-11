@@ -175,6 +175,10 @@ def test_linear_decode_and_prefill_match_rotated_reference(
 )
 def test_moe_routing_and_chunk_boundaries(rows, capacity, monkeypatch):
     """A hot expert exceeding workspace capacity must survive chunking and replay."""
+    _check_moe_routing(rows, capacity, 128, monkeypatch)
+
+
+def _check_moe_routing(rows, capacity, hidden_dim, monkeypatch):
     monkeypatch.setenv("VLLM_EXL3_MOE_MAX_TOKENS", str(capacity))
     pytest.importorskip("exllamav3_ext")
     torch.manual_seed(3)
@@ -183,7 +187,7 @@ def test_moe_routing_and_chunk_boundaries(rows, capacity, monkeypatch):
     num_experts = 32 if rows == 513 else 3
     for expert in range(num_experts):
         for kind in ("gate_proj", "up_proj", "down_proj"):
-            weights[expert, kind] = _weights(k=128, n=128, device="cuda")
+            weights[expert, kind] = _weights(k=hidden_dim, n=hidden_dim, device="cuda")
             name = f"experts.{expert}.{kind}"
             config.matrices[name] = _spec(name, weights[expert, kind])
     moe = SimpleNamespace(
@@ -193,7 +197,7 @@ def test_moe_routing_and_chunk_boundaries(rows, capacity, monkeypatch):
     )
     method, layer = Exl3MoEMethod(config, moe, "experts"), nn.Module()
     with torch.device("cuda"):
-        method.create_weights(layer, num_experts, 128, 128, torch.float16)
+        method.create_weights(layer, num_experts, hidden_dim, hidden_dim, torch.float16)
     for expert in range(num_experts):
         for shard, kind in (
             ("w1", "gate_proj"),
@@ -204,7 +208,7 @@ def test_moe_routing_and_chunk_boundaries(rows, capacity, monkeypatch):
                 param = getattr(layer, ("w2_" if shard == "w2" else "w13_") + key)
                 param.weight_loader(param, tensor, shard_id=shard, expert_id=expert)
     method.process_weights_after_loading(layer)
-    x = torch.randn(rows, 128, device="cuda", dtype=torch.float16)
+    x = torch.randn(rows, hidden_dim, device="cuda", dtype=torch.float16)
     ids = torch.stack(
         (
             torch.full((rows,), num_experts - 1, device="cuda", dtype=torch.long),
@@ -236,6 +240,23 @@ def test_moe_routing_and_chunk_boundaries(rows, capacity, monkeypatch):
         ids[:, 1].copy_(1 - ids[:, 1])
         graph.replay()
         torch.testing.assert_close(captured, method.apply(layer, x, routing, ids))
+
+
+@pytest.mark.parametrize("rows", [9, 16, 17, 31, 32, 33, 63, 64, 65, 129, 513, 1025])
+def test_experimental_m32_tails_and_replay(rows, monkeypatch):
+    """Check short row tiles, hot experts and replay against rotated dense weights."""
+    import os
+
+    library = os.environ.get("VLLM_EXL3_TEST_ROWS_LIBRARY")
+    if not library or not torch.cuda.is_available():
+        pytest.skip("Requires the optional SM80 row kernel build")
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("Row kernel is SM80-only")
+    from benchmarks.kernels.exl3_m32.launcher import Launcher
+
+    extension = _extension()
+    monkeypatch.setattr(extension, "exl3_moe", Launcher(extension, library))
+    _check_moe_routing(rows, 1024, 256, monkeypatch)
 
 
 def test_shared_experts_serialize_device_wide_exl3_workspace(monkeypatch):

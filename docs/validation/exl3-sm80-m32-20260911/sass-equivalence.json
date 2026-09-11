@@ -1,0 +1,10 @@
+{
+  "repro-build": {
+    "opcodes": 36896,
+    "opcode_sha256": "6340b50bf1333913b2165baff1d3fa596aa9cc4b8164ef208eaa2b73663a7931"
+  },
+  "final-build": {
+    "opcodes": 36896,
+    "opcode_sha256": "6340b50bf1333913b2165baff1d3fa596aa9cc4b8164ef208eaa2b73663a7931"
+  }
+}
