@@ -72,6 +72,12 @@ class Exl3ProfileWorkerExtension:
         if quantization == "exl3":
             patch(exl3, "_exl3_moe_fused", "routed_experts_inclusive", routing=True)
             ext = exl3._extension()
+            if any(
+                isinstance(getattr(module, "quant_method", None), exl3.Exl3MoEMethod)
+                and module.quant_method.m32_locks is not None
+                for module in self.get_model().modules()
+            ):
+                patch(torch.ops._exl3_C, "moe_m32", "moe_m32")
             for name in (
                 "exl3_moe",
                 "exl3_gemm",

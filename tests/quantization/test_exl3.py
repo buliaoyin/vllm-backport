@@ -466,3 +466,36 @@ def test_experimental_moe_pipeline(rows, variant, monkeypatch):
     extension = _extension()
     monkeypatch.setattr(extension, "exl3_moe", Pipeline(extension, library, variant))
     _check_moe_routing(rows, 1024, 256, monkeypatch, relative_limit=0.02)
+
+
+@pytest.mark.parametrize("rows", [9, 33, 65, 513])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "control",
+        "compact",
+        "loadfirst",
+        "loadfirst_s4",
+        "singlefrag",
+        "k16_resident",
+        "k16_singlefrag",
+        "k16_n128",
+        "m64_k16_n128",
+        "lookup",
+        "lookup_k16",
+    ],
+)
+def test_experimental_prefill_residency_and_codebook(rows, variant, monkeypatch):
+    """Guard exact lookup, changed K reduction and resident-group scratch reuse."""
+    import os
+
+    library = os.environ.get("VLLM_EXL3_TEST_PREFILL_LIBRARY")
+    if not library or not torch.cuda.is_available():
+        pytest.skip("Requires the optional prefill experiment library")
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("Prefill residency experiments require SM80")
+    pytest.importorskip("vllm._exl3_C")
+    from benchmarks.kernels.exl3_prefill.launcher import Launcher
+
+    monkeypatch.setattr(torch.ops._exl3_C, "moe_m32", Launcher(library, variant))
+    _check_moe_routing(rows, 1024, 256, monkeypatch, m_tile=None, intermediate_dim=512)
