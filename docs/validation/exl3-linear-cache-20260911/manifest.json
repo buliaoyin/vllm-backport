@@ -1,0 +1,119 @@
+{
+  "scope": "Only ordinary FP16 projection cache toggled; fixed PP 11/11/11/12, INT8 m64n128k64 and chunk 6144.",
+  "artifacts": [
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/metadata.json",
+      "artifact": "metadata.json.gz",
+      "original_sha256": "7ea39994948981808ef036dd932220a867200c17c50c2b6d42d35ae6929fe8db",
+      "artifact_sha256": "756b9d899c2fab6a8542865961de048500786780b212d5304bfb6d61e1e454dd"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/status.json",
+      "artifact": "status.json.gz",
+      "original_sha256": "7c5790b38df674b8382a5598398b8bcbc996a59026b15d270614bb2cfd806190",
+      "artifact_sha256": "c91a9e0ae6f4cb15903696d2446fb538cd20b1e2c3420e05e9e6928fd65cb8a7"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/summary.json",
+      "artifact": "summary.json.gz",
+      "original_sha256": "c313a532b98e16eaffcab3600d3c123092a11490a760aa6589b68bc976f84602",
+      "artifact_sha256": "4037c84ed79749e7a6899586ea830c150eef674629ea59389265ca36c297e477"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/run_ablation.py",
+      "artifact": "run_ablation.py.gz",
+      "original_sha256": "9509ccb74b82f30cab2a94636bd7fe408d6700b82ab7ce39ad7dcf202e80135b",
+      "artifact_sha256": "3da181707a4767e8c89914b59ad8f344391ffbca03504fb9691bd037924b96ea"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/analyze.py",
+      "artifact": "analyze.py.gz",
+      "original_sha256": "327120d0516428e16cbebc5ee41778ff6eadaedbc0ae89a0a47e60b5b4db6d25",
+      "artifact_sha256": "02622deeb5786348e0b6bc7297ce2eaebcfcace36c6de8caca1c9066686132b0"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/archive.py",
+      "artifact": "archive.py.gz",
+      "original_sha256": "80f5a88809341a2039484e1b7831892eb7e73782ff896c19a19cf0cacc8cb03e",
+      "artifact_sha256": "b8e3c23ad3b1620cd7067d67a02936ea4df26b71800ab6ab8a02aa2577f94f90"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/write_report.py",
+      "artifact": "write_report.py.gz",
+      "original_sha256": "06e7dfe5ef788be7646505b0ad24e2f6c6f6ff573f3a4c0df2fbe1592f8883bf",
+      "artifact_sha256": "53a0d53a248472f7ca26cf85d804c6648a8a2a05e6bce3d078e8313e07b7afac"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/benchmark_exl3.py",
+      "artifact": "benchmark_exl3.py.gz",
+      "original_sha256": "40c936f415df45d81b7500bbd899787c28926dbd11e1807630038c06333f8c33",
+      "artifact_sha256": "79cce0867673191c8a45a891b530a6d3c5ee9833bda7b2963a7742831d183faf"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/inputs.json.gz",
+      "artifact": "inputs.json.gz",
+      "original_sha256": "c130e549a81c1c0c13ec4b04cf1140fec0253fc14825501bd3477a89dfb9a372",
+      "artifact_sha256": "c130e549a81c1c0c13ec4b04cf1140fec0253fc14825501bd3477a89dfb9a372"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/confirmation-inputs.json.gz",
+      "artifact": "confirmation-inputs.json.gz",
+      "original_sha256": "d174d7dce9c57f2e3d1e03c74dc6e035bee1806a40fadf80213416ca6e29ea42",
+      "artifact_sha256": "d174d7dce9c57f2e3d1e03c74dc6e035bee1806a40fadf80213416ca6e29ea42"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/runner.log",
+      "artifact": "runner.log.gz",
+      "original_sha256": "32c1856bdfbedb14d044fbe18d7c290f0cac660ee2349ea2f0289e231e9a8da3",
+      "artifact_sha256": "1a7ea3520c63f4f7fb5339d4b5cd8fc8df53aa91ab28e766fd43ba3e7b968e14"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/on-full.json",
+      "artifact": "on-full.json.gz",
+      "original_sha256": "9d4fb491d1c0c316d16528179f99ceda04dd8abb13270f7cdea3ac4ef0567774",
+      "artifact_sha256": "cdf8151f333a16c8309e9d879f194a28c15a0c0875e3bad52e6c6fcf8f7acc85"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/on-full.log",
+      "artifact": "on-full.log.gz",
+      "original_sha256": "793af704dbc9f0928f890548519a7c80ffb320acdb385d27d0b21a5b56f9bb44",
+      "artifact_sha256": "38416bd587c015b13887125670355940374d2bbe1d7cdcd2c5c08f4471391e25"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/off-full.json",
+      "artifact": "off-full.json.gz",
+      "original_sha256": "c4c12d5494f0e6285071f381f3528b08d105488883d4b02dc3e5bd16cf857a5f",
+      "artifact_sha256": "667df9ed3affe046ebf0d7bdb0daf46fd579bd139ea2834e7cad4510f44d22ff"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/off-full.log",
+      "artifact": "off-full.log.gz",
+      "original_sha256": "9f86076156d6283d3141aed24fbd9db7615ab8aca388b8cd49518a8d5e32b3d7",
+      "artifact_sha256": "97e793b0138a30eb07748550ebdaa58b6b827901c0376bbf335dc156fbde09a9"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/off-confirm.json",
+      "artifact": "off-confirm.json.gz",
+      "original_sha256": "ae5e358782ac0f8683fae6ef29f52a36ce7360ff75bc2b631692049b0ccb9928",
+      "artifact_sha256": "8dd063405a98732ed218400a1b9a35d942db9c08e4ef865f57b793cf8d022c7b"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/off-confirm.log",
+      "artifact": "off-confirm.log.gz",
+      "original_sha256": "9369904b68d10b68703849b6e2078306499e5e52768a390164e7347b0d6fca76",
+      "artifact_sha256": "626962a10aa5180b8bf6bd3cb7a7daf334cccb3716ebcb4664b210311c788f1e"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/on-confirm.json",
+      "artifact": "on-confirm.json.gz",
+      "original_sha256": "a7e56ef2c8d42f6fedb7a35e3f7e29f83a047694d192e7ea57e80e0f87b88ec5",
+      "artifact_sha256": "74a47d58b19dc9acd2505bcb6bae13ca6f1c064e641e07ff912f38b1fc83d507"
+    },
+    {
+      "source": "/tmp/exl3-linear-cache-ablation-20260911/on-confirm.log",
+      "artifact": "on-confirm.log.gz",
+      "original_sha256": "5af8426f84d6b84aaca341a961f29ad88a4bf7957d6ecccd2109e42e000fd1ea",
+      "artifact_sha256": "652296c36fd71163f215bf1f227cdeef7c8a24ed000466c03da79bcddf69de08"
+    }
+  ]
+}

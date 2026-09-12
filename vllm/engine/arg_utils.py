@@ -2806,6 +2806,18 @@ class EngineArgs:
         if self.max_num_batched_tokens is None:
             if model_config.quantization == "exl3":
                 self.max_num_batched_tokens = 2048
+                if (
+                    model_config.is_moe
+                    and (
+                        envs.VLLM_EXL3_MOE_PREFILL == "int8"
+                        or (
+                            envs.VLLM_EXL3_MOE_PREFILL == "auto"
+                            and model_config.max_model_len >= 32768
+                        )
+                    )
+                    and current_platform.get_device_capability() == (8, 0)
+                ):
+                    self.max_num_batched_tokens = 6144
             elif parallel_config.use_batched_dp_moe:
                 self.max_num_batched_tokens = (
                     SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP

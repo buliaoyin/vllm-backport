@@ -25,6 +25,7 @@ define_extension_target(
   DESTINATION vllm
   LANGUAGE CUDA
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe.cu" "${CMAKE_CURRENT_LIST_DIR}/decode.cu"
+          "${CMAKE_CURRENT_LIST_DIR}/prefill.cu"
   COMPILE_FLAGS --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda
   ARCHITECTURES ${EXL3_CUDA_ARCHS}
   INCLUDE_DIRECTORIES "${EXL3_VLLM_ROOT}/csrc"

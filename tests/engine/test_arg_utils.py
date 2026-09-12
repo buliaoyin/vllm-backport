@@ -907,6 +907,18 @@ class TestDpDeviceIdSharding:
             )
 
 
+@pytest.mark.parametrize("context_limit", [16384, 24576, 65536])
+@pytest.mark.parametrize(
+    "is_moe,prefill,capability",
+    [
+        (False, "auto", (8, 0)),
+        (True, "auto", (8, 0)),
+        (True, "int8", (8, 0)),
+        (True, "native", (8, 0)),
+        (True, None, (8, 0)),
+        (True, "auto", (12, 0)),
+    ],
+)
 @pytest.mark.parametrize(
     "quantization,explicit,expected",
     [
@@ -918,9 +930,31 @@ class TestDpDeviceIdSharding:
     ],
 )
 def test_exl3_chunk_default_preserves_explicit_and_other_backends(
-    quantization, explicit, expected, monkeypatch
+    quantization,
+    explicit,
+    expected,
+    is_moe,
+    prefill,
+    capability,
+    context_limit,
+    monkeypatch,
 ):
     """EXL3 changes the implicit token budget, preserving caller overrides."""
+    from vllm.platforms import current_platform
+
+    if prefill is None:
+        monkeypatch.delenv("VLLM_EXL3_MOE_PREFILL", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", prefill)
+    monkeypatch.setattr(current_platform, "get_device_capability", lambda: capability)
+    if (
+        quantization == "exl3"
+        and explicit is None
+        and is_moe
+        and (prefill == "int8" or (prefill == "auto" and context_limit >= 32768))
+        and capability == (8, 0)
+    ):
+        expected = 6144
     from types import SimpleNamespace
 
     from vllm.usage.usage_lib import UsageContext
@@ -935,7 +969,10 @@ def test_exl3_chunk_default_preserves_explicit_and_other_backends(
         ),
     )
     model = SimpleNamespace(
-        quantization=quantization, max_model_len=65536, is_multimodal_model=False
+        quantization=quantization,
+        max_model_len=context_limit,
+        is_multimodal_model=False,
+        is_moe=is_moe,
     )
     args._set_default_max_num_seqs_and_batched_tokens_args(
         UsageContext.LLM_CLASS, model, SimpleNamespace(use_batched_dp_moe=False)

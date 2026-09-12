@@ -1,0 +1,90 @@
+{
+  "scope": "Completed unpadded teacher-forced full-vocabulary diagnostics only. Failed request-ID probe and excluded padded-decode probe are not included.",
+  "inputs_and_native_targets": "../exl3-adaptive-prefill-20260912",
+  "files": {
+    "analyze.py.gz": {
+      "bytes": 2016,
+      "sha256": "badf7488db07a858b1d8dea02dfa5ecc924a765eaf5f429d6d29ff681735e0f8"
+    },
+    "archive.py.gz": {
+      "bytes": 742,
+      "sha256": "c6ba6f22dea40d54b976ad73672b0434a1c4201f092dced211837274056ce1a4"
+    },
+    "audit.json": {
+      "bytes": 1021,
+      "sha256": "0cb1bacddf5c6be061bf8cba7f5c1d47cea3363bad15ddef421f17cfb7f46a84"
+    },
+    "audit.py.gz": {
+      "bytes": 1414,
+      "sha256": "1b906c53bb5fedd5638b5669f1af878755f43cc626bc683f14aa18af73907f61"
+    },
+    "benchmark_exl3_divergence.py.gz": {
+      "bytes": 2613,
+      "sha256": "cbcbe50487bd82ff79b7aa6bb79d77037f0fcc892e0caf6027f32aeb62abb72d"
+    },
+    "context.py.gz": {
+      "bytes": 820,
+      "sha256": "5339cd9f3281890eec887b37c64bd3ca0ccd76abd115b608e26cf940bba0b140"
+    },
+    "contexts.json": {
+      "bytes": 76769,
+      "sha256": "7b6cc4a2cee5c2ab04326c217ca2c3ddeea67edaa6f877e824b6ba59b5867dba"
+    },
+    "exl3_divergence_worker.py.gz": {
+      "bytes": 2566,
+      "sha256": "eb682c89a22ccc87084b63b564f097764fe243b61c70a4614494444521f5c0aa"
+    },
+    "lint-final.log.gz": {
+      "bytes": 696,
+      "sha256": "f26f25183c21f13e7d637627373cbc396cf5d583648f7f53a8f74a80bad94f21"
+    },
+    "lint.log.gz": {
+      "bytes": 697,
+      "sha256": "4eb87365b799bf3482f28f7f363091795035d72abf83c78e5a995a9d72735f3c"
+    },
+    "metrics-check.json": {
+      "bytes": 1703,
+      "sha256": "c3c4878018870a6c326a8b3e884b525cebb09aca455f7454b3f957ea51132555"
+    },
+    "packages.json": {
+      "bytes": 246,
+      "sha256": "aa5d93bdc03cc76a0dba7a383c9e449e293a548271059db74362061482f6541d"
+    },
+    "positions.csv.gz": {
+      "bytes": 2214884,
+      "sha256": "abd08438de377506e5a71defcfc90e4707c7f4a2fa8f19f11fa9830be9f4d824"
+    },
+    "provenance.json": {
+      "bytes": 1982,
+      "sha256": "4d3132843867284a2aa343f1c2dd29fb7a81b2a5eacc0932ecb75cfba83f10b0"
+    },
+    "report-methods.md.gz": {
+      "bytes": 2166,
+      "sha256": "467449a067f57f7e417e13a15b7447cec6b1f0375d94ad06186504dd9cdac057"
+    },
+    "report.py.gz": {
+      "bytes": 3973,
+      "sha256": "a68d70a333afb7e03852ab3b0098165f70a20cb66703ab882930c19632654c5a"
+    },
+    "results.json.gz": {
+      "bytes": 2874327,
+      "sha256": "05612109110adaacefee9ac1e150b8eef3db0da232457951ddc6685e4b80d1f3"
+    },
+    "run.log.gz": {
+      "bytes": 7966,
+      "sha256": "398234b94cada03ef5641f653e1b658aa8f07cd9992f51205e707cdb9be007dd"
+    },
+    "run.py.gz": {
+      "bytes": 774,
+      "sha256": "a425cc5894ca43af51a0740f74e277d7baf3f20823ad220bfccadce4af656e5d"
+    },
+    "status.json": {
+      "bytes": 793,
+      "sha256": "45ea27e95ecaf1e89a675191ddb649fa0f4a53bd79afaec3935970652be2f90a"
+    },
+    "summary.json": {
+      "bytes": 404102,
+      "sha256": "b01dc7941697975d56a9b11aa1af419ef2954f7a0776f763d46c1fc2296377c4"
+    }
+  }
+}

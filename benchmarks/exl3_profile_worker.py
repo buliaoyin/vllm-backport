@@ -71,6 +71,9 @@ class Exl3ProfileWorkerExtension:
         quantization = self.vllm_config.model_config.quantization
         if quantization == "exl3":
             patch(exl3, "_exl3_moe_fused", "routed_experts_inclusive", routing=True)
+            from vllm.model_executor.layers.quantization.utils import exl3_prefill
+
+            patch(exl3_prefill, "moe_int8", "moe_prefill_int8")
             ext = exl3._extension()
             if any(
                 isinstance(getattr(module, "quant_method", None), exl3.Exl3MoEMethod)
@@ -437,6 +440,7 @@ class Exl3ProfileWorkerExtension:
         layers = []
         decoder_layers = []
         buffers = {}
+        prefill_buffers = {}
         for name, module in self.get_model().named_modules():
             match = re.search(r"(?:^|\.)layers\.(\d+)$", name)
             if match and not isinstance(module, PPMissingLayer):
@@ -454,10 +458,21 @@ class Exl3ProfileWorkerExtension:
                 {
                     "prefix": method.prefix,
                     "capacity": method.workspace[0].shape[1],
+                    "int8_prefill_capacity": (
+                        method.prefill_workspace[1].shape[0]
+                        // method.moe.experts_per_token
+                        if method.prefill_workspace
+                        else 0
+                    ),
+                    "int8_prefill_min_rows": method.prefill_min_rows,
                     "m_tile": method.moe_m_tile,
                     "decode_mode": ("native", "plain", "residual")[method.decode_mode],
                 }
             )
+            for tensor in method.prefill_workspace:
+                prefill_buffers[tensor.data_ptr()] = (
+                    tensor.numel() * tensor.element_size()
+                )
             for tensor in method.workspace:
                 buffers[tensor.data_ptr()] = tensor.numel() * tensor.element_size()
         return {
@@ -466,5 +481,8 @@ class Exl3ProfileWorkerExtension:
             "decoder_layers": decoder_layers,
             "priority": envs.VLLM_EXL3_MOE_PRIORITY,
             "workspace_bytes": sum(buffers.values()),
+            "int8_prefill_workspace_bytes": sum(prefill_buffers.values()),
+            "cuda_allocated_bytes": torch.accelerator.memory_allocated(),
+            "cuda_peak_allocated_bytes": torch.accelerator.max_memory_allocated(),
             "layers": layers,
         }

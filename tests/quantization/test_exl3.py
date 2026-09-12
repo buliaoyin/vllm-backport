@@ -224,6 +224,7 @@ def _check_moe_routing(
         moe_parallel_config=SimpleNamespace(tp_size=1, ep_size=1),
         activation="silu",
         swiglu_limit=10.0,
+        experts_per_token=topk,
     )
     method, layer = Exl3MoEMethod(config, moe, "experts"), nn.Module()
     with torch.device("cuda"):
@@ -270,7 +271,7 @@ def _check_moe_routing(
         )
     relative = (actual.float() - expected).norm() / expected.norm()
     assert relative < relative_limit
-    if rows in (3, 513):
+    if rows in (3, 513, 4097):
         for _ in range(3):
             method.apply(layer, x, routing, ids)
         torch.accelerator.synchronize()
@@ -589,3 +590,146 @@ def test_experimental_batched_int8_prefill(rows, hidden, monkeypatch):
         intermediate_dim=512,
         relative_limit=0.02,
     )
+
+
+@pytest.mark.parametrize("rows", [4095, 4096, 4097, 6145])
+@pytest.mark.parametrize("hidden", [256, 768])
+def test_batched_int8_prefill_routing_and_capacity(rows, hidden, monkeypatch):
+    """Production IMMA matches independent rotations across scratch reuse/tails."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("Native EXL3 INT8 prefill targets SM80")
+    from vllm.model_executor.layers.quantization.utils import exl3_prefill
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", "int8")
+    calls = []
+    original = exl3_prefill.moe_int8
+
+    def observed(x, *args):
+        calls.append(x.shape[0])
+        return original(x, *args)
+
+    monkeypatch.setattr(exl3_prefill, "moe_int8", observed)
+    method = _check_moe_routing(
+        rows,
+        2048,
+        hidden,
+        monkeypatch,
+        relative_limit=0.02,
+        dtype=torch.bfloat16,
+        m_tile=32,
+        intermediate_dim=512,
+    )
+    if rows >= 4096:
+        assert calls and calls[0] == min(rows, 6144)
+    else:
+        assert not calls
+    assert len(method.config.prefill_workspaces) == 1
+
+
+def test_int8_prefill_large_topk_uses_native(monkeypatch):
+    """Unsupported expert fan-out must fall back before allocating an INT8 pool."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("INT8 prefill targets SM80")
+    from vllm.model_executor.layers.quantization.utils import exl3_prefill
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", "int8")
+    monkeypatch.setenv("VLLM_EXL3_MOE_INT8_MIN_TOKENS", "9")
+
+    def unexpected_allocation(*args):
+        raise AssertionError("Unsupported top-k must use native prefill")
+
+    monkeypatch.setattr(exl3_prefill, "allocate_workspace", unexpected_allocation)
+    _check_moe_routing(64, 128, 256, monkeypatch, topk=16, m_tile=32)
+
+
+@pytest.mark.parametrize("policy", ["auto", "int8"])
+def test_int8_prefill_workspace_oom_fallback(policy, monkeypatch):
+    """Auto retains correct native output; an explicit INT8 request reports OOM."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("INT8 prefill targets SM80")
+    from vllm.model_executor.layers.quantization.utils import exl3_prefill
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", policy)
+
+    def unavailable(*args):
+        raise torch.OutOfMemoryError("test workspace reservation failure")
+
+    monkeypatch.setattr(exl3_prefill, "allocate_workspace", unavailable)
+    if policy == "int8":
+        with pytest.raises(torch.OutOfMemoryError, match="workspace reservation"):
+            _check_moe_routing(9, 2048, 256, monkeypatch, m_tile=32)
+    else:
+        method = _check_moe_routing(9, 2048, 256, monkeypatch, m_tile=32)
+        assert not method.prefill_workspace
+        assert method.ptrs[0].device in method.config.prefill_disabled
+
+
+def test_int8_prefill_full_graph_uses_native_arithmetic(monkeypatch):
+    """Padding a decode graph must not enable request-dependent INT8 prefill."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("INT8 prefill targets SM80")
+    from vllm import forward_context
+    from vllm.config import CUDAGraphMode
+    from vllm.model_executor.layers.quantization.utils import exl3_prefill
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", "auto")
+    monkeypatch.setattr(
+        forward_context,
+        "_forward_context",
+        SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL),
+    )
+
+    def unexpected(*args):
+        pytest.fail("FULL graph must retain native arithmetic")
+
+    monkeypatch.setattr(exl3_prefill, "moe_int8", unexpected)
+    _check_moe_routing(4096, 2048, 256, monkeypatch, m_tile=32)
+
+
+def test_int8_prefill_uses_callers_stream(monkeypatch):
+    """Reconstruction, Hadamard and IMMA must share the caller's stream."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("INT8 prefill targets SM80")
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", "int8")
+    with torch.cuda.stream(torch.cuda.Stream()):
+        _check_moe_routing(
+            4096,
+            2048,
+            256,
+            monkeypatch,
+            m_tile=32,
+            dtype=torch.bfloat16,
+            relative_limit=0.02,
+        )
+    torch.accelerator.synchronize()
+
+
+def test_int8_prefill_uses_tensor_device(monkeypatch):
+    """Triton must launch on the input device and restore the caller's device."""
+    if torch.accelerator.device_count() < 2 or torch.cuda.get_device_capability(0) != (
+        8,
+        0,
+    ):
+        pytest.skip("Requires SM80 device 0 and a second CUDA device")
+    from vllm.model_executor.layers.quantization.utils import exl3_prefill
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", "int8")
+    original = exl3_prefill.moe_int8
+
+    def from_other_device(*args):
+        with torch.accelerator.device_index(1):
+            result = original(*args)
+            assert torch.accelerator.current_device_index() == 1
+            return result
+
+    monkeypatch.setattr(exl3_prefill, "moe_int8", from_other_device)
+    with torch.accelerator.device_index(0):
+        _check_moe_routing(
+            4096,
+            2048,
+            256,
+            monkeypatch,
+            m_tile=32,
+            dtype=torch.bfloat16,
+            relative_limit=0.02,
+        )

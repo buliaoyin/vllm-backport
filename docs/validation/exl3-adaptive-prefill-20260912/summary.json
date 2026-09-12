@@ -1,0 +1,2180 @@
+{
+  "native2048": {
+    "resolved_chunk_size": 2048,
+    "cases": {
+      "8k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          3.3900521993637085
+        ],
+        "decode_s": [
+          0.8043660804978572
+        ],
+        "e2e_s": 4.194398358959006,
+        "input_tps": 2416.485595076514,
+        "input_tps_range": [
+          2413.523813604581,
+          2419.4473765484477
+        ],
+        "decode_tps": 38.53966822487355
+      },
+      "16k": {
+        "samples": 2,
+        "prompt_lengths": [
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          5.767034411430359
+        ],
+        "decode_s": [
+          0.8085500455053989
+        ],
+        "e2e_s": 6.57592619600473,
+        "input_tps": 2840.9764339818284,
+        "input_tps_range": [
+          2838.887634055013,
+          2843.065233908643
+        ],
+        "decode_tps": 38.34023654689413
+      },
+      "20k": {
+        "samples": 2,
+        "prompt_lengths": [
+          20480
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          6.999311566352844
+        ],
+        "decode_s": [
+          0.810331018990837
+        ],
+        "e2e_s": 7.809617701539537,
+        "input_tps": 2926.0031036036526,
+        "input_tps_range": [
+          2924.248283574039,
+          2927.7579236332667
+        ],
+        "decode_tps": 38.256067756381896
+      },
+      "24k": {
+        "samples": 2,
+        "prompt_lengths": [
+          24576
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          8.261478543281555
+        ],
+        "decode_s": [
+          0.8113395824912004
+        ],
+        "e2e_s": 9.073091418977128,
+        "input_tps": 2974.7710878606226,
+        "input_tps_range": [
+          2973.1262615692644,
+          2976.415914151981
+        ],
+        "decode_tps": 38.20841592363927
+      },
+      "32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          10.730488538742065
+        ],
+        "decode_s": [
+          0.8142869200091809
+        ],
+        "e2e_s": 11.544941986969206,
+        "input_tps": 3053.729117755015,
+        "input_tps_range": [
+          3052.501164896529,
+          3054.957070613501
+        ],
+        "decode_tps": 38.07014730242999
+      },
+      "64k": {
+        "samples": 2,
+        "prompt_lengths": [
+          65536
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          20.58121359348297
+        ],
+        "decode_s": [
+          0.823586102516856
+        ],
+        "e2e_s": 21.404859416012187,
+        "input_tps": 3184.263226373038,
+        "input_tps_range": [
+          3183.765707529096,
+          3184.76074521698
+        ],
+        "decode_tps": 37.64026669150844
+      },
+      "8k_8k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192,
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          3.476315140724182,
+          5.897165298461914
+        ],
+        "decode_s": [
+          3.9525652790034655,
+          1.5822705934988335
+        ],
+        "e2e_s": 7.481115523492917,
+        "input_tps": 2778.2841356921863,
+        "input_tps_range": [
+          2777.6724179313214,
+          2778.895853453051
+        ]
+      },
+      "8k_8k_8k_8k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192,
+          8192,
+          8192,
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 8,
+        "ttft_s": [
+          3.474262237548828,
+          6.459121346473694,
+          8.883167147636414,
+          10.795395135879517
+        ],
+        "decode_s": [
+          9.557254476036178,
+          6.700771327014081,
+          4.352766441006679,
+          2.491349118499784
+        ],
+        "e2e_s": 13.290467854996677,
+        "input_tps": 3035.3682846749407,
+        "input_tps_range": [
+          3035.301247925996,
+          3035.4353214238854
+        ]
+      },
+      "16k_16k": {
+        "samples": 2,
+        "prompt_lengths": [
+          16384,
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          5.900061011314392,
+          10.761417031288147
+        ],
+        "decode_s": [
+          5.764789731503697,
+          0.9800322639639489
+        ],
+        "e2e_s": 11.743590740516083,
+        "input_tps": 3044.952913031673,
+        "input_tps_range": [
+          3043.435484478139,
+          3046.4703415852064
+        ]
+      },
+      "16k_16k_16k_16k": {
+        "samples": 2,
+        "prompt_lengths": [
+          16384,
+          16384,
+          16384,
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 8,
+        "ttft_s": [
+          5.908028721809387,
+          11.32966423034668,
+          16.182077527046204,
+          20.639398336410522
+        ],
+        "decode_s": [
+          16.639288395497715,
+          11.448896009504097,
+          6.750309678493068,
+          2.369237647508271
+        ],
+        "e2e_s": 23.014414250996197,
+        "input_tps": 3175.2863893683675,
+        "input_tps_range": [
+          3174.9769592842717,
+          3175.5958194524633
+        ]
+      },
+      "32k_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          32768,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          10.800188422203064,
+          20.59176194667816
+        ],
+        "decode_s": [
+          11.125653820461594,
+          1.4878795749973506
+        ],
+        "e2e_s": 22.083308796485653,
+        "input_tps": 3182.632058394178,
+        "input_tps_range": [
+          3182.1179140641493,
+          3183.146202724207
+        ]
+      },
+      "2k_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          2048,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          1.656448483467102,
+          12.558248281478882
+        ],
+        "decode_s": [
+          12.178173103980953,
+          1.4589431869972032
+        ],
+        "e2e_s": 14.018188361485954,
+        "input_tps": 2772.363234489575,
+        "input_tps_range": [
+          2769.9755217506668,
+          2774.750947228483
+        ]
+      },
+      "8k_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          3.4850152730941772,
+          13.280563950538635
+        ],
+        "decode_s": [
+          11.124338461988373,
+          1.4851359400199726
+        ],
+        "e2e_s": 14.767112561006797,
+        "input_tps": 3084.2063996980623,
+        "input_tps_range": [
+          3083.9304680756377,
+          3084.482331320487
+        ]
+      },
+      "8k_8k_8k_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192,
+          8192,
+          8192,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 8,
+        "ttft_s": [
+          3.4899709224700928,
+          6.48281729221344,
+          8.912987470626831,
+          18.342819213867188
+        ],
+        "decode_s": [
+          16.76089181797579,
+          13.897985824994976,
+          11.54357080947375,
+          2.270197800011374
+        ],
+        "e2e_s": 20.61683745647315,
+        "input_tps": 3126.2370158833305,
+        "input_tps_range": [
+          3125.97524783732,
+          3126.4987839293412
+        ]
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "layers": 16
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "layers": 15
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "layers": 14
+      }
+    ]
+  },
+  "int8-6144": {
+    "resolved_chunk_size": 6144,
+    "cases": {
+      "8k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          4.170534372329712
+        ],
+        "decode_s": [
+          0.8031459610210732
+        ],
+        "e2e_s": 4.9739462994621135,
+        "input_tps": 1964.2570724575535,
+        "input_tps_range": [
+          1963.3790655570176,
+          1965.1350793580891
+        ],
+        "decode_tps": 38.59821451276862
+      },
+      "16k": {
+        "samples": 2,
+        "prompt_lengths": [
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          5.90268349647522
+        ],
+        "decode_s": [
+          0.8054741630330682
+        ],
+        "e2e_s": 6.708227964496473,
+        "input_tps": 2775.6892361818836,
+        "input_tps_range": [
+          2773.02932178014,
+          2778.3491505836278
+        ],
+        "decode_tps": 38.48665135768537
+      },
+      "20k": {
+        "samples": 2,
+        "prompt_lengths": [
+          20480
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          6.88361132144928
+        ],
+        "decode_s": [
+          0.8079177895269822
+        ],
+        "e2e_s": 7.6916208320180885,
+        "input_tps": 2975.1838900777984,
+        "input_tps_range": [
+          2973.156584577846,
+          2977.2111955777505
+        ],
+        "decode_tps": 38.37024070173935
+      },
+      "24k": {
+        "samples": 2,
+        "prompt_lengths": [
+          24576
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          7.708918333053589
+        ],
+        "decode_s": [
+          0.8107341910072137
+        ],
+        "e2e_s": 8.519730265514227,
+        "input_tps": 3187.997305406666,
+        "input_tps_range": [
+          3185.8767753563325,
+          3190.1178354569997
+        ],
+        "decode_tps": 38.23695476788825
+      },
+      "32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          9.64173436164856
+        ],
+        "decode_s": [
+          0.8128141210181639
+        ],
+        "e2e_s": 10.45463794999523,
+        "input_tps": 3398.5591729582757,
+        "input_tps_range": [
+          3397.264135268698,
+          3399.8542106478535
+        ],
+        "decode_tps": 38.13911900686195
+      },
+      "64k": {
+        "samples": 2,
+        "prompt_lengths": [
+          65536
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          16.9778333902359
+        ],
+        "decode_s": [
+          0.822853085497627
+        ],
+        "e2e_s": 17.800758601981215,
+        "input_tps": 3860.094872689043,
+        "input_tps_range": [
+          3856.8044773957167,
+          3863.3852679823694
+        ],
+        "decode_tps": 37.67380693327732
+      },
+      "8k_8k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192,
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          4.262579560279846,
+          6.905751585960388
+        ],
+        "decode_s": [
+          3.6048136065073777,
+          0.9865013479720801
+        ],
+        "e2e_s": 7.89362749850261,
+        "input_tps": 2372.5151126693177,
+        "input_tps_range": [
+          2372.4886966210147,
+          2372.5415287176206
+        ]
+      },
+      "8k_8k_8k_8k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192,
+          8192,
+          8192,
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 8,
+        "ttft_s": [
+          4.260858774185181,
+          7.974090218544006,
+          9.312048435211182,
+          10.694099307060242
+        ],
+        "decode_s": [
+          8.378832540503936,
+          4.721583220001776,
+          3.4082612860074732,
+          2.051060565485386
+        ],
+        "e2e_s": 12.748702310491353,
+        "input_tps": 3064.1197000383245,
+        "input_tps_range": [
+          3063.7981178853897,
+          3064.4412821912597
+        ]
+      },
+      "16k_16k": {
+        "samples": 2,
+        "prompt_lengths": [
+          16384,
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          5.994470000267029,
+          10.712312698364258
+        ],
+        "decode_s": [
+          6.248064387502382,
+          1.5801644015009515
+        ],
+        "e2e_s": 12.294558850466274,
+        "input_tps": 3058.9106807078706,
+        "input_tps_range": [
+          3057.42516107441,
+          3060.396200341331
+        ]
+      },
+      "16k_16k_16k_16k": {
+        "samples": 2,
+        "prompt_lengths": [
+          16384,
+          16384,
+          16384,
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 8,
+        "ttft_s": [
+          6.011172771453857,
+          11.108702898025513,
+          15.147620677947998,
+          17.943063855171204
+        ],
+        "decode_s": [
+          13.778193291509524,
+          8.760583112511085,
+          4.751531452027848,
+          1.9804241649981122
+        ],
+        "e2e_s": 19.92963533650618,
+        "input_tps": 3652.442201374347,
+        "input_tps_range": [
+          3651.580639710841,
+          3653.3037630378535
+        ]
+      },
+      "32k_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          32768,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          10.476548433303833,
+          16.931878209114075
+        ],
+        "decode_s": [
+          7.994271482486511,
+          1.5875999410054646
+        ],
+        "e2e_s": 18.523029259522445,
+        "input_tps": 3870.5697604622937,
+        "input_tps_range": [
+          3868.670240794608,
+          3872.469280129979
+        ]
+      },
+      "2k_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          2048,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          1.6501933336257935,
+          11.473426342010498
+        ],
+        "decode_s": [
+          11.305385953484802,
+          1.559591619996354
+        ],
+        "e2e_s": 13.033861182484543,
+        "input_tps": 3034.4903288961323,
+        "input_tps_range": [
+          3033.9098269343103,
+          3035.0708308579538
+        ]
+      },
+      "8k_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          4.275326371192932,
+          14.08882999420166
+        ],
+        "decode_s": [
+          11.29477673798101,
+          1.557961256505223
+        ],
+        "e2e_s": 15.648131182475481,
+        "input_tps": 2907.269193875518,
+        "input_tps_range": [
+          2905.16680138818,
+          2909.3715863628554
+        ]
+      },
+      "8k_8k_8k_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          8192,
+          8192,
+          8192,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 8,
+        "ttft_s": [
+          4.271489381790161,
+          7.990330815315247,
+          9.333718419075012,
+          16.25884437561035
+        ],
+        "decode_s": [
+          13.749948830489302,
+          10.086762382998131,
+          8.774115627486026,
+          1.9002943250234239
+        ],
+        "e2e_s": 18.16296995599987,
+        "input_tps": 3526.9421346729805,
+        "input_tps_range": [
+          3526.0974108979613,
+          3527.7868584479997
+        ]
+      },
+      "decode_then_32k": {
+        "samples": 2,
+        "prompt_lengths": [
+          2048,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          1.6527928113937378,
+          9.838042497634888
+        ],
+        "decode_s": [
+          10.691040208010236,
+          0.9587137580383569
+        ],
+        "e2e_s": 12.527953778509982,
+        "max_output_gaps_s": [
+          6.414843345497502,
+          0.03283748897956684
+        ]
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 57084943360,
+        "cuda_peak_allocated_bytes": 59939529728,
+        "layers": 16
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 62390480896,
+        "cuda_peak_allocated_bytes": 65245067264,
+        "layers": 15
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 59643304960,
+        "cuda_peak_allocated_bytes": 62296564736,
+        "layers": 14
+      }
+    ]
+  },
+  "auto-remaining": {
+    "resolved_chunk_size": 6144,
+    "cases": {
+      "20k": {
+        "samples": 1,
+        "prompt_lengths": [
+          20480
+        ],
+        "checks_passed": true,
+        "checks_total": 1,
+        "ttft_s": [
+          7.718336582183838
+        ],
+        "decode_s": [
+          0.8058866770006716
+        ],
+        "e2e_s": 8.524540125974454,
+        "input_tps": 2653.4214700190437,
+        "input_tps_range": [
+          2653.4214700190437,
+          2653.4214700190437
+        ],
+        "decode_tps": 38.46694688560308
+      },
+      "24k": {
+        "samples": 1,
+        "prompt_lengths": [
+          24576
+        ],
+        "checks_passed": true,
+        "checks_total": 1,
+        "ttft_s": [
+          8.516754388809204
+        ],
+        "decode_s": [
+          0.8085603489889763
+        ],
+        "e2e_s": 9.325567330000922,
+        "input_tps": 2885.6062859218096,
+        "input_tps_range": [
+          2885.6062859218096,
+          2885.6062859218096
+        ],
+        "decode_tps": 38.33974797151801
+      },
+      "64k": {
+        "samples": 1,
+        "prompt_lengths": [
+          65536
+        ],
+        "checks_passed": true,
+        "checks_total": 1,
+        "ttft_s": [
+          17.98630142211914
+        ],
+        "decode_s": [
+          0.8207002560375258
+        ],
+        "e2e_s": 18.80698262999067,
+        "input_tps": 3643.6618325213503,
+        "input_tps_range": [
+          3643.6618325213503,
+          3643.6618325213503
+        ],
+        "decode_tps": 37.772621333972815
+      },
+      "8k_8k_8k_8k": {
+        "samples": 1,
+        "prompt_lengths": [
+          8192,
+          8192,
+          8192,
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 4,
+        "ttft_s": [
+          3.4493186473846436,
+          6.408326625823975,
+          8.812677145004272,
+          10.704388618469238
+        ],
+        "decode_s": [
+          9.486727831012104,
+          6.655962802993599,
+          4.327840403013397,
+          2.4866342279710807
+        ],
+        "e2e_s": 13.194849062012509,
+        "input_tps": 3061.174362024043,
+        "input_tps_range": [
+          3061.174362024043,
+          3061.174362024043
+        ]
+      },
+      "8k_32k": {
+        "samples": 1,
+        "prompt_lengths": [
+          8192,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 2,
+        "ttft_s": [
+          3.4649455547332764,
+          13.175971269607544
+        ],
+        "decode_s": [
+          11.033703529043123,
+          1.4780492369900458
+        ],
+        "e2e_s": 14.655869946000166,
+        "input_tps": 3108.6892314709808,
+        "input_tps_range": [
+          3108.6892314709808,
+          3108.6892314709808
+        ]
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 57084942336,
+        "cuda_peak_allocated_bytes": 59918571008,
+        "layers": 16
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 62390479872,
+        "cuda_peak_allocated_bytes": 65224108544,
+        "layers": 15
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 59643303936,
+        "cuda_peak_allocated_bytes": 62275607552,
+        "layers": 14
+      }
+    ]
+  },
+  "auto-final": {
+    "resolved_chunk_size": 6144,
+    "cases": {
+      "64k": {
+        "samples": 3,
+        "prompt_lengths": [
+          65536
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          16.891350507736206
+        ],
+        "decode_s": [
+          0.8181906060199253
+        ],
+        "e2e_s": 17.709514508023858,
+        "input_tps": 3879.855549145383,
+        "input_tps_range": [
+          3870.899926927195,
+          3894.9337440199674
+        ],
+        "decode_tps": 37.888481940411154
+      },
+      "8k": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          3.4505155086517334
+        ],
+        "decode_s": [
+          0.8084827399579808
+        ],
+        "e2e_s": 4.258938242972363,
+        "input_tps": 2374.1380032808406,
+        "input_tps_range": [
+          2373.7769959084508,
+          2377.454527237907
+        ],
+        "decode_tps": 38.34342833541648
+      },
+      "16k": {
+        "samples": 3,
+        "prompt_lengths": [
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          5.854732036590576
+        ],
+        "decode_s": [
+          0.813129530986771
+        ],
+        "e2e_s": 6.667835173022468,
+        "input_tps": 2798.4201322288013,
+        "input_tps_range": [
+          2796.784761151257,
+          2799.1040491759727
+        ],
+        "decode_tps": 38.124307159746174
+      },
+      "20k": {
+        "samples": 3,
+        "prompt_lengths": [
+          20480
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          7.087729215621948
+        ],
+        "decode_s": [
+          0.8135157949873246
+        ],
+        "e2e_s": 7.901578443008475,
+        "input_tps": 2889.5009074077443,
+        "input_tps_range": [
+          2888.1103867730394,
+          2892.4262108338853
+        ],
+        "decode_tps": 38.10620542466912
+      },
+      "24k": {
+        "samples": 3,
+        "prompt_lengths": [
+          24576
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          7.787034511566162
+        ],
+        "decode_s": [
+          0.81289594899863
+        ],
+        "e2e_s": 8.600982574978843,
+        "input_tps": 3156.015292278083,
+        "input_tps_range": [
+          3152.9195392848414,
+          3156.071821204782
+        ],
+        "decode_tps": 38.135262007625336
+      },
+      "32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          9.7182035446167
+        ],
+        "decode_s": [
+          0.8135275759850629
+        ],
+        "e2e_s": 10.531234266993124,
+        "input_tps": 3371.816596509908,
+        "input_tps_range": [
+          3370.6061548659154,
+          3372.995623612838
+        ],
+        "decode_tps": 38.105653594426144
+      },
+      "8k_8k": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192,
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 6,
+        "ttft_s": [
+          3.4673848152160645,
+          5.881497383117676
+        ],
+        "decode_s": [
+          3.945353557006456,
+          1.5826829080469906
+        ],
+        "e2e_s": 7.465169799979776,
+        "input_tps": 2785.6851636164697,
+        "input_tps_range": [
+          2785.4521090718717,
+          2787.10058768037
+        ]
+      },
+      "8k_8k_8k_8k": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192,
+          8192,
+          8192,
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 12,
+        "ttft_s": [
+          3.477195978164673,
+          6.467918872833252,
+          8.893570899963379,
+          10.80654525756836
+        ],
+        "decode_s": [
+          9.566128107951954,
+          6.703725185012445,
+          4.353893588006031,
+          2.4918156049679965
+        ],
+        "e2e_s": 13.302098490006756,
+        "input_tps": 3032.236410341311,
+        "input_tps_range": [
+          3029.580126667128,
+          3034.2400719886887
+        ]
+      },
+      "16k_16k": {
+        "samples": 3,
+        "prompt_lengths": [
+          16384,
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 6,
+        "ttft_s": [
+          5.908449172973633,
+          10.777570486068726
+        ],
+        "decode_s": [
+          5.770831135974731,
+          0.9797854329808615
+        ],
+        "e2e_s": 11.759765781986061,
+        "input_tps": 3040.3883734610213,
+        "input_tps_range": [
+          3039.410343534491,
+          3041.648583252419
+        ]
+      },
+      "16k_16k_16k_16k": {
+        "samples": 3,
+        "prompt_lengths": [
+          16384,
+          16384,
+          16384,
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 12,
+        "ttft_s": [
+          5.920899868011475,
+          11.354110479354858,
+          16.21716570854187,
+          20.68121862411499
+        ],
+        "decode_s": [
+          16.66983359999722,
+          11.46572868200019,
+          6.755899589974433,
+          2.3676561239990406
+        ],
+        "e2e_s": 23.054908043006435,
+        "input_tps": 3168.86549052689,
+        "input_tps_range": [
+          3167.3034788509963,
+          3169.2639168703863
+        ]
+      },
+      "32k_32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          32768,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 6,
+        "ttft_s": [
+          9.772136688232422,
+          19.559151887893677
+        ],
+        "decode_s": [
+          11.120449661975726,
+          1.487035800004378
+        ],
+        "e2e_s": 21.05021757702343,
+        "input_tps": 3350.656530284635,
+        "input_tps_range": [
+          3348.509349475233,
+          3353.5308032104153
+        ]
+      },
+      "2k_32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          2048,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 6,
+        "ttft_s": [
+          1.6539397239685059,
+          12.55141568183899
+        ],
+        "decode_s": [
+          12.172606329026166,
+          1.4570194740081206
+        ],
+        "e2e_s": 14.009370683052111,
+        "input_tps": 2773.870365107602,
+        "input_tps_range": [
+          2771.053383346645,
+          2773.9523541799
+        ]
+      },
+      "8k_32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 6,
+        "ttft_s": [
+          3.487354278564453,
+          13.290735960006714
+        ],
+        "decode_s": [
+          11.12935997598106,
+          1.4829700870322995
+        ],
+        "e2e_s": 14.77503782795975,
+        "input_tps": 3081.845890494939,
+        "input_tps_range": [
+          3081.6307389374488,
+          3083.9617463046616
+        ]
+      },
+      "8k_8k_8k_32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192,
+          8192,
+          8192,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 12,
+        "ttft_s": [
+          3.4894092082977295,
+          6.489417314529419,
+          8.922948837280273,
+          18.37961435317993
+        ],
+        "decode_s": [
+          16.794157163007185,
+          13.922766633040737,
+          11.565879712055903,
+          2.264510851004161
+        ],
+        "e2e_s": 20.647746350965463,
+        "input_tps": 3119.978411847291,
+        "input_tps_range": [
+          3118.020833728458,
+          3120.616260441776
+        ]
+      },
+      "decode_then_32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          2048,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 6,
+        "ttft_s": [
+          1.6515390872955322,
+          10.88487958908081
+        ],
+        "decode_s": [
+          12.028157424007077,
+          1.3552240070421249
+        ],
+        "e2e_s": 13.969970608013682,
+        "max_output_gaps_s": [
+          2.847158060001675,
+          0.05233497801236808
+        ]
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 57084945408,
+        "cuda_peak_allocated_bytes": 59918583296,
+        "layers": 16
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 62390482944,
+        "cuda_peak_allocated_bytes": 65224120832,
+        "layers": 15
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 59643307008,
+        "cuda_peak_allocated_bytes": 62275619840,
+        "layers": 14
+      }
+    ],
+    "profile": [
+      {
+        "moe_runner_inclusive": {
+          "calls": 143,
+          "total_ms": 6797.340679168701
+        },
+        "moe_prefill_int8": {
+          "calls": 143,
+          "total_ms": 6339.996692657471
+        }
+      },
+      {
+        "moe_runner_inclusive": {
+          "calls": 165,
+          "total_ms": 7972.44620513916
+        },
+        "moe_prefill_int8": {
+          "calls": 165,
+          "total_ms": 7439.589359283447
+        }
+      },
+      {
+        "moe_runner_inclusive": {
+          "calls": 154,
+          "total_ms": 7313.942535400391
+        },
+        "moe_prefill_int8": {
+          "calls": 154,
+          "total_ms": 6826.283012390137
+        }
+      }
+    ]
+  },
+  "native-confirm": {
+    "resolved_chunk_size": 2048,
+    "cases": {
+      "64k": {
+        "samples": 3,
+        "prompt_lengths": [
+          65536
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          20.3946270942688
+        ],
+        "decode_s": [
+          0.8212135969661176
+        ],
+        "e2e_s": 21.216079324949533,
+        "input_tps": 3213.395356388576,
+        "input_tps_range": [
+          3195.863350130191,
+          3234.3232810511017
+        ],
+        "decode_tps": 37.74900965415826
+      },
+      "8k": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          3.466522216796875
+        ],
+        "decode_s": [
+          0.809383938962128
+        ],
+        "e2e_s": 4.27617652900517,
+        "input_tps": 2363.175392416653,
+        "input_tps_range": [
+          2362.008655356528,
+          2364.2276129988645
+        ],
+        "decode_tps": 38.30073529720797
+      },
+      "decode_then_32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          2048,
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 6,
+        "ttft_s": [
+          1.6523571014404297,
+          10.854120969772339
+        ],
+        "decode_s": [
+          11.997976501006633,
+          1.3542518590111285
+        ],
+        "e2e_s": 13.939015401003417,
+        "max_output_gaps_s": [
+          2.842413126025349,
+          0.05216962599661201
+        ]
+      }
+    },
+    "accuracy": {
+      "correct": 64,
+      "total": 64,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 53603619840,
+        "cuda_peak_allocated_bytes": 54564303872,
+        "layers": 16
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 58774939648,
+        "cuda_peak_allocated_bytes": 59735623680,
+        "layers": 15
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 56027762176,
+        "cuda_peak_allocated_bytes": 56921340416,
+        "layers": 14
+      }
+    ]
+  },
+  "int8-accuracy": {
+    "resolved_chunk_size": 6144,
+    "cases": {},
+    "accuracy": {
+      "correct": 61,
+      "total": 64,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 57084945408,
+        "cuda_peak_allocated_bytes": 57387100672,
+        "layers": 16
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 62390482944,
+        "cuda_peak_allocated_bytes": 62692638208,
+        "layers": 15
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 59643305472,
+        "cuda_peak_allocated_bytes": 59945460736,
+        "layers": 14
+      }
+    ],
+    "profile": [
+      {
+        "moe_runner_inclusive": {
+          "calls": 13,
+          "total_ms": 1144.1377487182617
+        },
+        "moe_prefill_int8": {
+          "calls": 13,
+          "total_ms": 1133.2638492584229
+        }
+      },
+      {
+        "moe_runner_inclusive": {
+          "calls": 15,
+          "total_ms": 1138.0695095062256
+        },
+        "moe_prefill_int8": {
+          "calls": 15,
+          "total_ms": 1126.3651752471924
+        }
+      },
+      {
+        "moe_runner_inclusive": {
+          "calls": 14,
+          "total_ms": 1113.6583728790283
+        },
+        "moe_prefill_int8": {
+          "calls": 14,
+          "total_ms": 1103.4695377349854
+        }
+      }
+    ]
+  },
+  "mixed-auto": {
+    "resolved_chunk_size": 6144,
+    "cases": {
+      "64k": {
+        "samples": 3,
+        "prompt_lengths": [
+          65536
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          13.898692607879639
+        ],
+        "decode_s": [
+          0.699404869985301
+        ],
+        "e2e_s": 14.598435423045885,
+        "input_tps": 4715.263647376835,
+        "input_tps_range": [
+          4701.914386224531,
+          4734.328353799769
+        ],
+        "decode_tps": 44.32339740592814
+      },
+      "8k": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          2.873228073120117
+        ],
+        "decode_s": [
+          0.6892678959993646
+        ],
+        "e2e_s": 3.5623780280002393,
+        "input_tps": 2851.1485310332787,
+        "input_tps_range": [
+          2848.6448080980394,
+          2855.6315475887222
+        ],
+        "decode_tps": 44.97525589096722
+      },
+      "16k": {
+        "samples": 3,
+        "prompt_lengths": [
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          4.7332799434661865
+        ],
+        "decode_s": [
+          0.6905203000060283
+        ],
+        "e2e_s": 5.424023545056116,
+        "input_tps": 3461.4474942722227,
+        "input_tps_range": [
+          3461.2110843610644,
+          3469.2307500779348
+        ],
+        "decode_tps": 44.893683791380745
+      },
+      "20k": {
+        "samples": 3,
+        "prompt_lengths": [
+          20480
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          5.666716814041138
+        ],
+        "decode_s": [
+          0.6918871679808944
+        ],
+        "e2e_s": 6.359655136009678,
+        "input_tps": 3614.085664075206,
+        "input_tps_range": [
+          3612.246707983963,
+          3618.0747214356093
+        ],
+        "decode_tps": 44.80499340732971
+      },
+      "24k": {
+        "samples": 3,
+        "prompt_lengths": [
+          24576
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          6.810365200042725
+        ],
+        "decode_s": [
+          0.6913099730154499
+        ],
+        "e2e_s": 7.5018111349781975,
+        "input_tps": 3608.6170532889814,
+        "input_tps_range": [
+          3605.921140548808,
+          3610.3863039085777
+        ],
+        "decode_tps": 44.8424024099927
+      },
+      "32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          8.17325735092163
+        ],
+        "decode_s": [
+          0.692944849957712
+        ],
+        "e2e_s": 8.866521295974962,
+        "input_tps": 4009.1726704659586,
+        "input_tps_range": [
+          4008.9146956894388,
+          4012.5366294774326
+        ],
+        "decode_tps": 44.7366049432243
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 37515078144,
+        "cuda_peak_allocated_bytes": 40348734464,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 47853071360,
+        "cuda_peak_allocated_bytes": 50686727680,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 47853071360,
+        "cuda_peak_allocated_bytes": 50686727680,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pp_rank": 3,
+        "workspace_bytes": 1157627904,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 49483757568,
+        "cuda_peak_allocated_bytes": 52139485184,
+        "layers": 12
+      }
+    ],
+    "profile": [
+      {
+        "moe_runner_inclusive": {
+          "calls": 88,
+          "total_ms": 4153.997314453125
+        },
+        "moe_prefill_int8": {
+          "calls": 88,
+          "total_ms": 3873.223678588867
+        }
+      },
+      {
+        "moe_runner_inclusive": {
+          "calls": 121,
+          "total_ms": 5816.329204559326
+        },
+        "moe_prefill_int8": {
+          "calls": 121,
+          "total_ms": 5426.534385681152
+        }
+      },
+      {
+        "moe_runner_inclusive": {
+          "calls": 121,
+          "total_ms": 5711.036426544189
+        },
+        "moe_prefill_int8": {
+          "calls": 121,
+          "total_ms": 5330.183181762695
+        }
+      },
+      {
+        "moe_runner_inclusive": {
+          "calls": 132,
+          "total_ms": 7021.158096313477
+        }
+      }
+    ]
+  },
+  "mixed-native": {
+    "resolved_chunk_size": 2048,
+    "cases": {
+      "64k": {
+        "samples": 3,
+        "prompt_lengths": [
+          65536
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          16.028932809829712
+        ],
+        "decode_s": [
+          0.6988239010097459
+        ],
+        "e2e_s": 16.727923491969705,
+        "input_tps": 4088.606570227194,
+        "input_tps_range": [
+          4068.880582211982,
+          4108.769053223763
+        ],
+        "decode_tps": 44.360245771799484
+      },
+      "8k": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          2.8821492195129395
+        ],
+        "decode_s": [
+          0.6887677059858106
+        ],
+        "e2e_s": 3.570979090000037,
+        "input_tps": 2842.323341393262,
+        "input_tps_range": [
+          2839.8700599129534,
+          2847.518245305454
+        ],
+        "decode_tps": 45.00791737270945
+      },
+      "16k": {
+        "samples": 3,
+        "prompt_lengths": [
+          16384
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          4.7465455532073975
+        ],
+        "decode_s": [
+          0.69019642600324
+        ],
+        "e2e_s": 5.43872050702339,
+        "input_tps": 3451.7734669013744,
+        "input_tps_range": [
+          3448.7758652506036,
+          3460.7618899126887
+        ],
+        "decode_tps": 44.914750108912436
+      },
+      "20k": {
+        "samples": 3,
+        "prompt_lengths": [
+          20480
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          5.68475866317749
+        ],
+        "decode_s": [
+          0.6907618840341456
+        ],
+        "e2e_s": 6.375642671016976,
+        "input_tps": 3602.6155573951355,
+        "input_tps_range": [
+          3602.3068996780084,
+          3607.2457192606676
+        ],
+        "decode_tps": 44.87798287154422
+      },
+      "24k": {
+        "samples": 3,
+        "prompt_lengths": [
+          24576
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          6.648707628250122
+        ],
+        "decode_s": [
+          0.691796880972106
+        ],
+        "e2e_s": 7.339690752036404,
+        "input_tps": 3696.3574538271846,
+        "input_tps_range": [
+          3694.804895718284,
+          3697.055854482085
+        ],
+        "decode_tps": 44.8108409457399
+      },
+      "32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          8.547235012054443
+        ],
+        "decode_s": [
+          0.6923408689908683
+        ],
+        "e2e_s": 9.23959107400151,
+        "input_tps": 3833.7544192696496,
+        "input_tps_range": [
+          3833.5793670635285,
+          3838.3832159942044
+        ],
+        "decode_tps": 44.775632045504565
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 34033718272,
+        "cuda_peak_allocated_bytes": 34983969280,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 44237493760,
+        "cuda_peak_allocated_bytes": 45187744768,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 44237493760,
+        "cuda_peak_allocated_bytes": 45187744768,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pp_rank": 3,
+        "workspace_bytes": 1157627904,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 49291125248,
+        "cuda_peak_allocated_bytes": 50174268928,
+        "layers": 12
+      }
+    ]
+  },
+  "dense-native": {
+    "resolved_chunk_size": 2048,
+    "cases": {
+      "p8192_b1": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          1.8591375350952148
+        ],
+        "decode_s": [
+          0.44864825200056657
+        ],
+        "e2e_s": 2.307615843019448,
+        "input_tps": 4406.344256602,
+        "input_tps_range": [
+          4393.2509087040735,
+          4420.50181157043
+        ],
+        "decode_tps": 69.09644663000013
+      },
+      "p32768_b1": {
+        "samples": 3,
+        "prompt_lengths": [
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          8.294532060623169
+        ],
+        "decode_s": [
+          0.48091505601769313
+        ],
+        "e2e_s": 8.775438621989451,
+        "input_tps": 3950.5543845638153,
+        "input_tps_range": [
+          3927.6255600066825,
+          3977.1945474400536
+        ],
+        "decode_tps": 64.46044808141647
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pp_rank": 0,
+        "workspace_bytes": 0,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 20038794240,
+        "cuda_peak_allocated_bytes": 20586216960,
+        "layers": 64
+      }
+    ]
+  },
+  "dense-auto": {
+    "resolved_chunk_size": 2048,
+    "cases": {
+      "p8192_b1": {
+        "samples": 3,
+        "prompt_lengths": [
+          8192
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          1.8567776679992676
+        ],
+        "decode_s": [
+          0.44836108095478266
+        ],
+        "e2e_s": 2.305342687992379,
+        "input_tps": 4411.944489200541,
+        "input_tps_range": [
+          4397.259085125109,
+          4421.235573357298
+        ],
+        "decode_tps": 69.14070225271483
+      },
+      "p32768_b1": {
+        "samples": 3,
+        "prompt_lengths": [
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          8.292998790740967
+        ],
+        "decode_s": [
+          0.4808888460393064
+        ],
+        "e2e_s": 8.774037685012445,
+        "input_tps": 3951.2847917673735,
+        "input_tps_range": [
+          3927.7263547301172,
+          3977.97997287173
+        ],
+        "decode_tps": 64.46396138176628
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pp_rank": 0,
+        "workspace_bytes": 0,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 20038794240,
+        "cuda_peak_allocated_bytes": 20586216960,
+        "layers": 64
+      }
+    ]
+  },
+  "auto32-confirm": {
+    "resolved_chunk_size": 6144,
+    "cases": {
+      "64k": {
+        "samples": 3,
+        "prompt_lengths": [
+          65536
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          16.87604284286499
+        ],
+        "decode_s": [
+          0.8210732289589942
+        ],
+        "e2e_s": 17.697367449000012,
+        "input_tps": 3883.3748296454414,
+        "input_tps_range": [
+          3868.3043834394725,
+          3903.582966922307
+        ],
+        "decode_tps": 37.755463101998416
+      },
+      "24k": {
+        "samples": 3,
+        "prompt_lengths": [
+          24576
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          8.312929391860962
+        ],
+        "decode_s": [
+          0.8136779890046455
+        ],
+        "e2e_s": 9.126435788988601,
+        "input_tps": 2956.3585640534748,
+        "input_tps_range": [
+          2952.6320117416426,
+          2961.7230895972016
+        ],
+        "decode_tps": 38.09860954690642
+      },
+      "32k": {
+        "samples": 3,
+        "prompt_lengths": [
+          32768
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          9.735140085220337
+        ],
+        "decode_s": [
+          0.8155225520022213
+        ],
+        "e2e_s": 10.550997529993765,
+        "input_tps": 3365.9505372447197,
+        "input_tps_range": [
+          3364.220645501044,
+          3366.970883000962
+        ],
+        "decode_tps": 38.01243745361877
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 57084945408,
+        "cuda_peak_allocated_bytes": 59918583296,
+        "layers": 16
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 62390482944,
+        "cuda_peak_allocated_bytes": 65224120832,
+        "layers": 15
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 59643307008,
+        "cuda_peak_allocated_bytes": 62275619840,
+        "layers": 14
+      }
+    ]
+  },
+  "mixed-auto32-confirm": {
+    "resolved_chunk_size": 6144,
+    "cases": {
+      "24k": {
+        "samples": 3,
+        "prompt_lengths": [
+          24576
+        ],
+        "checks_passed": true,
+        "checks_total": 3,
+        "ttft_s": [
+          6.540415525436401
+        ],
+        "decode_s": [
+          0.6903872650000267
+        ],
+        "e2e_s": 7.230872377986088,
+        "input_tps": 3757.5594248440652,
+        "input_tps_range": [
+          3751.443472544196,
+          3768.187688760388
+        ],
+        "decode_tps": 44.90233463387944
+      }
+    },
+    "accuracy": {
+      "correct": 0,
+      "total": 0,
+      "truncated": 0
+    },
+    "ranks": [
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 0,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 37515076608,
+        "cuda_peak_allocated_bytes": 38465286656,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 1,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 47853069824,
+        "cuda_peak_allocated_bytes": 48803279872,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA CMP 170HX",
+        "pp_rank": 2,
+        "workspace_bytes": 402653184,
+        "int8_prefill_workspace_bytes": 3422945280,
+        "cuda_allocated_bytes": 47853069824,
+        "cuda_peak_allocated_bytes": 48803279872,
+        "layers": 11
+      },
+      {
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pp_rank": 3,
+        "workspace_bytes": 1157627904,
+        "int8_prefill_workspace_bytes": 0,
+        "cuda_allocated_bytes": 49483756032,
+        "cuda_peak_allocated_bytes": 50366858752,
+        "layers": 12
+      }
+    ]
+  }
+}

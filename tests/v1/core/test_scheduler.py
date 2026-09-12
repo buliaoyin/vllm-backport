@@ -6180,3 +6180,124 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "length,count,max_seqs,cap,expected",
+    [
+        (8192, 1, 4, 6144, 2048),
+        (16384, 1, 4, 6144, 2048),
+        (16385, 1, 4, 6144, 2048),
+        (24576, 1, 4, 6144, 2048),
+        (32767, 1, 4, 6144, 2048),
+        (32768, 1, 4, 6144, 6144),
+        (8192, 2, 4, 6144, 2048),
+        (8192, 4, 4, 6144, 2048),
+        (8192, 4, 1, 6144, 2048),
+        (32768, 1, 4, 1024, 1024),
+    ],
+)
+def test_exl3_adaptive_budget_preserves_short_requests(
+    async_scheduling, length, count, max_seqs, cap, expected, monkeypatch
+):
+    """Aggregating short prompts must not delay their first tokens with INT8."""
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    scheduler = create_scheduler(
+        max_num_seqs=max_seqs,
+        max_num_batched_tokens=cap,
+        max_model_len=65536,
+        async_scheduling=async_scheduling,
+    )
+    scheduler.exl3_prefill_auto = True
+    for request in create_requests(count, num_tokens=length):
+        scheduler.add_request(request)
+    result = scheduler.schedule()
+    assert sum(result.num_scheduled_tokens.values()) == expected
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_exl3_adaptive_budget_protects_decode(async_scheduling, monkeypatch):
+    """A newly arriving long prefill must not lengthen an active decode step."""
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=6144,
+        max_model_len=65536,
+        async_scheduling=async_scheduling,
+    )
+    scheduler.exl3_prefill_auto = True
+    short = create_requests(1, num_tokens=32, req_ids=["short"])[0]
+    scheduler.add_request(short)
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"short": 32}
+    short.append_output_token_ids(10)
+    long = create_requests(1, num_tokens=32768, req_ids=["long"])[0]
+    scheduler.add_request(long)
+    result = scheduler.schedule()
+    assert sum(result.num_scheduled_tokens.values()) <= 2048
+    assert result.num_scheduled_tokens.get("long", 0) > 0
+
+
+def test_exl3_adaptive_budget_retains_plan_until_small_tail(monkeypatch):
+    """A long prompt must not oscillate between native and INT8 mid-prefill."""
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=6144,
+        max_model_len=65536,
+    )
+    scheduler.exl3_prefill_auto = True
+    request = create_requests(1, num_tokens=32768)[0]
+    scheduler.add_request(request)
+    scheduled = []
+    while request.num_computed_tokens < request.num_prompt_tokens:
+        output = scheduler.schedule()
+        scheduled.append(output.num_scheduled_tokens[request.request_id])
+    assert scheduled == [6144] * 5 + [2048]
+
+
+def test_exl3_adaptive_budget_uses_uncached_prompt_work(monkeypatch):
+    """A 32K prompt with a 24K cache hit needs the short native chunk policy."""
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=6144,
+        max_model_len=65536,
+        enable_prefix_caching=True,
+    )
+    scheduler.exl3_prefill_auto = True
+    warm = create_requests(1, num_tokens=24576, same_prompt=True, req_ids=["warm"])[0]
+    scheduler.add_request(warm)
+    while warm.num_computed_tokens < warm.num_prompt_tokens:
+        scheduler.schedule()
+    scheduler.kv_cache_manager.cache_blocks(warm, warm.num_prompt_tokens)
+    scheduler.finish_requests("warm", RequestStatus.FINISHED_STOPPED)
+    request = create_requests(
+        1, num_tokens=32768, same_prompt=True, req_ids=["cached"]
+    )[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"cached": 2048}
+    assert request.num_computed_tokens == 24576 + 2048
+    assert "cached" not in scheduler.exl3_int8_prefill_requests
+    assert "warm" not in scheduler.exl3_int8_prefill_requests
+
+
+def test_exl3_chunk_plan_does_not_survive_request_id_reuse(monkeypatch):
+    """A new short request cannot inherit a finished long request's chunk plan."""
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=6144,
+        max_model_len=65536,
+    )
+    scheduler.exl3_prefill_auto = True
+    long = create_requests(1, num_tokens=32768, req_ids=["reused"])[0]
+    scheduler.add_request(long)
+    scheduler.schedule()
+    assert "reused" in scheduler.exl3_int8_prefill_requests
+    scheduler.finish_requests("reused", RequestStatus.FINISHED_ABORTED)
+    short = create_requests(1, num_tokens=8192, req_ids=["reused"])[0]
+    scheduler.add_request(short)
+    assert scheduler.schedule().num_scheduled_tokens == {"reused": 2048}

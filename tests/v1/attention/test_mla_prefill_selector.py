@@ -473,3 +473,33 @@ class TestMLAPrefillBackendConfig:
             mla_prefill_backend=MLAPrefillBackendEnum.TRTLLM_RAGGED,
         )
         assert config.mla_prefill_backend == MLAPrefillBackendEnum.TRTLLM_RAGGED
+
+
+@pytest.mark.parametrize("dense_prefill", [False, True])
+def test_profile_reserves_context_projection_only_for_dense_prefill(
+    dense_prefill, monkeypatch
+):
+    """Sparse MQA must not reserve a dense projection it can never execute."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+    layer = SimpleNamespace(
+        prefill_backend=object() if dense_prefill else None,
+        chunked_prefill_workspace_size=65536,
+        num_heads=32,
+        qk_nope_head_dim=256,
+        v_head_dim=256,
+    )
+    output = torch.ones(1, 32 * 256, dtype=torch.bfloat16)
+    x = torch.zeros(1, 512, dtype=torch.bfloat16)
+    allocations = []
+
+    def reserve(shape, **kwargs):
+        allocations.append(shape)
+        return x
+
+    monkeypatch.setattr(torch, "empty", reserve)
+    result = MLAAttention.forward_impl(layer, x, x, x, x, None, output)
+    assert torch.count_nonzero(result) == 0
+    assert allocations == ([(65536, 32, 512)] if dense_prefill else [])

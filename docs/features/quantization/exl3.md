@@ -1,6 +1,6 @@
 # EXL3
 
-EXL3 is an experimental weight-only quantization backend using the MIT-licensed
+EXL3 is a weight-only quantization backend using the MIT-licensed
 [ExLlamaV3](https://github.com/turboderp-org/exllamav3) CUDA extension. Weights stay
 in their original trellis representation. Each matrix retains its own bit width,
 codebook and Hadamard sign/scale vectors, including separately quantized matrices
@@ -70,8 +70,10 @@ Shared experts run serially because upstream GEMMs share a device-wide lock
 workspace. Dual batch overlap is explicitly rejected.
 Do not infer support for those features from model architecture support alone.
 
-The prefill kernels compute EXL3 products with FP16 operands; BF16 inputs and
-outputs are converted at the operation boundary. Large linear prefill batches temporarily
+Native prefill computes EXL3 products with FP16 operands; BF16 inputs and
+outputs are converted at the operation boundary. Supported large SM80 MoE
+prefills can instead reconstruct one INT8 expert projection and use grouped
+INT8 Tensor Core GEMMs, with INT32 accumulation and affine codebook scaling. Large linear prefill batches temporarily
 reconstruct bounded column slices, then use GEMM. The entire model is never
 permanently expanded to FP16. MoE batches are divided by the allocated expert
 workspace capacity, which defaults to the smaller of 2048 tokens and the
@@ -85,15 +87,42 @@ For BF16 activations, uniform 4-bit mul1 weights, dimensions divisible by 256 in
 DP4A on SM80 and INT8 DP4A with activation residual compensation on SM120.
 Other configurations use upstream batched expert GEMMs.
 
-EXL3 defaults `max_num_batched_tokens` to 2048 when no explicit token budget is
-provided. `--max-num-batched-tokens` overrides this scheduler setting. Other
-quantization backends retain their existing defaults. The usual throughput-mode,
-unchunked-prefill and multimodal budget adjustments still apply.
+The default `VLLM_EXL3_MOE_PREFILL=native` keeps native prefill and a 2048-token
+scheduler budget. A concurrent 64-question GSM8K comparison scored 64/64 with
+native prefill and 61/64 with forced INT8 prefill, so the added quantization
+remains opt-in despite its long-input speedup.
+
+Set `VLLM_EXL3_MOE_PREFILL=auto` to enable adaptive prefill. On SM80 MoE models
+with a context limit of at least 32K, the implicit scheduler capacity is 6144.
+After prefix-cache lookup, a request with at least 32768 uncomputed prompt tokens
+selects chunks of up to 6144; that plan remains active until the small tail.
+Short prompts and steps with active decode requests use at most 2048 tokens.
+Several short prompts do not become a long prompt by being submitted together.
+Other EXL3 models keep the 2048 default. Explicit token budgets and existing
+scheduler alignment limits remain upper bounds.
+
+`VLLM_EXL3_MOE_PREFILL=native` disables INT8 prefill and its workspace.
+Set `int8` to use the configured scheduler budget without the adaptive latency
+limits. This can improve bulk throughput but increase short-request TTFT or
+interrupt ongoing output. The worker requires at least 4096 GEMM rows by default;
+smaller batches and tails use native kernels. INT8 prefill supports at most eight
+selected experts per token and 65535 total experts. Unsupported devices and formats
+also use native kernels. FULL CUDA Graphs retain native arithmetic, independently
+of their padding. `VLLM_EXL3_MOE_INT8_MIN_TOKENS` overrides the row threshold
+(range 9–6144); lowering it is useful for numerical evaluations, not a default
+performance recommendation.
+
+The automatic threshold comes from the tested GLM checkpoint and PP layouts.
+See the [concurrent validation](../../validation/exl3-adaptive-prefill-20260912.md)
+for TTFT, aggregate throughput, output gaps and accuracy, and the
+[design](../../design/exl3-adaptive-prefill.md) for cache and lifecycle behavior.
 
 SM80 uses the bundled M=32, FP32-accumulating expert kernel for uniform 4-bit
 mul1 weights with dimensions divisible by 256 in [256, 8192]. Short expert tails
 retain the smaller row path. Other formats and GPU architectures use the upstream
-kernel. `VLLM_EXL3_MOE_M_TILE=16` explicitly selects the upstream implementation.
+kernel. `VLLM_EXL3_MOE_M_TILE=16` selects upstream for native prefill; use
+`VLLM_EXL3_MOE_PREFILL=native` as well to disable the new INT8 path. INT8 uses
+a separate M64 / N128 / K64 grouped GEMM.
 The [component build instructions](../../../csrc/libtorch_stable/quantization/exl3/README.md)
 allow updating `_exl3_C` without rebuilding unrelated extensions.
 
@@ -110,12 +139,24 @@ These settings do not change the scheduler's outer chunk size. In pipeline
 parallelism, increasing the outer chunk can reduce overlap between stages, so
 benchmark both settings together for the intended input length and concurrency.
 
+INT8 prefill supports uniform 4-bit mul1 experts and the same SM80 dimension
+bounds as M32. Its CUDA helpers are included in `_exl3_C`, and its Triton kernels
+are part of vLLM. It needs neither an experimental worker nor an external helper
+library. It introduces activation/codebook rounding and is not lossless.
+
 Workspaces are shared across layers with the same expert dimensions on a device.
 For hidden size 4096 and intermediate size 2048, the default 2048-row workspace
 uses 384 MiB on the tested CMP 170HX and 1104 MiB on the tested RTX PRO 6000
 Blackwell. M32 additionally shares a roughly 4 MiB lock buffer per device.
 For these dimensions, hybrid decode adds a shared 5.25 MiB scratch on SM80
 and 9.25 MiB on SM120.
+INT8 prefill additionally reserves about 3.188 GiB per supported rank for the
+GLM shape (288 experts, top-8, 6144 rows). The bounded pool is allocated before KV
+cache profiling; switching input lengths does not create additional pools. Auto
+falls back to native if that allocation fails, while explicit `int8` reports the
+allocation failure. Model and KV budgets must still fit the device. An auto
+engine configured for a context shorter than 32K does not reserve this pool.
+
 Setting the scheduler token budget to 1024 also caps expert workspace capacity
 at 1024, halving the main workspace. Workspace memory grows
 linearly with capacity and with the extension's number of concurrent expert
@@ -123,8 +164,8 @@ groups. See the [optimization experiments](../../validation/exl3-optimization-20
 for kernel ablations and complete-model measurements.
 
 ExLlamaV3 controls its optional INT8 GEMV path through `EXL3_INT8_GEMV`. Use
-both `EXL3_INT8_GEMV=0` and `VLLM_EXL3_MOE_DECODE=native` to validate without
-activation INT8. Use the same ordinary GEMV setting in both engines when comparing
+`EXL3_INT8_GEMV=0`, `VLLM_EXL3_MOE_DECODE=native` and
+`VLLM_EXL3_MOE_PREFILL=native` to validate without activation INT8. Use the same ordinary GEMV setting in both engines when comparing
 speed or numerical accuracy, and record the expert decode policy separately.
 Set these variables before starting the process. Mode 2 is
 the upstream default and uses approximate INT8 activations; its numerical error
@@ -156,3 +197,15 @@ at 8K, 16K, 32K and 64K, including exact token counts and expected answers.
 The benchmark accepts gzip JSON inputs and configurable context/cache sizes.
 For fixed-length generation, retrieval checks decode only the response before
 the first configured stop token; full generated tokens remain in the results.
+
+For the validated three-CMP-170HX GLM deployment, use PP `16/15/14`,
+`max_num_seqs=4` and an explicit 2 GiB KV cache budget per rank. For the mixed
+four-GPU comparison use PP `11/11/11/12`. These are deployment measurements,
+not hard-coded layer assignments. Adaptive inference requires no benchmark
+worker; the optional profile worker only collects diagnostic intervals.
+
+The complete-engine benchmark also accepts `after_tokens` per input in a case.
+For example, `[0, 4]` admits the second request after the first has produced four
+tokens, and records each output arrival. Warmups use the measured output length
+so the active-decode pattern is the same. Report maximum output gaps as well as
+percentiles: a single multi-second interruption can be invisible at p95.

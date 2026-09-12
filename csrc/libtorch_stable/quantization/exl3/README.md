@@ -43,3 +43,20 @@ cmake --install /tmp/vllm-exl3-build --component _exl3_C
 The component builds SM80 and, with CUDA 12.8 or newer, SM120. M32 runtime
 dispatch remains restricted to SM80. Set `VLLM_EXL3_MOE_M_TILE=16` and
 `VLLM_EXL3_MOE_DECODE=native` to select upstream kernels for both paths.
+
+`prefill.cu` exposes INT8 reconstruction, input Hadamard gathering, fused
+activation/Hadamard, and weighted output scattering through the stable API.
+`prefill_reconstruct.cuh` freezes the validated batched 4-bit mul1 reconstruction
+adaptation from the same ExLlamaV3 commit. The affine integer codebook matches the
+`m64n128k64` prototype documented in `benchmarks/kernels/exl3_prefill_int8`.
+The production caller is `vllm/model_executor/layers/quantization/utils/exl3_prefill.py`;
+it uses grouped Triton IMMA and a caller-owned, bounded INT8 projection buffer.
+No upstream checkout or runtime source extraction is needed to build or run it.
+
+The prefill helpers validate tensor device, type, contiguity, dimensions and
+workspace shapes. Pointer tables contain owned model tensors; routing IDs must
+be valid expert indices. CUDA launches use the current stream for the tensor's
+device. The Python caller also selects the tensor device for Triton launches.
+SM80 is the only enabled INT8-prefill target; other devices retain native MoE.
+To select only upstream kernels, set `VLLM_EXL3_MOE_PREFILL=native` in addition
+to the M-tile and decode overrides above.

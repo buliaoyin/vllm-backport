@@ -87,30 +87,71 @@ class VllmBackend:
             [{"prompt_token_ids": ids} for ids in inputs], params, use_tqdm=False
         )
         elapsed = time.perf_counter() - start
+        return elapsed, [self.output_row(output) for output in outputs]
+
+    @staticmethod
+    def output_row(output):
+        stats = output.metrics
+        completion = output.outputs[0]
+        assert output.num_cached_tokens == 0
+        assert stats is not None and not stats.is_corrupted
+        return {
+            "prompt_tokens": len(output.prompt_token_ids),
+            "new_tokens": len(completion.token_ids),
+            "token_ids": list(completion.token_ids),
+            "text": completion.text,
+            "ttft": stats.first_token_latency,
+            "prefill": stats.first_token_ts - stats.scheduled_ts,
+            "queue": stats.scheduled_ts - stats.queued_ts,
+            "first_token_ts": stats.first_token_ts,
+            "last_token_ts": stats.last_token_ts,
+            "decode": stats.last_token_ts - stats.first_token_ts,
+            "cached_tokens": output.num_cached_tokens,
+            "finish_reason": completion.finish_reason,
+        }
+
+    def generate_staggered(self, case, max_tokens):
+        """Admit later requests after the first request has started decoding."""
+        from vllm import SamplingParams
+
+        engine = self.llm.llm_engine
+        assert not engine.has_unfinished_requests()
+        thresholds = case["after_tokens"]
+        if thresholds[0] != 0 or max(thresholds) > max_tokens:
+            raise ValueError("Invalid staggered admission token thresholds")
+        prefix = str(time.perf_counter_ns())
+        names = [f"exl3-{prefix}-{i}" for i in range(len(thresholds))]
+        arrived, completed, counts, arrivals = {}, {}, {}, {}
+        params = SamplingParams(temperature=0, max_tokens=max_tokens, ignore_eos=True)
+        start = time.perf_counter()
+        while len(completed) < len(names):
+            for i, name in enumerate(names):
+                if name not in arrived and thresholds[i] <= counts.get(names[0], 0):
+                    arrived[name] = time.perf_counter() - start
+                    engine.add_request(
+                        name, {"prompt_token_ids": case["inputs"][i]}, params
+                    )
+            for output in engine.step():
+                name = output.request_id
+                count = len(output.outputs[0].token_ids)
+                now = time.perf_counter() - start
+                if count > counts.get(name, 0):
+                    arrivals.setdefault(name, []).append([count, now])
+                counts[name] = count
+                if output.finished:
+                    completed[name] = self.output_row(output)
         rows = []
-        for output in outputs:
-            stats = output.metrics
-            completion = output.outputs[0]
-            assert output.num_cached_tokens == 0
-            assert stats is not None and not stats.is_corrupted
-            rows.append(
-                {
-                    "prompt_tokens": len(output.prompt_token_ids),
-                    "new_tokens": len(completion.token_ids),
-                    "token_ids": list(completion.token_ids),
-                    "text": completion.text,
-                    "ttft": stats.first_token_latency,
-                    "prefill": stats.first_token_ts - stats.scheduled_ts,
-                    "decode": stats.last_token_ts - stats.first_token_ts,
-                    "cached_tokens": output.num_cached_tokens,
-                    "finish_reason": completion.finish_reason,
-                }
-            )
-        return elapsed, rows
+        for name in names:
+            row = completed[name]
+            row.update(arrival_offset=arrived[name], token_arrivals=arrivals[name])
+            rows.append(row)
+        return time.perf_counter() - start, rows
 
 
 class ExllamaBackend:
     def __init__(self, args, data):
+        if args.chunk_size is None:
+            args.chunk_size = 512
         from exllamav3 import Cache, Config, Generator, Model, Tokenizer
 
         config = Config.from_directory(data["model"])
@@ -222,7 +263,7 @@ def main():
     parser.add_argument("--kv-cache-gib", type=float, default=2)
     parser.add_argument("--exl-cache-tokens", type=int, default=16384)
     parser.add_argument("--warmups", type=int, default=2)
-    parser.add_argument("--chunk-size", type=int, default=512)
+    parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--tokens", type=int, default=256)
@@ -272,6 +313,7 @@ def main():
         )
     result = {
         "answer_check_scope": "before_first_stop_token",
+        "warmup_new_tokens": args.tokens,
         "args": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
@@ -294,6 +336,7 @@ def main():
                 "VLLM_EXL3_MOE_MAX_TOKENS",
                 "VLLM_EXL3_MOE_PRIORITY",
                 "VLLM_EXL3_MOE_DECODE",
+                "VLLM_EXL3_MOE_PREFILL",
                 "VLLM_EXL3_MOE_M_TILE",
                 "OMP_NUM_THREADS",
                 "VLLM_PP_LAYER_PARTITION",
@@ -385,11 +428,19 @@ def main():
         for case in [] if args.skip_perf else data["cases"]:
             # Warm every batch/prefill shape, then reset caches before measuring.
             print("WARMUP", case["name"], flush=True)
+
+            def generate_case(tokens, case=case):
+                if "after_tokens" in case:
+                    if args.backend != "vllm":
+                        raise ValueError("Staggered cases require the vllm backend")
+                    return backend.generate_staggered(case, tokens)
+                return backend.generate(case["inputs"], tokens, True)
+
             for _ in range(args.warmups):
-                backend.generate(case["inputs"], 16, True)
+                generate_case(args.tokens)
             for repeat in range(args.repeats):
                 print("MEASURE", case["name"], repeat, flush=True)
-                elapsed, rows = backend.generate(case["inputs"], args.tokens, True)
+                elapsed, rows = generate_case(args.tokens)
                 assert all(row["new_tokens"] == args.tokens for row in rows)
                 record = {
                     "case": case["name"],

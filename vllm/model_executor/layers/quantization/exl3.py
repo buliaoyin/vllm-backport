@@ -63,7 +63,8 @@ def _native_extension():
         raise ImportError(
             "EXL3 native kernels require vllm._exl3_C. Build the component as "
             "described in docs/features/quantization/exl3.md, or use the upstream "
-            "kernels with VLLM_EXL3_MOE_M_TILE=16 and VLLM_EXL3_MOE_DECODE=native."
+            "kernels with VLLM_EXL3_MOE_M_TILE=16, VLLM_EXL3_MOE_DECODE=native "
+            "and VLLM_EXL3_MOE_PREFILL=native."
         ) from exc
 
 
@@ -124,6 +125,8 @@ class Exl3Config(QuantizationConfig):
         self.workspaces: dict[tuple, list[torch.Tensor]] = {}
         self.m32_locks: dict[torch.device, torch.Tensor] = {}
         self.decode_workspaces: dict[tuple, torch.Tensor] = {}
+        self.prefill_workspaces: dict[tuple, list[torch.Tensor]] = {}
+        self.prefill_disabled: set[torch.device] = set()
 
     @classmethod
     def get_name(cls):
@@ -398,6 +401,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.moe_m_tile = 16
         self.decode_mode = 0
         self.decode_workspace = None
+        self.prefill_workspace = []
+        self.prefill_min_rows = envs.VLLM_EXL3_MOE_INT8_MIN_TOKENS
+        if not 9 <= self.prefill_min_rows <= 6144:
+            raise ValueError("VLLM_EXL3_MOE_INT8_MIN_TOKENS must be in [9, 6144]")
         self.loaded = set()
 
     @property
@@ -608,6 +615,82 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "residual" if residual else "plain",
             )
 
+        prefill = envs.VLLM_EXL3_MOE_PREFILL
+        if prefill not in ("auto", "native", "int8"):
+            raise ValueError("VLLM_EXL3_MOE_PREFILL must be auto, native or int8")
+        if (
+            prefill != "native"
+            and capability == (8, 0)
+            and supports_native
+            and self.num_experts <= 65535
+            and self.moe.experts_per_token <= 8
+        ):
+            from vllm.model_executor.layers.quantization.utils.exl3_prefill import (
+                INT8_MAX_ROWS,
+                allocate_workspace,
+            )
+
+            int8_capacity = INT8_MAX_ROWS
+            if vllm_config is not None:
+                int8_capacity = min(
+                    int8_capacity, vllm_config.scheduler_config.max_num_batched_tokens
+                )
+                if (
+                    prefill == "auto"
+                    and vllm_config.model_config is not None
+                    and vllm_config.model_config.max_model_len < 32768
+                ):
+                    int8_capacity = 0
+            if (
+                int8_capacity >= self.prefill_min_rows
+                and device not in self.config.prefill_disabled
+            ):
+                _native_extension()
+                if not hasattr(torch.ops._exl3_C, "prefill_reconstruct"):
+                    raise ImportError(
+                        "Rebuild vllm._exl3_C for INT8 prefill, or set "
+                        "VLLM_EXL3_MOE_PREFILL=native."
+                    )
+                topk = self.moe.experts_per_token
+                prefill_key = (
+                    device,
+                    self.num_experts,
+                    self.hidden_size,
+                    self.intermediate_size,
+                    int8_capacity,
+                    topk,
+                )
+                if prefill_key not in self.config.prefill_workspaces:
+                    try:
+                        buffers = allocate_workspace(*prefill_key)
+                    except torch.OutOfMemoryError:
+                        if prefill == "int8":
+                            raise
+                        self.config.prefill_disabled.add(device)
+                        logger.warning_once(
+                            "Insufficient memory for EXL3 INT8 prefill workspace; "
+                            "using native expert prefill on %s.",
+                            device,
+                        )
+                    else:
+                        self.config.prefill_workspaces[prefill_key] = buffers
+                        logger.info_once(
+                            "EXL3 INT8 prefill on SM80: rows >= %d, capacity %d, "
+                            "%.3f GiB shared workspace (native capacity %d).",
+                            self.prefill_min_rows,
+                            int8_capacity,
+                            sum(t.numel() * t.element_size() for t in buffers) / 2**30,
+                            capacity,
+                        )
+                self.prefill_workspace = self.config.prefill_workspaces.get(
+                    prefill_key, []
+                )
+        elif prefill != "native":
+            logger.info_once(
+                "EXL3 INT8 prefill is unavailable for this device or expert format; "
+                "using native expert prefill."
+            )
+
     def apply(
         self,
         layer,
@@ -623,12 +706,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             topk_ids,
             self.ptrs,
             self.workspace,
+            self.prefill_workspace,
             self.bits,
             self.flags,
             float(self.moe.swiglu_limit or 0.0),
             self.m32_locks,
             self.decode_workspace,
             self.decode_mode,
+            self.prefill_min_rows,
         )
 
 
@@ -826,12 +911,14 @@ def _exl3_moe(
     topk_ids: torch.Tensor,
     ptrs: list[torch.Tensor],
     workspace: list[torch.Tensor],
+    prefill_workspace: list[torch.Tensor],
     bits: list[int],
     flags: list[bool],
     limit: float,
     m32_locks: torch.Tensor | None = None,
     decode_workspace: torch.Tensor | None = None,
     decode_mode: int = 0,
+    prefill_min_rows: int = 4096,
 ) -> torch.Tensor:
     if (
         decode_workspace is not None
@@ -850,6 +937,54 @@ def _exl3_moe(
             decode_workspace,
             decode_mode,
         )
+    use_int8_prefill = bool(prefill_workspace) and x.shape[0] >= prefill_min_rows
+    if use_int8_prefill:
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        # FULL graphs can pad a small decode batch to a large captured shape.
+        # Keep their arithmetic independent of request lengths and padding.
+        if is_forward_context_available():
+            use_int8_prefill = (
+                get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
+            )
+    if use_int8_prefill:
+        from vllm.model_executor.layers.quantization.utils.exl3_prefill import (
+            moe_int8,
+        )
+
+        capacity = prefill_workspace[1].shape[0] // topk_ids.shape[1]
+        if x.shape[0] <= capacity:
+            return moe_int8(x, topk_weights, topk_ids, ptrs, prefill_workspace, limit)
+        output = torch.empty_like(x)
+        for start in range(0, x.shape[0], capacity):
+            end = min(start + capacity, x.shape[0])
+            if end - start >= prefill_min_rows:
+                result = moe_int8(
+                    x[start:end],
+                    topk_weights[start:end],
+                    topk_ids[start:end],
+                    ptrs,
+                    prefill_workspace,
+                    limit,
+                )
+            else:
+                result = _exl3_moe_fused(
+                    x[start:end],
+                    topk_weights[start:end],
+                    topk_ids[start:end],
+                    ptrs,
+                    workspace,
+                    bits,
+                    flags,
+                    limit,
+                    m32_locks,
+                )
+            output[start:end].copy_(result)
+        return output
     implementation = _exl3_moe_decode if 0 < x.shape[0] <= 8 else _exl3_moe_fused
     args = (x, topk_weights, topk_ids, ptrs, workspace, bits, flags, limit)
     if implementation is _exl3_moe_fused and m32_locks is not None:
@@ -863,12 +998,14 @@ def _exl3_moe_fake(
     topk_ids,
     ptrs,
     workspace,
+    prefill_workspace,
     bits,
     flags,
     limit,
     m32_locks=None,
     decode_workspace=None,
     decode_mode=0,
+    prefill_min_rows=4096,
 ):
     return torch.empty_like(x)
 
@@ -876,6 +1013,6 @@ def _exl3_moe_fake(
 direct_register_custom_op(
     "exl3_moe",
     _exl3_moe,
-    mutates_args=["workspace", "m32_locks", "decode_workspace"],
+    mutates_args=["workspace", "m32_locks", "decode_workspace", "prefill_workspace"],
     fake_impl=_exl3_moe_fake,
 )

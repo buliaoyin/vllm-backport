@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -122,6 +123,20 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
         )
+        self.exl3_int8_prefill_requests: set[str] = set()
+        self.exl3_prefill_auto = (
+            vllm_config.model_config.quantization == "exl3"
+            and vllm_config.model_config.is_moe
+            and envs.VLLM_EXL3_MOE_PREFILL == "auto"
+            and self.scheduler_config.enable_chunked_prefill
+            and self.scheduler_config.max_num_batched_tokens > 2048
+        )
+        if self.exl3_prefill_auto:
+            logger.info(
+                "EXL3 auto prefill: select large chunks at 32768 uncached prompt "
+                "tokens; retain up to 6144 tokens per step until the tail. "
+                "Short prompts and active decode use at most 2048 tokens per step."
+            )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -502,6 +517,18 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _exl3_prefill_budget(
+        self, request: Request, num_computed_tokens: int, available_tokens: int
+    ) -> int:
+        """Choose after cache lookup, and retain a large chunk plan until its tail."""
+        remaining = request.num_prompt_tokens - num_computed_tokens
+        if remaining < 4096 or available_tokens < 4096:
+            return 2048
+        if remaining >= 32768 or request.request_id in self.exl3_int8_prefill_requests:
+            self.exl3_int8_prefill_requests.add(request.request_id)
+            return 6144
+        return 2048
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -526,6 +553,11 @@ class Scheduler(SchedulerInterface):
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
+        if self.exl3_prefill_auto:
+            self.exl3_int8_prefill_requests.intersection_update(self.requests)
+            if any(r.num_computed_tokens >= r.num_prompt_tokens for r in self.running):
+                token_budget = min(token_budget, 2048)
+                input_budget = min(input_budget, 2048)
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -592,6 +624,14 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if self.exl3_prefill_auto:
+                budget = self._exl3_prefill_budget(
+                    request,
+                    request.num_computed_tokens,
+                    min(token_budget, input_budget),
+                )
+                token_budget = min(token_budget, budget)
+                input_budget = min(input_budget, budget)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -962,6 +1002,14 @@ class Scheduler(SchedulerInterface):
                     # compute to a cadence-aligned step.
                     break
                 else:
+                    if self.exl3_prefill_auto:
+                        budget = self._exl3_prefill_budget(
+                            request,
+                            num_computed_tokens,
+                            min(token_budget, input_budget),
+                        )
+                        token_budget = min(token_budget, budget)
+                        input_budget = min(input_budget, budget)
                     request_token_budget = min(token_budget, input_budget - draft_slots)
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
@@ -1426,6 +1474,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        self.exl3_int8_prefill_requests.discard(request.request_id)
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.spec_token_ids_step_id = None
@@ -1509,6 +1558,7 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
         """
 
+        self.exl3_int8_prefill_requests.discard(session.request_id)
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         num_computed_tokens = session.num_computed_tokens
@@ -2615,6 +2665,7 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        self.exl3_int8_prefill_requests.discard(request.request_id)
         self._discard_pending_draft_token_ids(request.request_id)
 
         self._inflight_prefills.discard(request)

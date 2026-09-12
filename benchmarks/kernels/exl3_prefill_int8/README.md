@@ -77,10 +77,15 @@ Use worker extension
 ranks it selects this backend for at least 4096 input rows. Smaller inputs use
 the original expert path; SM120 retains the original dispatch.
 
-The validated long-input configuration uses chunk 6144 and a 4 GiB ordinary
-projection cache per SM80 rank. The archived inputs refer to the local GLM
-checkpoint; change only the model path when reproducing on another machine.
-Run from the repository root in a shell without other EXL3 experiment overrides:
+Use chunk 6144 with the ordinary projection FP16 cache disabled. The
+[cache ablation](../../../docs/validation/exl3-linear-cache-20260911.md) measures
+its small throughput contribution against 10.09 GiB of resident weight copies
+across the three SM80 ranks. The original 4700-target confirmation used a
+4 GiB cache budget per SM80; its recorded results retain that configuration.
+
+The archived inputs refer to the local GLM checkpoint; change only the model
+path when reproducing on another machine. Run from the repository root in a
+shell without other EXL3 experiment overrides:
 
 ```bash
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -94,7 +99,7 @@ export VLLM_EXL3_BATCHED_INT8_LIBRARY=/tmp/exl3-prefill-int8/helpers.so
 export VLLM_EXL3_BATCHED_INT8_CONFIG=m64n128k64
 export VLLM_EXL3_BATCHED_INT8_MIN_ROWS=4096
 export VLLM_EXL3_MOE_MAX_TOKENS=6144
-export VLLM_EXL3_LINEAR_CACHE_GIB=4
+unset VLLM_EXL3_LINEAR_CACHE_GIB
 export VLLM_PP_LAYER_PARTITION=11,11,11,12
 
 .venv/bin/python benchmarks/benchmark_exl3.py \
@@ -110,11 +115,22 @@ export VLLM_PP_LAYER_PARTITION=11,11,11,12
 The input file contains one 64K request per sample (B1); `--batch-size 4` is
 engine capacity. Add `--event-profile` for a separate diagnostic request after
 clean performance sampling. Runtime metadata reports the active threshold,
-IMMA kernels and scratch. The cache budget is additional to expert scratch.
+IMMA kernels and scratch. To reproduce the cache-enabled ablation, explicitly
+set `VLLM_EXL3_LINEAR_CACHE_GIB=4`; that budget is additional to expert scratch.
 Use a separate engine for every configuration. For the default control, unset
 the `VLLM_EXL3_BATCHED_INT8_*` and cache variables, set both chunk and
 `VLLM_EXL3_MOE_MAX_TOKENS` to 2048, and select worker extension
 `benchmarks.kernels.exl3_prefill.worker.WorkerExtension`.
+
+For GLM on three CMP 170HX GPUs, the tested long-input configuration uses
+`CUDA_VISIBLE_DEVICES=0,1,2`, PP `16,15,14`, chunk 6144, and 2 GiB KV cache per
+rank with `PYTORCH_ALLOC_CONF=expandable_segments:True`. Keep the ordinary
+projection cache disabled. The [three-GPU validation
+report](../../../docs/validation/exl3-3x170hx-20260911.md) includes the full
+command, partition/chunk search, startup memory limits, and 8K–64K throughput.
+The three-GPU B1 measurements favor native M32 / chunk 2048 at 8K–16K and
+INT8 / chunk 6144 at 32K–64K. This deployment choice does not change production
+defaults.
 
 For the 64-question quality comparison, use `inputs.json.gz` from the same
 archive, replace `--skip-eval` with `--skip-perf --eval-batch-size 1
@@ -128,3 +144,16 @@ includes all samples, shorter-input regressions, quality limits, memory costs,
 source hashes and the exact measurement script (`benchmark_model.py.gz`). The
 public benchmark supports the same explicit batching and runtime inspection;
 its defaults are not a substitute for the recorded command/environment.
+
+## Production integration
+
+The validated arithmetic now lives in `_exl3_C` and
+`vllm/model_executor/layers/quantization/utils/exl3_prefill.py`. Normal inference
+uses `VLLM_EXL3_MOE_PREFILL=auto|native|int8` (default `native`) and does not use this worker or
+`helpers.so`. See [the production guide](../../../docs/features/quantization/exl3.md)
+and [concurrent validation](../../../docs/validation/exl3-adaptive-prefill-20260912.md).
+
+For historical worker experiments, explicitly set `VLLM_EXL3_MOE_PREFILL=native`
+so the production dispatcher and adaptive scheduler do not supersede the
+experimental worker. Keep the original source/library hashes in experiment
+records. Direct kernel benchmarks in this directory still exercise the prototype.
