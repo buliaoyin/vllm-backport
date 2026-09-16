@@ -446,7 +446,8 @@ class SpeculativeConfig:
     """Optional DSpark backbone query length, including the predicting anchor.
     It can exceed num_speculative_tokens to preserve a trained query block while
     proposing only its prefix. Requires greedy DSpark with
-    sample_from_anchor=True and fixed-length verification."""
+    sample_from_anchor=True and fixed-length verification. DeepSeek V4.1
+    supports query lengths beyond its checkpoint block size."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -1435,10 +1436,9 @@ class SpeculativeConfig:
                         "DSparkV41DraftModel" if is_v41 else "DSparkDraftModel"
                     ]
                     if is_v41:
-                        # hf_config_override set n_predict to the number of
-                        # MTP stages (3), but one DSpark round drafts
-                        # dspark_block_size tokens; num_speculative_tokens
-                        # divisibility is checked against n_predict below.
+                        # Keep the checkpoint block length as the default, rather
+                        # than the number of MTP stages. DSpark query lengths need
+                        # not be multiples of either value.
                         draft_hf_config.n_predict = getattr(
                             draft_hf_config, "dspark_block_size", None
                         ) or getattr(draft_hf_config, "n_predict", None)
@@ -1484,6 +1484,11 @@ class SpeculativeConfig:
                     elif (
                         self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
+                        and not (
+                            self.use_dspark()
+                            and self.draft_model_config.hf_config.model_type
+                            == "deepseek_v41"
+                        )
                     ):
                         # Ensure divisibility for MTP module reuse.
                         raise ValueError(

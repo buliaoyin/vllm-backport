@@ -74,7 +74,14 @@ class DSparkSpeculator(DFlashSpeculator):
                 self.draft_model_config.hf_config, "dspark_block_size", query_tokens
             )
             if query_tokens > trained:
-                raise ValueError("DSpark queries exceed the checkpoint block size")
+                if self.draft_model_config.hf_config.model_type != "deepseek_v41":
+                    raise ValueError("DSpark queries exceed the checkpoint block size")
+                logger.info(
+                    "DeepSeek V4.1 DSpark uses %d query tokens "
+                    "(checkpoint block size: %d)",
+                    query_tokens,
+                    trained,
+                )
             self.num_query_per_req = query_tokens
 
         # DSpark consumes mean-pooled target aux hidden states at the target

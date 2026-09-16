@@ -60,7 +60,7 @@ def test_static_cache_selects_capacity_and_device_per_layer():
         cpu_moe_config(config, 22)
 
 
-@pytest.mark.parametrize("draft_tokens", [3, 5])
+@pytest.mark.parametrize("draft_tokens", [3, 5, 7])
 def test_cpu_callbacks_accept_reachable_decode_graphs(draft_tokens):
     """Unused capture candidates must not reject a supported 16-request batch."""
     from vllm.config import CUDAGraphMode

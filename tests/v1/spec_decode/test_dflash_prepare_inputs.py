@@ -25,12 +25,17 @@ def _run_prepare(
     cp_size: int = 1,
     cp_interleave: int = 1,
     num_query_tokens: int | None = None,
+    num_speculative_steps: int = 3,
     max_num_reqs: int = 4,
     num_reqs: int = 1,
 ):
     device = torch.device("cuda")
-    max_num_tokens = max(16, max_num_reqs * (num_query_tokens or 3))
-    num_speculative_steps = 3
+    target_count = len(target_positions)
+    max_num_tokens = max(
+        16,
+        num_reqs * target_count,
+        max_num_reqs * (num_query_tokens or num_speculative_steps),
+    )
     state_indices = [
         (min(2, max_num_reqs - 1) + i) % max_num_reqs for i in range(num_reqs)
     ]
@@ -45,12 +50,16 @@ def _run_prepare(
     )
     input_batch = SimpleNamespace(
         num_reqs=num_reqs,
-        num_scheduled_tokens=np.full(num_reqs, 4, dtype=np.int32),
+        num_scheduled_tokens=np.full(num_reqs, target_count, dtype=np.int32),
         positions=torch.tensor(
             target_positions * num_reqs, dtype=torch.int64, device=device
         ),
         query_start_loc=torch.arange(
-            0, 4 * num_reqs + 1, 4, dtype=torch.int32, device=device
+            0,
+            target_count * num_reqs + 1,
+            target_count,
+            dtype=torch.int32,
+            device=device,
         ),
         idx_mapping=torch.tensor(state_indices, dtype=torch.int32, device=device),
     )
@@ -224,42 +233,52 @@ def test_dspark_query_prefix_keeps_tail_kv_without_sampling_past_output():
 
 
 @pytest.mark.parametrize("num_reqs", [3, 16])
-def test_dspark_query_prefix_keeps_concurrent_request_slots_separate(num_reqs):
-    """Five-query drafts must respect reordered requests and rejected suffixes."""
+@pytest.mark.parametrize("draft_tokens, query_tokens", [(3, 5), (5, 5), (7, 7)])
+def test_dspark_query_prefix_keeps_concurrent_request_slots_separate(
+    num_reqs, draft_tokens, query_tokens
+):
+    """Drafts must respect reordered requests, rejected suffixes and buffer bounds."""
     blocks = [0, 0, 7, 8, 9, 10, 11, 12]
     out = _run_prepare(
-        target_positions=[10, 11, 12, 13],
+        target_positions=list(range(10, 11 + draft_tokens)),
         block_table_values=blocks,
-        num_query_tokens=5,
+        num_query_tokens=query_tokens,
+        num_speculative_steps=draft_tokens,
         max_num_reqs=16,
         num_reqs=num_reqs,
     )
     for index in range(num_reqs):
-        start = 12 if index % 2 == 0 else 14
+        start = 11 + draft_tokens - (2 if index % 2 == 0 else 0)
         anchor = 99 + index if index % 2 == 0 else 199 + index
-        query = slice(5 * index, 5 * (index + 1))
-        sample = slice(3 * index, 3 * (index + 1))
+        query = slice(query_tokens * index, query_tokens * (index + 1))
+        sample = slice(draft_tokens * index, draft_tokens * (index + 1))
         assert out.input_buffers.positions[query].cpu().tolist() == list(
-            range(start, start + 5)
+            range(start, start + query_tokens)
         )
-        assert out.input_buffers.input_ids[query].cpu().tolist() == [anchor] + [123] * 4
+        assert out.input_buffers.input_ids[query].cpu().tolist() == [anchor] + [123] * (
+            query_tokens - 1
+        )
         assert out.query_slot_mapping[query].tolist() == [
             (blocks[position // 4] + 16 * index) * 4 + position % 4
-            for position in range(start, start + 5)
+            for position in range(start, start + query_tokens)
         ]
         assert out.sample_indices[sample].tolist() == list(
-            range(5 * index, 5 * index + 3)
+            range(query_tokens * index, query_tokens * index + draft_tokens)
         )
-        assert out.sample_pos[sample].tolist() == list(range(start + 1, start + 4))
-        assert out.sample_idx_mapping[sample].tolist() == [(2 + index) % 16] * 3
+        assert out.sample_pos[sample].tolist() == list(
+            range(start + 1, start + draft_tokens + 1)
+        )
+        assert (
+            out.sample_idx_mapping[sample].tolist() == [(2 + index) % 16] * draft_tokens
+        )
     assert out.input_buffers.query_start_loc.cpu().tolist() == [
-        min(index, num_reqs) * 5 for index in range(17)
+        min(index, num_reqs) * query_tokens for index in range(17)
     ]
-    assert out.sample_idx_mapping[3 * num_reqs :].tolist() == [-1] * (
-        3 * (16 - num_reqs)
+    assert out.sample_idx_mapping[draft_tokens * num_reqs :].tolist() == [-1] * (
+        draft_tokens * (16 - num_reqs)
     )
-    assert out.query_slot_mapping[5 * num_reqs :].tolist() == [PAD_SLOT_ID] * (
-        80 - 5 * num_reqs
-    )
+    assert out.query_slot_mapping[query_tokens * num_reqs :].tolist() == [
+        PAD_SLOT_ID
+    ] * (len(out.query_slot_mapping) - query_tokens * num_reqs)
     for guard in out.sample_guards:
         assert guard.tolist() == [-77] * 4

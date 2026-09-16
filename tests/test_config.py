@@ -1151,29 +1151,35 @@ def test_max_num_new_slots_for_drafting(method, parallel_drafting, expected_slot
     assert speculative_config.max_num_new_slots_for_drafting == expected_slots
 
 
-def test_dspark_query_prefix_reserves_full_backbone_slots():
-    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=3)
+@pytest.mark.parametrize("draft_tokens, query_tokens", [(3, 5), (5, 5), (7, 7)])
+def test_dspark_query_prefix_reserves_full_backbone_slots(draft_tokens, query_tokens):
+    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=draft_tokens)
     spec.method = "dspark"
     spec.parallel_drafting = True
     spec.draft_sample_method = "greedy"
     spec.enable_adaptive_verification = False
-    spec.dspark_num_query_tokens = 5
+    spec.dspark_num_query_tokens = query_tokens
     spec._verify_args()
     config = object.__new__(VllmConfig)
     config.speculative_config = spec
 
-    assert config.num_speculative_tokens == 3
-    assert config.num_lookahead_tokens == 5
-    assert spec.max_num_new_slots_for_drafting == 4
+    assert config.num_speculative_tokens == draft_tokens
+    assert config.uniform_decode_query_len == draft_tokens + 1
+    assert config.num_lookahead_tokens == max(draft_tokens, query_tokens)
+    assert spec.max_num_new_slots_for_drafting == query_tokens - 1
 
 
-@pytest.mark.parametrize("query_tokens", [None, 3, 5])
-def test_dspark_draft_attention_preserves_target_verification(query_tokens):
+@pytest.mark.parametrize(
+    "draft_tokens, query_tokens", [(3, None), (3, 3), (3, 5), (5, 5), (7, 7)]
+)
+def test_dspark_draft_attention_preserves_target_verification(
+    draft_tokens, query_tokens
+):
     from vllm.config import AttentionConfig
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
     from vllm.v1.worker.gpu.spec_decode.dspark.utils import dspark_backbone_vllm_config
 
-    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=3)
+    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=draft_tokens)
     spec.method = "dspark"
     spec.dspark_num_query_tokens = query_tokens
     target = object.__new__(VllmConfig)
@@ -1181,9 +1187,9 @@ def test_dspark_draft_attention_preserves_target_verification(query_tokens):
     target.attention_config = AttentionConfig(use_non_causal=False)
     draft = dspark_backbone_vllm_config(target)
 
-    assert draft.num_speculative_tokens == (query_tokens or 3)
-    assert target.num_speculative_tokens == 3
-    if query_tokens in (None, 3):
+    assert draft.num_speculative_tokens == (query_tokens or draft_tokens)
+    assert target.num_speculative_tokens == draft_tokens
+    if query_tokens in (None, draft_tokens):
         assert draft is target
     else:
         assert draft is not target
@@ -1193,10 +1199,10 @@ def test_dspark_draft_attention_preserves_target_verification(query_tokens):
     speculator.vllm_config = target
     speculator.requires_non_causal = True
     attention = speculator.attn_vllm_config
-    assert attention.num_speculative_tokens == (query_tokens or 3)
+    assert attention.num_speculative_tokens == (query_tokens or draft_tokens)
     assert attention.attention_config.use_non_causal
     assert not target.attention_config.use_non_causal
-    assert target.num_speculative_tokens == 3
+    assert target.num_speculative_tokens == draft_tokens
 
 
 @pytest.mark.parametrize("query_tokens", [0, 2])
@@ -1208,6 +1214,41 @@ def test_dspark_query_prefix_cannot_omit_proposed_positions(query_tokens):
     spec.dspark_num_query_tokens = query_tokens
     with pytest.raises(ValueError, match="cover every proposed token"):
         spec._verify_args()
+
+
+@pytest.mark.parametrize("draft_tokens", [3, 5, 7])
+@patch("vllm.config.speculative.ModelConfig")
+def test_v41_dspark_block_length_does_not_require_mtp_divisibility(
+    model_config_cls, draft_tokens, monkeypatch
+):
+    """The checkpoint block length is a default, not an MTP reuse constraint."""
+    from unittest.mock import MagicMock
+
+    target = MagicMock()
+    target.model = "local-model"
+    target.quantization = None
+    target.max_model_len = 4096
+    target.hf_config = SimpleNamespace(model_type="deepseek_v41")
+    draft = model_config_cls.return_value
+    draft.architectures = ["DeepseekV41ForCausalLM"]
+    draft.max_model_len = 4096
+    draft.hf_config = SimpleNamespace(
+        model_type="deepseek_v41",
+        n_predict=3,
+        dspark_block_size=5,
+        num_nextn_predict_layers=3,
+    )
+    monkeypatch.setattr(SpeculativeConfig, "update_arch_", lambda self: None)
+    spec = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=draft_tokens,
+        dspark_num_query_tokens=max(5, draft_tokens),
+        target_model_config=target,
+        target_parallel_config=ParallelConfig(),
+    )
+    assert spec.num_speculative_tokens == draft_tokens
+    assert spec.draft_model_config.hf_config.dspark_block_size == 5
+    assert spec.draft_model_config.hf_config.num_nextn_predict_layers == 3
 
 
 def test_dspark_query_length_is_rejected_for_other_methods():
@@ -2953,7 +2994,10 @@ def test_revision_resolved_when_weights_match_model(mock_resolve):
     mock_resolve.assert_any_call(model, None, config.hf_token)
 
 
-def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(monkeypatch):
+@pytest.mark.parametrize("draft_tokens", [None, 3, 5, 7])
+def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
+    monkeypatch, draft_tokens
+):
     from vllm.engine.arg_utils import EngineArgs
     from vllm.models.deepseek_v4_1 import hybrid
 
@@ -2966,6 +3010,8 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(monkeypatch):
         additional_config={"deepseek_v41_hybrid": {"pipeline_layers": [7, 7, 26]}},
         speculative_config={"method": "dspark"},
     )
+    if draft_tokens is not None:
+        args.speculative_config["num_speculative_tokens"] = draft_tokens
     hybrid.apply_hybrid_defaults(args)
     hybrid.apply_hybrid_defaults(args)
     assert args.max_num_batched_tokens == 4096
@@ -2973,7 +3019,10 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(monkeypatch):
     assert args.enable_prefix_caching is False
     assert args.kv_cache_memory_bytes is None
     assert args.limit_mm_per_prompt == {"image": 1}
-    assert args.speculative_config["num_speculative_tokens"] == 3
+    assert args.speculative_config["num_speculative_tokens"] == (draft_tokens or 3)
+    assert args.speculative_config["dspark_num_query_tokens"] == max(
+        5, draft_tokens or 3
+    )
     assert args.additional_config["cpu_phase_threads"] == [22, 22]
     assert "gpu_cache_selections" not in args.additional_config["cpu_moe"]
 

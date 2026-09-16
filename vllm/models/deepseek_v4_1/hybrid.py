@@ -78,7 +78,9 @@ def apply_hybrid_defaults(args):
         if spec.get("method") != "dspark":
             raise ValueError("DeepSeek CPU hybrid supports DSpark speculation only")
         spec.setdefault("num_speculative_tokens", 3)
-        spec.setdefault("dspark_num_query_tokens", 5)
+        spec.setdefault(
+            "dspark_num_query_tokens", max(5, int(spec["num_speculative_tokens"]))
+        )
         spec.setdefault("use_local_argmax_reduction", True)
     libraries = native_libraries()
     args.additional_config.update(
