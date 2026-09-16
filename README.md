@@ -10,6 +10,8 @@
 
 内存参考（此前三卡实测）：加载后 worker 主存占用约 **344 GiB（PSS）**，建议配置 **512 GiB 主存**。开启 DSpark 时三卡显存采样峰值合计约 **188–189 GiB**；实际占用随分层、KV 预算和并发数变化。
 
+编译安装见 [混合推理构建说明](docs/contributing/deepseek_v41_build.md)，支持官方源码安装、wheel 和 CMake 增量流程。
+
 三张 CMP 170HX 推荐启动命令：
 
 ```bash

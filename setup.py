@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -31,7 +32,7 @@ def load_module_from_path(module_name, path):
     return module
 
 
-ROOT_DIR = Path(__file__).parent
+ROOT_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
 
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
@@ -192,6 +193,12 @@ class CMakeExtension(Extension):
 
 
 class cmake_build_ext(build_ext):
+    def get_ext_filename(self, fullname: str) -> str:
+        # These ctypes libraries have a C ABI, independent of Python's ABI tag.
+        if fullname.rsplit(".", 1)[-1] in ("libdsv41_ik", "libdsv41_cuda"):
+            return os.path.join(*fullname.split(".")) + ".so"
+        return super().get_ext_filename(fullname)
+
     # A dict of extension directories that have been configured.
     did_config: dict[str, bool] = {}
 
@@ -461,7 +468,7 @@ class cmake_build_ext(build_ext):
                 )
 
 
-class precompiled_build_ext(build_ext):
+class precompiled_build_ext(cmake_build_ext):
     """Disables extension building when using precompiled binaries."""
 
     def run(self) -> None:
@@ -1020,6 +1027,9 @@ class precompiled_wheel_utils:
                             "vllm/cumem_allocator.abi3.so",
                             "vllm/spinloop.abi3.so",
                             "vllm/fs_io_C.abi3.so",
+                            "vllm/libdsv41_ik.so",
+                            "vllm/libdsv41_cuda.so",
+                            "vllm/third_party/ik_llama/LICENSE",
                             # ROCm-specific libraries
                             "vllm/_rocm_C.abi3.so",
                         }
@@ -1360,6 +1370,13 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
+    if sys.platform.startswith("linux") and platform.machine() in (
+        "x86_64",
+        "amd64",
+        "AMD64",
+    ):
+        ext_modules.append(CMakeExtension(name="vllm.libdsv41_ik"))
+        ext_modules.append(CMakeExtension(name="vllm.libdsv41_cuda"))
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     # FA3 kernels only target SM90+; skip the target entirely when
     # TORCH_CUDA_ARCH_LIST is restricted to older archs.
@@ -1404,8 +1421,6 @@ if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.tml_fa4", optional=True))
 
 if _is_cpu():
-    import platform
-
     if platform.machine() in ("x86_64", "AMD64"):
         ext_modules.append(CMakeExtension(name="vllm._C"))
         ext_modules.append(CMakeExtension(name="vllm._C_AVX512"))
@@ -1467,6 +1482,25 @@ if USE_PRECOMPILED_RUST_FRONTEND and not is_metadata_only_build():
     )
     for pkg, files in patch.items():
         package_data.setdefault(pkg, []).extend(files)
+    if (
+        USE_PRECOMPILED_EXTENSIONS
+        and _is_cuda()
+        and any(ext.name.startswith("vllm.libdsv41_") for ext in ext_modules)
+    ):
+        missing = [
+            name
+            for name in ("libdsv41_ik.so", "libdsv41_cuda.so")
+            if name not in patch.get("vllm", [])
+        ]
+        if missing:
+            logger.warning(
+                "Precompiled wheel lacks DeepSeek hybrid libraries: %s. "
+                "Hybrid serving requires a source build (unset "
+                "VLLM_USE_PRECOMPILED), an incremental CMake build, or a "
+                "matching wheel built from this branch. Existing local "
+                "libraries have not been rebuilt.",
+                ", ".join(missing),
+            )
 
 # If the rust frontend binary is already present in the source tree (e.g.,
 # pre-built in a separate Docker build stage), ship it as-is.

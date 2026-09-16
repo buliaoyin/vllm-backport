@@ -121,8 +121,9 @@ def native_libraries():
     libraries = [libdir / f"libdsv41_{name}.so" for name in ("ik", "cuda")]
     if any(not library.is_file() for library in libraries):
         raise RuntimeError(
-            "DeepSeek hybrid native libraries are not installed. Build the pinned "
-            "IK backend and CUDA bridge with csrc/cpu/dsv41/build_backends.py "
-            "--backends ik --cuda-bridge --install-dir vllm."
+            "DeepSeek hybrid native libraries are not installed. Install this "
+            "branch from source with VLLM_USE_PRECOMPILED unset, or build and "
+            "install the libdsv41_ik and libdsv41_cuda CMake targets. Upstream "
+            "precompiled wheels do not contain this branch's hybrid backends."
         )
     return libraries
