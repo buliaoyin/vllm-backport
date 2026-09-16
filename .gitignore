@@ -255,5 +255,5 @@ vllm/grpc/vllm_engine_pb2.pyi
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
 
-# Local DeepSeek profiling data and source snapshots
-/docs/validation/deepseek-v41-results/
+# Local validation reports and experiment artifacts
+/docs/validation/
