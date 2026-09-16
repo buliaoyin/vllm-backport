@@ -34,7 +34,14 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
   cache for the rest.
 """
 
+import ctypes
+import sys
+import time
 import weakref
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from mmap import PAGESIZE
 
 import numpy as np
 import torch
@@ -547,6 +554,46 @@ class NgramHashState(nn.Module):
         return output
 
 
+_ENGRAM_LOAD_CHUNK_BYTES = 64 * 1024**2
+
+
+def _engram_checkpoint_pageout(
+    weight: torch.Tensor,
+) -> Callable[[int, int], None] | None:
+    if sys.platform != "linux" or not weight.is_contiguous():
+        return None
+    base = weight.data_ptr()
+    size = weight.numel() * weight.element_size()
+    try:
+        with open("/proc/self/maps") as mappings:
+            for line in mappings:
+                fields = line.split(maxsplit=5)
+                if len(fields) != 6 or not fields[5].rstrip().endswith(".safetensors"):
+                    continue
+                first, last = (int(x, 16) for x in fields[0].split("-"))
+                if fields[1].endswith("p") and first <= base < base + size <= last:
+                    break
+            else:
+                return None
+    except OSError:
+        return None
+    madvise = ctypes.CDLL(None, use_errno=True).madvise
+    madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    madvise.restype = ctypes.c_int
+
+    def release(offset: int, length: int) -> None:
+        start = ((base + offset + PAGESIZE - 1) // PAGESIZE) * PAGESIZE
+        end = ((base + offset + length) // PAGESIZE) * PAGESIZE
+        # Linux MADV_PAGEOUT reclaims clean file pages without discarding
+        # private modifications, unlike MADV_DONTNEED. Never advise the target.
+        if end > start and madvise(start, end - start, 21):
+            logger.warning_once(
+                "Engram source page reclaim failed: %d", ctypes.get_errno()
+            )
+
+    return release
+
+
 def _engram_head_shard_weight_loader(
     param: torch.nn.Parameter, loaded_weight: torch.Tensor
 ) -> None:
@@ -559,7 +606,47 @@ def _engram_head_shard_weight_loader(
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
     )
-    param.data.copy_(shard)
+    row_bytes = shard.shape[1] * shard.element_size()
+    owner = getattr(param, "engram_memory", None)
+    if owner is not None:
+        from vllm.models.deepseek_v4_1.host_memory import check_host_headroom
+
+    if param.device.type != "cpu" or (
+        owner is None
+        and shard.numel() * shard.element_size() < _ENGRAM_LOAD_CHUNK_BYTES
+    ):
+        param.data.copy_(shard)
+        return
+    release = _engram_checkpoint_pageout(shard)
+    if release is not None:
+        logger.info(
+            "Copying Engram in 64 MiB chunks and reclaiming consumed checkpoint pages"
+        )
+    load_start = time.perf_counter()
+    rows = max(1, _ENGRAM_LOAD_CHUNK_BYTES // row_bytes)
+    executor = ThreadPoolExecutor(max_workers=1) if release else nullcontext()
+    with executor as pool:
+        pending = None
+        for start in range(0, part_rows, rows):
+            count = min(rows, part_rows - start)
+            if owner is not None:
+                check_host_headroom(count * row_bytes)
+            param.data[start : start + count].copy_(shard[start : start + count])
+            if owner is not None:
+                owner.register(param.data_ptr(), start * row_bytes, count * row_bytes)
+            if pool is not None and release is not None:
+                # Keep at most one consumed chunk awaiting reclaim.
+                if pending is not None:
+                    pending.result()
+                pending = pool.submit(release, start * row_bytes, count * row_bytes)
+        if pending is not None:
+            pending.result()
+    logger.info(
+        "Loaded %.2f GiB Engram host weights in %.2f seconds (%d Torch threads)",
+        part_rows * row_bytes / 1024**3,
+        time.perf_counter() - load_start,
+        torch.get_num_threads(),
+    )
 
 
 @triton.jit
@@ -666,6 +753,44 @@ class ParallelEngramEmbedding(nn.Module):
         # Explicit device: model init runs under a `torch.device("cuda")`
         # context, which would otherwise put the shard in HBM.
         kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+        deferred = (
+            cpu_offload and self.part_num_embeddings * dim >= _ENGRAM_LOAD_CHUNK_BYTES
+        )
+        if deferred:
+            from vllm.models.deepseek_v4_1.host_memory import empty_registered
+
+            weight, weight_owner = empty_registered(
+                (self.part_num_embeddings, dim), torch.float8_e4m3fn, deferred=True
+            )
+            scales, scale_owner = empty_registered(
+                (self.part_num_embeddings, dim // block_size),
+                torch.uint8,
+                deferred=True,
+            )
+            self.weight = nn.Parameter(weight, requires_grad=False)
+            self.weight_scale_inv = nn.Parameter(scales, requires_grad=False)
+            self.weight.engram_memory = weight_owner
+            self.weight_scale_inv.engram_memory = scale_owner
+        else:
+            self._allocate_embedding_parameters(dim, block_size, kwargs)
+        for param in (self.weight, self.weight_scale_inv):
+            set_weight_attrs(
+                param,
+                {
+                    "weight_loader": _engram_head_shard_weight_loader,
+                    "engram_vocab_start": self.vocab_start_idx,
+                },
+            )
+        if cpu_offload:
+            logger.info(
+                "Engram host table: %d rows x %d, %.2f GiB per rank; deferred=%s",
+                self.part_num_embeddings,
+                dim,
+                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+                deferred,
+            )
+
+    def _allocate_embedding_parameters(self, dim, block_size, kwargs):
         self.weight = nn.Parameter(
             torch.empty(
                 self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
@@ -681,22 +806,6 @@ class ParallelEngramEmbedding(nn.Module):
             ),
             requires_grad=False,
         )
-        for param in (self.weight, self.weight_scale_inv):
-            set_weight_attrs(
-                param,
-                {
-                    "weight_loader": _engram_head_shard_weight_loader,
-                    "engram_vocab_start": self.vocab_start_idx,
-                },
-            )
-        if cpu_offload:
-            logger.info(
-                "Engram table offloaded to pinned host memory: %d rows x %d, "
-                "%.2f GiB per rank",
-                self.part_num_embeddings,
-                dim,
-                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
-            )
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Parameters when resident, else cached UVA views of the pinned shard.

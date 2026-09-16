@@ -16,6 +16,7 @@ from vllm.tasks import GenerationTask
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.stats import ExpertCacheStats
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -153,6 +154,13 @@ class ModelState(ABC):
         num_sampled: torch.Tensor,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
+        return None
+
+    def reset_expert_cache_stats(self) -> None:
+        """Exclude model warmup from serving cache statistics."""
+        return None
+
+    def take_expert_cache_stats(self) -> ExpertCacheStats | None:
         return None
 
     @abstractmethod

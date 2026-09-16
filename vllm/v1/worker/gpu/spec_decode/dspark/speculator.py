@@ -38,7 +38,10 @@ from vllm.v1.worker.gpu.spec_decode.dspark.markov_argmax import (
     FusedMarkovSampler,
     build_fused_markov_sampler,
 )
-from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+    dspark_backbone_vllm_config,
+    load_dspark_model,
+)
 
 logger = init_logger(__name__)
 
@@ -59,6 +62,20 @@ class DSparkSpeculator(DFlashSpeculator):
             self.num_query_per_req = self.num_speculative_steps
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
+        query_tokens = self.speculative_config.dspark_num_query_tokens
+        if query_tokens is not None:
+            if not self.sample_from_anchor:
+                raise ValueError(
+                    "A separate DSpark query length requires sample_from_anchor=True"
+                )
+            if query_tokens * self.max_num_reqs > self.max_num_tokens:
+                raise ValueError("DSpark queries exceed the token buffer capacity")
+            trained = getattr(
+                self.draft_model_config.hf_config, "dspark_block_size", query_tokens
+            )
+            if query_tokens > trained:
+                raise ValueError("DSpark queries exceed the checkpoint block size")
+            self.num_query_per_req = query_tokens
 
         # DSpark consumes mean-pooled target aux hidden states at the target
         # layers, combined to hidden_size via main_proj. Store that combined
@@ -96,12 +113,17 @@ class DSparkSpeculator(DFlashSpeculator):
         # load_draft_model once the head's weights and shard geometry exist.
         self._fused_markov: FusedMarkovSampler | None = None
 
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        return dspark_backbone_vllm_config(super().attn_vllm_config)
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        self._ced_context_source = getattr(target_model, "take_ced_draft_context", None)
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
@@ -139,6 +161,31 @@ class DSparkSpeculator(DFlashSpeculator):
                 model, self.max_num_reqs, self.num_speculative_steps, self.device
             )
         return model
+
+    @torch.inference_mode()
+    def propose(self, input_batch, *args, **kwargs):
+        source = getattr(self, "_ced_context_source", None)
+        if source is not None and not kwargs.get("dummy_run", False):
+            context = source()
+            if context is not None:
+                request_ids = context.request_ids or (context.request_id,)
+                if not set(request_ids).issubset(input_batch.req_ids):
+                    raise ValueError("CED draft context belongs to another request")
+                # A short final prefill chunk may contain fewer than 128 tokens.
+                # Publish the entire replay suffix before the normal per-chunk
+                # update, which will overwrite only the newest rows correctly.
+                states = self.model.combine_hidden_states(
+                    torch.cat(context.auxiliary, dim=-1)
+                )
+                assert self._layer_group_idx is not None
+                slots = [
+                    context.slots[self.draft_kv_cache_group_ids[index]]
+                    for index in self._layer_group_idx
+                ]
+                self.model.precompute_and_store_context_kv(
+                    states, context.positions, slots
+                )
+        return super().propose(input_batch, *args, **kwargs)
 
     def _sample_logits(
         self,

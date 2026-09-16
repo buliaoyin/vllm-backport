@@ -660,3 +660,29 @@ def test_fp8_paged_mqa_logits_torch_next_n_reads_planar_cache():
             ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
 
     assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("M,N", [(1, 127), (4, 8193), (128, 65537), (128, 524288)])
+def test_bucketed_prefill_allocations_preserve_logits_and_topk(M, N):
+    """Rounded storage must preserve masked logits and the strided top-k consumer."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(7)
+    q = torch.randn(M, 64, 128, device="cuda").to(torch.float8_e4m3fn)
+    k = torch.randn(N, 128, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.logspace(-4, 4, N, device="cuda")
+    weights = torch.randn(M, 64, device="cuda")
+    ks = torch.arange(M, dtype=torch.int32, device="cuda") % (N // 4)
+    ke = torch.full_like(ks, N - 1)
+    args = q, (k, scales), weights, ks, ke
+    exact = fp8_mqa_logits_triton(*args)
+    rounded = fp8_mqa_logits_triton(*args, round_allocations=True)
+    torch.testing.assert_close(rounded, exact, atol=0, rtol=0)
+    outputs = []
+    for logits in (exact, rounded):
+        out = torch.empty(M, 8, dtype=torch.int32, device="cuda")
+        ops.top_k_per_row_prefill(
+            logits, ks, ke, out, M, logits.stride(0), logits.stride(1), 8
+        )
+        outputs.append(out)
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)

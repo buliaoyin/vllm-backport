@@ -6515,3 +6515,52 @@ def test_update_draft_token_ids_in_output_strips_padding(monkeypatch):
         -1,
     ]
     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
+
+
+def test_token_budget_recycles_unscheduled_windows_after_completion():
+    """A request skipped by the next batch cannot retain its old prefill scratch."""
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    scheduler = create_scheduler(
+        max_model_len=128,
+        block_size=2,
+        max_num_batched_tokens=16,
+        kv_cache_spec=SlidingWindowSpec(
+            block_size=2,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=4,
+        ),
+    )
+    scheduler.cache_config.kv_cache_tokens = 128
+    requests = create_requests(2, num_tokens=8, block_size=2)
+    for request in requests:
+        scheduler.add_request(request)
+    first = scheduler.schedule()
+    retained = list(
+        scheduler.kv_cache_manager.get_blocks(requests[1].request_id).blocks[0]
+    )
+    # Both prefills are still in flight. A new scheduler pass must not free them.
+    scheduler.schedule()
+    assert all(block.ref_cnt == 1 for block in retained)
+    ids = [request.request_id for request in requests]
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=ids,
+            req_id_to_index={rid: i for i, rid in enumerate(ids)},
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.max_num_scheduled_tokens = 1
+    second = scheduler.schedule()
+    assert ids[1] not in second.num_scheduled_tokens
+    block_ids = scheduler.kv_cache_manager.get_block_ids(ids[1])[0]
+    null_id = scheduler.kv_cache_manager.block_pool.null_block.block_id
+    assert block_ids[:2] == [null_id, null_id]
+    assert block_ids[2:] == [block.block_id for block in retained[2:]]
+    assert all(block.ref_cnt == 1 for block in retained[2:])

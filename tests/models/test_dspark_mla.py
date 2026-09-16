@@ -266,3 +266,41 @@ def test_v41_dspark_loads_linear_scales(
     assert loaded == {runtime_name}
     assert shards == [() if shard_id is None else (shard_id,)]
     torch.testing.assert_close(param, checkpoint_scale)
+
+
+@pytest.mark.parametrize("own_embedding", [False, True])
+def test_v41_dspark_loads_checkpoint_embedding_only_when_pp_cannot_share_it(
+    monkeypatch, own_embedding
+):
+    from vllm.models.deepseek_v4_1.nvidia import dspark
+
+    weight = torch.randn(16, 8, dtype=torch.bfloat16)
+    param = nn.Parameter(torch.zeros_like(weight), requires_grad=False)
+    draft = SimpleNamespace(
+        has_own_embed_tokens=own_embedding,
+        pad_shared_expert=False,
+        config=SimpleNamespace(num_attention_heads=4, n_routed_experts=1),
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(ffn=SimpleNamespace(use_mega_moe=False))],
+            confidence_head=None,
+        ),
+        named_parameters=lambda: [("model.embed_tokens.weight", param)],
+        process_weights_after_loading=lambda: None,
+    )
+    draft._remap_dspark_name = lambda name: (
+        dspark.DSparkDeepseekV4ForCausalLM._remap_dspark_name(draft, name)
+    )
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        dspark, "fused_moe_make_expert_params_mapping", lambda *a, **k: []
+    )
+    loaded = dspark.DSparkDeepseekV4ForCausalLM.load_weights(
+        draft, [("embed.weight", weight)]
+    )
+    if own_embedding:
+        assert loaded == {"model.embed_tokens.weight"}
+        torch.testing.assert_close(param, weight, rtol=0, atol=0)
+    else:
+        assert not loaded
+        assert torch.count_nonzero(param) == 0

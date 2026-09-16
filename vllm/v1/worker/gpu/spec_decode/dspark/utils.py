@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 import torch.nn as nn
 
 from vllm.config import ModelConfig, VllmConfig, replace
@@ -30,7 +32,25 @@ def _resolve_dspark_attention_backend(
     return None
 
 
+def dspark_backbone_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    """Size draft attention for all query positions without changing verification."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None:
+        return vllm_config
+    query_tokens = speculative_config.dspark_num_query_tokens
+    if (
+        query_tokens is None
+        or query_tokens == speculative_config.num_speculative_tokens
+    ):
+        return vllm_config
+    draft_config = copy.copy(vllm_config)
+    draft_config.speculative_config = copy.copy(speculative_config)
+    draft_config.speculative_config.num_speculative_tokens = query_tokens
+    return draft_config
+
+
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+    vllm_config = dspark_backbone_vllm_config(vllm_config)
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config

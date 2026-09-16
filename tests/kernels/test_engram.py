@@ -776,3 +776,75 @@ def test_engram_head_collectives_survive_graph_breaks():
     if torch.accelerator.device_count() < 2:
         pytest.skip("Requires two GPUs")
     torch.multiprocessing.spawn(_engram_tp_worker, args=(2, get_open_port()), nprocs=2)
+
+
+@pytest.mark.parametrize("file_backed", [False, True])
+def test_engram_chunked_host_load_preserves_bytes_and_source(
+    tmp_path, monkeypatch, file_backed
+):
+    """Reclaim only consumed checkpoint pages; preserve scales and shard offsets."""
+    from safetensors.torch import safe_open, save_file
+
+    monkeypatch.setattr(engram_ops, "_ENGRAM_LOAD_CHUNK_BYTES", 8192)
+    raw = torch.randint(0, 256, (1024, 256), dtype=torch.uint8)
+    path = tmp_path / "engram.safetensors"
+    save_file({"scale": raw}, path)
+    if file_backed:
+        with safe_open(path, framework="pt") as checkpoint:
+            source = checkpoint.get_tensor("scale")
+        # Private changes must survive page reclaim and reach the destination.
+        source[100:120] = 17
+        raw[100:120] = 17
+    else:
+        source = raw.clone()
+    source = source.view(torch.float8_e8m0fnu)
+    param = torch.nn.Parameter(torch.empty((777, 256), dtype=torch.uint8), False)
+    param.engram_vocab_start = 37
+    release = engram_ops._engram_checkpoint_pageout(source)
+    assert (release is not None) == file_backed
+    engram_ops._engram_head_shard_weight_loader(param, source)
+    torch.testing.assert_close(param, raw[37:814], rtol=0, atol=0)
+    torch.testing.assert_close(source.view(torch.uint8), raw, rtol=0, atol=0)
+    with safe_open(path, framework="pt") as checkpoint:
+        persisted = checkpoint.get_tensor("scale")
+        if file_backed:
+            assert not torch.equal(persisted[100:120], raw[100:120])
+
+
+@pytest.mark.parametrize("file_backed", [False, True])
+def test_engram_deferred_registration_preserves_uva_across_chunks(
+    monkeypatch, tmp_path, file_backed
+):
+    """Loading must populate every registered span without a second table copy."""
+    from vllm.models.deepseek_v4_1 import host_memory
+    from vllm.models.deepseek_v4_1.common import engram as engram_ops
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    chunk = 16 * 1024**2
+    monkeypatch.setattr(engram_ops, "_ENGRAM_LOAD_CHUNK_BYTES", chunk)
+    rows = 2 * chunk // 256 + 1
+    target, owner = host_memory.empty_registered(
+        (rows, 256), torch.uint8, deferred=True
+    )
+    param = torch.nn.Parameter(target, requires_grad=False)
+    param.engram_memory = owner
+    param.engram_vocab_start = 0
+    source = torch.full((rows, 256), 7, dtype=torch.uint8)
+    source[chunk // 256, 0] = 9
+    source[-1, -1] = 11
+    if file_backed:
+        from safetensors.torch import safe_open, save_file
+
+        path = tmp_path / "engram.safetensors"
+        save_file({"weight": source}, path)
+        with safe_open(path, framework="pt") as checkpoint:
+            source = checkpoint.get_tensor("weight")
+    engram_ops._engram_head_shard_weight_loader(param, source)
+    source.zero_()
+    view = get_accelerator_view_from_cpu_tensor(param)
+    assert view.data_ptr() == param.data_ptr()
+    assert view.untyped_storage().nbytes() == rows * 256
+    assert view[chunk // 256, 0].item() == 9
+    assert view[-1, -1].item() == 11
+    assert view[1, 1].item() == 7
+    torch.accelerator.synchronize()

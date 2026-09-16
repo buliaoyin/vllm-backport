@@ -171,7 +171,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
-    PREFILL_CHUNK_SIZE: ClassVar[int] = 4
+    PREFILL_CHUNK_SIZE: int = 4
 
     @classmethod
     @abstractmethod
@@ -215,6 +215,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
+        self.PREFILL_CHUNK_SIZE = min(
+            self.PREFILL_CHUNK_SIZE, vllm_config.scheduler_config.max_num_seqs
+        )
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
         tp_size = get_tensor_model_parallel_world_size()

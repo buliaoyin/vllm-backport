@@ -562,3 +562,21 @@ def test_marlin_gemm_with_bias(size_m):
     max_diff = compute_max_diff(output, output_ref)
 
     assert max_diff < 0.04
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("n,k", [(4608, 5120), (5120, 2304)])
+@pytest.mark.parametrize("is_a_8bit", [False, True])
+def test_inplace_expert_repack_preserves_marlin_layout(n, k, is_a_8bit):
+    """Reusing storage must preserve every expert's packed GEMM operands."""
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        _repack_marlin_experts,
+    )
+
+    weights = torch.randint(0, 256, (4, n, k // 2), dtype=torch.uint8, device="cuda")
+    original = weights.clone()
+    expected = _repack_marlin_experts(weights, n, k, is_a_8bit)
+    assert torch.equal(weights, original)
+    actual = _repack_marlin_experts(weights, n, k, is_a_8bit, inplace=True)
+    assert actual.data_ptr() == weights.data_ptr()
+    assert torch.equal(actual, expected)

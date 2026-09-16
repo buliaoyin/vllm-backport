@@ -22,6 +22,7 @@ from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     CachingMetrics,
+    ExpertCacheStats,
     IterationStats,
     MultiModalCacheStats,
     PromptTokenStats,
@@ -103,6 +104,7 @@ class LoggingStatLogger(StatLoggerBase):
         self._reset(time.monotonic())
 
         self.last_scheduler_stats = SchedulerStats()
+        self.expert_cache_stats: ExpertCacheStats | None = None
 
         # Caching metrics. This cannot be reset.
         # TODO: Make the interval configurable.
@@ -218,6 +220,10 @@ class LoggingStatLogger(StatLoggerBase):
 
             if scheduler_stats.spec_decoding_stats is not None:
                 self.spec_decoding_logging.observe(scheduler_stats.spec_decoding_stats)
+            if scheduler_stats.expert_cache_stats is not None:
+                if self.expert_cache_stats is None:
+                    self.expert_cache_stats = ExpertCacheStats()
+                self.expert_cache_stats.accumulate(scheduler_stats.expert_cache_stats)
             if kv_connector_stats := scheduler_stats.kv_connector_stats:
                 self.kv_connector_logging.observe(kv_connector_stats)
             if (
@@ -313,11 +319,36 @@ class LoggingStatLogger(StatLoggerBase):
         )
 
         self.spec_decoding_logging.log(log_fn=log_fn)
+        self._log_expert_cache_stats(log_fn)
         self.kv_connector_logging.log(log_fn=log_fn)
         if self.cudagraph_logging is not None:
             self.cudagraph_logging.log(log_fn=log_fn)
         if self._enable_perf_stats():
             self.perf_metrics_logging.log(log_fn=log_fn, log_prefix=self.log_prefix)
+
+    def _log_expert_cache_stats(self, log_fn):
+        stats = self.expert_cache_stats
+        if stats is None:
+            return
+        routes = stats.gpu_hits + stats.cpu_misses
+        hit_rate = f"{100 * stats.gpu_hits / routes:.2f}%" if routes else "N/A"
+        log_fn(
+            self.log_prefix + "Hybrid expert cache: GPU hit rate: %s "
+            "(%d/%d routes), CPU routes: %d, "
+            "Expert replacements: %d, Cache updates: %d, Reload time: %.1f ms, "
+            "Host LRU hits: %d, Repacked experts: %d, Decode checks: %d",
+            hit_rate,
+            stats.gpu_hits,
+            routes,
+            stats.cpu_misses,
+            stats.experts_reloaded,
+            stats.updates,
+            stats.reload_seconds * 1000,
+            stats.host_lru_hits,
+            stats.repacked_experts,
+            stats.decode_checks,
+        )
+        self.expert_cache_stats = None
 
     def log_engine_initialized(self):
         if self.vllm_config.cache_config.num_gpu_blocks:

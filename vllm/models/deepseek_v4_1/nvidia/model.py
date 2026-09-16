@@ -26,6 +26,9 @@ from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    fused_topk_bias,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -63,6 +66,11 @@ from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
 )
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4_1.ced import CEDPrefill, CEDStep, ced_prefill_enabled
+from vllm.models.deepseek_v4_1.cpu_moe import (
+    CPUExpertModule,
+    cpu_moe_config,
+)
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -90,6 +98,7 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         prefix: str = "",
         use_sequence_parallel: bool = False,
     ):
+        self.cpu_config = cpu_moe_config(vllm_config, extract_layer_index(prefix))
         config = vllm_config.model_config.hf_config
         n_routed_experts = config.n_routed_experts
         n_activated_experts = config.num_experts_per_tok
@@ -109,6 +118,58 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
             num_hash_layers=0,
             image_sentinel_lo=IMAGE_SENTINEL_BASE_ID,
         )
+        self.cpu_shared_stream = (
+            torch.cuda.Stream()
+            if self.cpu_config and self.cpu_config.cuda_library_path
+            else None
+        )
+
+    def _init_fused_moe_experts(self, vllm_config, config, quant_config, prefix):
+        if self.cpu_config is None:
+            return super()._init_fused_moe_experts(
+                vllm_config, config, quant_config, prefix
+            )
+        self.n_redundant_experts = 0
+        self.n_shared_experts = config.n_shared_experts or 0
+        self.n_logical_experts = self.n_routed_experts
+        self.n_physical_experts = self.n_routed_experts
+        self.n_local_physical_experts = self.n_routed_experts
+        self.n_local_experts = self.n_routed_experts
+        self.experts_start_idx = self.physical_expert_start = 0
+        self.experts_end_idx = self.physical_expert_end = self.n_routed_experts
+        self.experts = CPUExpertModule(self.cpu_config, vllm_config)
+
+    def _forward_fused_moe(self, hidden_states, input_ids=None):
+        if self.cpu_config is None:
+            return super()._forward_fused_moe(hidden_states, input_ids)
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids = fused_topk_bias(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+            topk=self.n_activated_experts,
+            renormalize=self.renormalize,
+            indices_type=torch.int64,
+            input_tokens=input_ids,
+            hash_indices_table=None,
+            routed_scaling_factor=self.routed_scaling_factor,
+            bias_vl=self.gate.bias_vl,
+            image_sentinel_lo=self.image_sentinel_lo,
+        )
+        shared = None
+        if self.cpu_shared_stream is not None and self.shared_experts is not None:
+            self.cpu_shared_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.cpu_shared_stream):
+                shared = self.shared_experts(hidden_states)
+        output = self.experts(hidden_states, topk_ids, topk_weights)
+        if shared is not None:
+            torch.cuda.current_stream().wait_stream(self.cpu_shared_stream)
+            shared.record_stream(torch.cuda.current_stream())
+            output.add_(shared)
+        elif self.shared_experts is not None:
+            output.add_(self.shared_experts(hidden_states))
+        return output
 
 
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
@@ -116,11 +177,37 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
-    Without an explicit backend, SM12 defaults to FlashInfer while the other
-    CUDA arches keep the FlashMLA path.
+    SM8/SM12 keep portable prefill and decode unless the optional SM120 decode
+    path or an explicit native backend is requested.
     """
     backend = vllm_config.attention_config.backend
-    device_capability = current_platform.get_device_capability()
+    device_capability = current_platform.get_device_capability(
+        torch.accelerator.current_device_index()
+    )
+    additional = vllm_config.additional_config
+    mode = (
+        additional.get("dsv41_attention", "auto")
+        if isinstance(additional, dict)
+        else "auto"
+    )
+    if mode not in ("auto", "portable", "sm120_decode"):
+        raise ValueError(f"Unknown DeepSeek V4.1 attention mode: {mode}")
+    if device_capability is not None and device_capability.major == 12:
+        if mode == "portable" or (
+            mode == "auto"
+            and backend in (None, AttentionBackendEnum.TRITON_MLA_SPARSE_DSV41)
+        ):
+            from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
+                DeepseekV41AmpereMLAAttention,
+            )
+
+            return DeepseekV41AmpereMLAAttention
+        if mode == "sm120_decode":
+            from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
+                DeepseekV41SM120DecodeAttention,
+            )
+
+            return DeepseekV41SM120DecodeAttention
     if device_capability is not None and device_capability.major == 8:
         if backend is not None and (
             backend != AttentionBackendEnum.TRITON_MLA_SPARSE_DSV41
@@ -311,44 +398,31 @@ class DeepseekV4DecoderLayer(nn.Module):
         # The reference collapses each sublayer's input with the *previous*
         # sublayer's pre-mix: attention uses the pre-mix carried in (identity
         # for the first layer), the FFN uses this layer's attention pre-mix.
-        if residual is None:
-            if x.dim() == 2:
-                # First layer: the stream is the embedding broadcast to hc
-                # copies and the identity pre-mix selects copy 0.
-                assert self.hc_attn_fn_broadcast is not None
-                residual = x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
-                post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
-                    residual,
-                    self.hc_attn_fn_broadcast,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    x=x,
-                    norm_weight=self.attn_norm.weight,
-                    norm_eps=self.attn_norm.variance_epsilon,
-                )
-            else:
-                residual = x
-                post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
-                    residual,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    pre_mix=pre_mix,
-                    norm_weight=self.attn_norm.weight,
-                    norm_eps=self.attn_norm.variance_epsilon,
-                )
+        if residual is None and x.dim() == 2:
+            # First layer: the stream is the embedding broadcast to hc
+            # copies and the identity pre-mix selects copy 0.
+            assert self.hc_attn_fn_broadcast is not None
+            residual = x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
+            post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
+                residual,
+                self.hc_attn_fn_broadcast,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                x=x,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+            )
         else:
-            residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
+            residual = (
+                x
+                if residual is None
+                else mhc_post_tilelang(x, residual, post_mix, res_mix)
+            )
             if self.engram is not None and engram_hashes is not None:
                 # Engram injection happens between the previous sublayer's
                 # post and this block's pre, on the full hc stream, so the
@@ -400,6 +474,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp: typing.ClassVar[bool] = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -461,6 +537,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         self.engram_layout = EngramLayout.from_config(config)
+        self.pp_shared_kv = None
+        additional = vllm_config.additional_config
+        if isinstance(additional, dict) and additional.get("pp_kv_transfer", False):
+            from vllm.distributed.utils import get_pp_indices
+            from vllm.models.deepseek_v4_1.pp_kv import IncrementalPPKV
+
+            if self.use_sequence_parallel or self.parallel_config.use_ubatching:
+                raise ValueError(
+                    "PP KV replicas do not support sequence parallel or DBO"
+                )
+            pp = get_pp_group()
+            start, end = get_pp_indices(
+                config.num_hidden_layers, pp.rank_in_group, pp.world_size
+            )
+            self.pp_shared_kv = IncrementalPPKV(
+                vllm_config, prefix, start, end, _select_dsv4_attn_cls(vllm_config)
+            )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -474,6 +567,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+
+        self.ced_prefill = None
+        if ced_prefill_enabled(vllm_config) and get_pp_group().is_last_rank:
+            if not self.start_layer < 20 or self.end_layer != 40:
+                raise ValueError(
+                    "CED prefill requires encoder layer 19 and all decoder layers "
+                    "on the last PP rank"
+                )
+            self.ced_prefill = CEDPrefill(config.sliding_window)
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
         # (chunked prefill / decode lookback); key it off the first local
@@ -514,6 +616,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        from vllm.distributed.utils import get_pp_indices
+
+        super()._set_aux_hidden_state_layers(layers)
+        pp = get_pp_group()
+        if pp.world_size > 1:
+            last_start, _ = get_pp_indices(
+                self.config.num_hidden_layers, pp.world_size - 1, pp.world_size
+            )
+            if any(layer <= last_start for layer in layers):
+                raise ValueError(
+                    "V4.1 PP auxiliary states must all be on the last stage"
+                )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -529,8 +645,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
+        shared_kv = (
+            self.pp_shared_kv.make_empty_inputs(batch_size, device)
+            if self.pp_shared_kv is not None
+            else {}
+        )
         return IntermediateTensors(
             {
+                **shared_kv,
                 "hidden_states": torch.zeros(
                     (batch_size, self.hc_mult, self.config.hidden_size),
                     dtype=dtype,
@@ -551,6 +673,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_step: CEDStep | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -560,6 +683,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            if self.pp_shared_kv is not None:
+                self.pp_shared_kv.import_chunk(
+                    intermediate_tensors, self.topk_indices_buffer
+                )
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -637,6 +764,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            if idx == 20 and ced_step is not None:
+                assert self.ced_prefill is not None
+                return self.ced_prefill.forward(
+                    self, ced_step, hidden_states, residual, post_mix, res_mix, pre_mix
+                )
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
                 positions,
@@ -668,9 +800,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
-            )
+            tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
+            if self.pp_shared_kv is not None:
+                tensors.update(
+                    self.pp_shared_kv.export_chunk(
+                        full_num_tokens, self.topk_indices_buffer
+                    )
+                )
+            return IntermediateTensors(tensors)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -727,6 +864,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         for name, loaded_weight in weights:
+            cpu_match = re.fullmatch(
+                r"layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\."
+                r"(weight|weight_scale)",
+                name,
+            )
+            if cpu_match:
+                layer_id, expert, projection = map(int, cpu_match.groups()[:3])
+                if not self.start_layer <= layer_id < self.end_layer:
+                    continue
+                experts = self.layers[layer_id].ffn.experts
+                if isinstance(experts, CPUExpertModule):
+                    experts.load_weight(
+                        expert, projection - 1, cpu_match.group(4), loaded_weight
+                    )
+                    loaded_params.add(name)
+                    continue
             if name.startswith(("vision.", "aligner.", "image_")):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
@@ -1095,6 +1248,7 @@ class DeepseekV41LLMForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_step: CEDStep | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
@@ -1102,8 +1256,13 @@ class DeepseekV41LLMForCausalLM(
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            ced_step=ced_step,
         )
         return hidden_states
+
+    def take_ced_draft_context(self):
+        ced = self.model.ced_prefill
+        return ced.take_draft_context() if ced is not None else None
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-collapse residual stream buffer (max_num_batched_tokens,
@@ -1118,6 +1277,9 @@ class DeepseekV41LLMForCausalLM(
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
+        for module in self.model.modules():
+            if isinstance(module, CPUExpertModule):
+                module.finalize()
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
 

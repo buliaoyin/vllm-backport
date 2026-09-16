@@ -744,6 +744,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         *args,
         skip_attn: bool = False,
         uniform_decode: bool = False,
+        num_reqs: int | None = None,
         context_len: int = 0,
         skip_eplb: bool = False,
         is_profile: bool = False,
@@ -756,7 +757,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Create a dummy scheduler output.
-        num_reqs = min(num_tokens, self.max_num_reqs)
+        if num_reqs is None:
+            num_reqs = min(num_tokens, self.max_num_reqs)
+        if not 0 < num_reqs <= min(num_tokens, self.max_num_reqs):
+            raise ValueError("Invalid number of requests for the dummy batch")
         if uniform_decode:
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
             # and for spec-decode with MTP we want to make sure the dummy runs use
@@ -1617,6 +1621,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        if (
+            not dummy_run
+            and batch_req_state is not None
+            and batch_req_state.has_prefill
+            and getattr(self.model_state, "requires_eager_prefill", False)
+        ):
+            skip_compiled = True
+
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -2041,6 +2053,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
+        )
+        model_runner_output.expert_cache_stats = (
+            self.model_state.take_expert_cache_stats()
         )
 
         if self.speculator is not None:

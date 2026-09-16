@@ -194,7 +194,7 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
                 torch.empty_like(q_ref),
                 torch.empty_like(q_scale_ref)
                 .view(torch.uint8)
-                .reshape(num_tokens, N_HEAD, -1),
+                .reshape(num_tokens, n_head, -1),
                 torch.empty_like(weights_ref),
             )
         else:
@@ -256,7 +256,9 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
     )
 
 
-@pytest.mark.skipif(not has_cutedsl(), reason="cutedsl (cutlass) not installed")
+@pytest.mark.skipif(
+    not is_cutedsl_supported(), reason="cutedsl is not supported on this device"
+)
 @pytest.mark.parametrize(
     "use_fp4",
     [

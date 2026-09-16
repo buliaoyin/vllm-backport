@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_bytes_per_block,
     _get_packed_kv_cache_groups,
     _pool_bytes_per_block,
+    _project_kv_cache_groups_to_worker,
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
@@ -650,3 +651,22 @@ class TestCompressorRingGroup:
             scheduler_block_size=128,
         )
         assert len(manager.coordinator.single_type_managers) == len(groups)
+
+
+@pytest.mark.parametrize("layout", ["BLHNC", "BLNHC"])
+def test_pipeline_rank_without_compressed_layers_allocates_only_local_cache(layout):
+    """Keep global group IDs while omitting another rank's compressed KV views."""
+    local = {"swa.0": _mla(512), "swa.1": _mla(512)}
+    groups = [
+        _uniform_group({"compressed.2": _mla(128)}),
+        _uniform_group(local),
+    ]
+    projected = _project_kv_cache_groups_to_worker(groups, local)
+    config = get_kv_cache_config_from_groups(
+        _mock_vllm_config(layout), projected, available_memory=MEMORY
+    )
+    caches = _bind(config, layout)
+    assert set(caches) == set(local)
+    assert [group.layer_names for group in config.kv_cache_groups] == [[], list(local)]
+    for cache in caches.values():
+        assert cache.shape == (config.num_blocks, 1, 64, 512)

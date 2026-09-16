@@ -631,6 +631,11 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return 0
+        if (
+            speculative_config.use_dspark()
+            and speculative_config.dspark_num_query_tokens is not None
+        ):
+            return speculative_config.dspark_num_query_tokens
         if speculative_config.use_dflash():
             # DFlash requires an extra lookahead slot since it uses in-fill-style
             # decoding instead of standard next-token sampling, so it has a query

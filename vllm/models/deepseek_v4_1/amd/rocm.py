@@ -480,6 +480,7 @@ class DeepseekV41ROCMAiterSparseSWABackend(DeepseekSparseSWABackend):
 class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4.1."""
 
+    _combine_prefill_indices = staticmethod(combine_topk_swa_indices)
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
     swa_backend_cls = DeepseekV41ROCMAiterSparseSWABackend
 
@@ -878,7 +879,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = combine_topk_swa_indices(
+            combined_indices, combined_lens = self._combine_prefill_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[
                     num_decodes + chunk_start : num_decodes + chunk_end + 1

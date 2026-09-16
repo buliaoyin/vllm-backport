@@ -309,3 +309,29 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     runner.capture_model(profile_only=True)
 
     assert lock_calls == []
+
+
+@pytest.mark.parametrize("num_reqs", [1, 16])
+def test_dummy_profile_preserves_requested_batch_shape(num_reqs):
+    """Memory profiling must exercise one long query as well as many short ones."""
+    from unittest.mock import Mock
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.max_num_reqs = 16
+    runner.kv_connector = Mock()
+    runner.is_first_pp_rank = True
+    runner.lora_config = None
+    runner.maybe_dummy_run_with_lora = lambda *args, **kwargs: contextlib.nullcontext()
+    captured = []
+
+    class ForwardReached(Exception):
+        pass
+
+    def forward(batch, *args, **kwargs):
+        captured.append(batch.num_scheduled_tokens)
+        raise ForwardReached
+
+    runner.execute_model = forward
+    with pytest.raises(ForwardReached):
+        runner._dummy_run(2048, num_reqs=num_reqs, skip_eplb=True)
+    assert list(captured[0].values()) == [2048 // num_reqs] * num_reqs

@@ -30,6 +30,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
 )
 from vllm.models.deepseek_v4.compressor import _get_c128_boundary
+from vllm.models.deepseek_v4_1.pp_kv import pack_kv_rows, scatter_kv_rows
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.v1.attention.backends.mla.compressor_utils import (
@@ -1667,3 +1668,203 @@ def test_fused_kv_insert_split(num_tokens: int, kv_block_size: int):
     # RoPE (last 64): stored as bf16. The kernel recomputes the rotation, so it
     # is bf16-close to the reference rather than bit-exact (cf. test_cutedsl).
     torch.testing.assert_close(recovered[:, NOPE_DIM:], ref[:, NOPE_DIM:])
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CED Ampere path")
+@torch.inference_mode()
+def test_ced_publishes_global_kv_with_fp32_projection_and_padding():
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.deepseek_v4_1.attention import DeepseekV4Indexer
+    from vllm.models.deepseek_v4_1.ced import publish_decoder_kv
+    from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+
+    torch.manual_seed(93)
+    hidden = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
+    hidden[5:] = float("nan")
+    weight = torch.randn(512, 64, dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(8, device="cuda")
+    slots = positions.clone()
+    slots[5:] = -1
+    main = torch.full((1, 128, 584), 37, dtype=torch.uint8, device="cuda")
+    index = torch.full((1, 128, 132), 37, dtype=torch.uint8, device="cuda")
+    rotary = SimpleNamespace(cos_sin_cache=torch.randn(16, 64, device="cuda"))
+    compressor = DeepseekCompressor.__new__(DeepseekCompressor)
+    torch.nn.Module.__init__(compressor)
+    compressor.head_dim = 512
+    compressor.compress_ratio = 1
+    compressor.rms_norm_eps = 1e-6
+    compressor.norm = SimpleNamespace(
+        weight=torch.ones(512, dtype=torch.bfloat16, device="cuda")
+    )
+    compressor.fused_wkv_wgate = SimpleNamespace(weight=weight)
+    compressor.state_cache = None
+    compressor.k_cache_prefix = "main"
+    compressor._static_forward_context = {"main": SimpleNamespace(kv_cache=main)}
+    wk = torch.randn(128, 512, dtype=torch.bfloat16, device="cuda")
+    indexer = SimpleNamespace(
+        owns_k=True,
+        wk=lambda latent: (torch.nn.functional.linear(latent, wk), None),
+        k_norm=SimpleNamespace(
+            weight=torch.ones(128, dtype=torch.bfloat16, device="cuda"),
+            variance_epsilon=1e-6,
+        ),
+        k_cache=SimpleNamespace(prefix="index", kv_cache=index),
+        compress_ratio=1,
+        use_fp4_kv=False,
+    )
+    indexer._produce_k = lambda *args: DeepseekV4Indexer._produce_k(indexer, *args)
+    attn = SimpleNamespace(
+        compressor=compressor,
+        indexer=indexer,
+        rotary_emb=rotary,
+        indexer_rotary_emb=rotary,
+    )
+    metadata = {name: SimpleNamespace(slot_mapping=slots) for name in ("main", "index")}
+    with override_forward_context(ForwardContext({}, metadata, {})):
+        latent = publish_decoder_kv(attn, hidden, positions)
+    raw = hidden[:5].float() @ weight.float().T
+    reference = raw * torch.rsqrt(raw.square().mean(-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(latent[:5].float(), reference, atol=0.015, rtol=0.005)
+    # fp8_ds_mla packs payload/scales within each page, rather than storing
+    # independent contiguous rows. Compare complete pages with an unpadded run.
+    reference_main, reference_index = (
+        torch.full_like(main, 37),
+        torch.full_like(index, 37),
+    )
+    compressor._static_forward_context["main"].kv_cache = reference_main
+    indexer.k_cache.kv_cache = reference_index
+    metadata = {
+        name: SimpleNamespace(slot_mapping=slots[:5]) for name in ("main", "index")
+    }
+    with override_forward_context(ForwardContext({}, metadata, {})):
+        publish_decoder_kv(attn, hidden[:5], positions[:5])
+    for actual, expected in ((main, reference_main), (index, reference_index)):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert (actual != 37).any()
+
+
+def _pp_kv_row_view(cache_cpu, slot, block):
+    page = cache_cpu[slot // block].flatten()
+    offset = slot % block
+    return torch.cat(
+        (
+            page[: block * 576].view(block, 576)[offset],
+            page[block * 576 : block * 584].view(block, 8)[offset],
+        )
+    )
+
+
+def _pp_kv_put_row(cache_cpu, slot, block, row):
+    page = cache_cpu[slot // block].flatten()
+    offset = slot % block
+    page[: block * 576].view(block, 576)[offset].copy_(row[:576])
+    page[block * 576 : block * 584].view(block, 8)[offset].copy_(row[576:])
+
+
+@pytest.mark.parametrize("device_id", [0, 3])
+@pytest.mark.parametrize("block", [64, 128])
+def test_kv_increment_preserves_history_padding_and_rewrites(device_id, block):
+    if torch.accelerator.device_count() <= device_id:
+        pytest.skip("Requested GPU is unavailable")
+    torch.accelerator.set_device_index(device_id)
+    device = torch.device("cuda", device_id)
+    # Strided pages ensure the kernel uses the allocation's physical page stride.
+    storage = torch.randint(0, 256, (8, block, 584), dtype=torch.uint8, device=device)
+    source = storage[::2]
+    source_cpu = source.cpu()
+    replica = torch.full_like(storage, 167)[::2]
+    expected = replica.cpu()
+    for source_ids, destination_ids in [
+        ([-1, 0, -1, block + 3, -1], [-1, block + 1, -1, 2, -1]),
+        ([block * 2 + 1, -1, block - 1], [block * 3, -1, block + 2]),
+        ([block * 2 + 7, -1, 1], [block * 3, -1, block + 1]),
+    ]:
+        src_slots = torch.tensor(source_ids, dtype=torch.int64, device=device)
+        dst_slots = torch.tensor(destination_ids, dtype=torch.int64, device=device)
+        rows = pack_kv_rows(source, src_slots, len(source_ids) + 2)
+        scatter_kv_rows(rows, replica, dst_slots)
+        actual_rows = rows.cpu()
+        for i, (src, dst) in enumerate(zip(source_ids, destination_ids)):
+            if src < 0:
+                assert not actual_rows[i].any()
+            else:
+                row = _pp_kv_row_view(source_cpu, src, block)
+                torch.testing.assert_close(actual_rows[i], row, rtol=0, atol=0)
+                _pp_kv_put_row(expected, dst, block, row)
+        assert not actual_rows[len(source_ids) :].any()
+        torch.testing.assert_close(replica.cpu(), expected, rtol=0, atol=0)
+
+
+def test_kv_increment_cross_device_copy_uses_consumer_slots():
+    if torch.accelerator.device_count() < 2:
+        pytest.skip("Requires two GPUs")
+    source = torch.randint(0, 256, (2, 64, 584), device="cuda:0", dtype=torch.uint8)
+    replica = torch.zeros((2, 64, 584), device="cuda:1", dtype=torch.uint8)
+    source_slots = torch.tensor([-1, 7, -1, 65], device="cuda:0", dtype=torch.int64)
+    destination_slots = torch.tensor(
+        [-1, 70, -1, 3], device="cuda:1", dtype=torch.int64
+    )
+    with torch.accelerator.device_index(0):
+        rows = pack_kv_rows(source, source_slots, 4)
+    received = rows.to("cuda:1", non_blocking=True)
+    with torch.accelerator.device_index(1):
+        scatter_kv_rows(received, replica, destination_slots)
+    expected = torch.zeros_like(replica, device="cpu")
+    source_cpu = source.cpu()
+    _pp_kv_put_row(expected, 70, 64, _pp_kv_row_view(source_cpu, 7, 64))
+    _pp_kv_put_row(expected, 3, 64, _pp_kv_row_view(source_cpu, 65, 64))
+    torch.testing.assert_close(replica.cpu(), expected, rtol=0, atol=0)
+
+
+def test_kv_increment_cuda_graph_reuses_slots_and_rejected_positions():
+    if not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+    with torch.accelerator.device_index(0):
+        source = torch.randint(0, 256, (2, 64, 584), device="cuda:0", dtype=torch.uint8)
+        replica = torch.zeros_like(source)
+        slots = torch.tensor([-1, 7, -1, 65], device="cuda:0", dtype=torch.int64)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                scatter_kv_rows(pack_kv_rows(source, slots, 4), replica, slots)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            rows = pack_kv_rows(source, slots, 4)
+            scatter_kv_rows(rows, replica, slots)
+        for ids in [[-1, 7, -1, 65], [-1, 7, -1, -1], [-1, 8, -1, 65]]:
+            source.random_(0, 256)
+            slots.copy_(torch.tensor(ids, dtype=torch.int64))
+            graph.replay()
+            expected_source, actual = source.cpu(), replica.cpu()
+            for slot in ids:
+                if slot >= 0:
+                    torch.testing.assert_close(
+                        _pp_kv_row_view(actual, slot, 64),
+                        _pp_kv_row_view(expected_source, slot, 64),
+                        rtol=0,
+                        atol=0,
+                    )
+
+
+def test_kv_increment_offsets_above_two_gib_do_not_wrap():
+    if not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+    with torch.accelerator.device_index(0):
+        block = 128
+        cache = torch.empty((32769, block, 584), device="cuda:0", dtype=torch.uint8)
+        page = torch.randint(0, 256, (block, 584), dtype=torch.uint8)
+        cache[-1].copy_(page)
+        slot = (cache.shape[0] - 1) * block + 71
+        assert (cache.shape[0] - 1) * cache.stride(0) > 2**31
+        slots = torch.tensor([slot], device="cuda:0", dtype=torch.int64)
+        packed = pack_kv_rows(cache, slots, 1)
+        torch.testing.assert_close(
+            packed.cpu()[0], _pp_kv_row_view(page[None], 71, block)
+        )
+        replacement = torch.arange(584, device="cuda:0").to(torch.uint8)[None]
+        scatter_kv_rows(replacement, cache, slots)
+        torch.testing.assert_close(
+            _pp_kv_row_view(cache[-1:].cpu(), 71, block), replacement.cpu()[0]
+        )

@@ -62,6 +62,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
+    ExpertCacheStats,
     PrefixCacheStats,
     RequestSpecDecodeMetrics,
     SchedulerStats,
@@ -562,6 +563,10 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self.cache_config.kv_cache_tokens is not None and self.connector is None:
+            for request in self.running:
+                self.kv_cache_manager.recycle_sliding_windows(request)
+
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -2291,6 +2296,7 @@ class Scheduler(SchedulerInterface):
                 kv_connector_stats,
                 cudagraph_stats,
                 perf_stats,
+                model_runner_output.expert_cache_stats,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -2775,6 +2781,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        expert_cache_stats: ExpertCacheStats | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -2802,6 +2809,7 @@ class Scheduler(SchedulerInterface):
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
+            expert_cache_stats=expert_cache_stats,
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,

@@ -166,6 +166,20 @@ def get_pp_indices(
     are attempting to reduce maximum memory consumption across partitions.
     """
     partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if (
+        config is not None
+        and num_hidden_layers == 40
+        and isinstance(config.additional_config, dict)
+    ):
+        settings = config.additional_config.get("deepseek_v41_hybrid")
+        if settings is not None:
+            configured = ",".join(map(str, settings["pipeline_layers"]))
+            if partition_list_str is not None and partition_list_str != configured:
+                raise ValueError("Conflicting hybrid and environment PP partitions")
+            partition_list_str = configured
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]

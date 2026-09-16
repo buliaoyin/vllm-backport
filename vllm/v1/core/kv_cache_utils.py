@@ -1725,6 +1725,8 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
+        if not group.layer_names:
+            continue
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
@@ -2321,6 +2323,19 @@ def update_kv_cache_capacity(
     vllm_config.cache_config.kv_cache_size_tokens = num_tokens
     vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
     max_model_len = vllm_config.model_config.max_model_len
+    if vllm_config.cache_config.kv_cache_tokens is not None:
+        logger.info_once(
+            "GPU KV cache token budget: %s aggregate tokens for up to %d requests. "
+            "The physical pool also reserves per-request state, in-flight tokens "
+            "and block alignment; its full-context equivalent is %s tokens "
+            "(%.2fx requests of %s tokens), not the configured token budget.",
+            f"{vllm_config.cache_config.kv_cache_tokens:,}",
+            vllm_config.scheduler_config.max_num_seqs,
+            f"{num_tokens:,}",
+            max_concurrency,
+            f"{max_model_len:,}",
+        )
+        return
     logger.info_once(
         "GPU KV cache size: %s tokens, "
         "Maximum concurrency for %s tokens per request: %.2fx",
@@ -2384,6 +2399,50 @@ def _max_memory_usage_bytes_from_groups(
             )
 
     return bytes_per_block * total_blocks
+
+
+def _token_budget_num_blocks(
+    config: VllmConfig, groups: list[KVCacheGroupSpec], target: int, num_reqs: int
+) -> int:
+    budget = copy.copy(config)
+    budget.model_config = copy.copy(config.model_config)
+    budget.model_config.max_model_len = min(
+        cdiv(target, num_reqs), config.model_config.max_model_len
+    )
+    shared_scratch = config.max_in_flight_tokens + num_reqs * (
+        config.num_lookahead_tokens + config.num_speculative_tokens
+    )
+    total = 0
+    for group in groups:
+        group_blocks = 0
+        for spec in iter_layer_specs(group.kv_cache_spec):
+            blocks = cdiv(spec.max_memory_usage_bytes(budget), spec.page_size_bytes)
+            blocks = blocks * num_reqs + num_reqs - 1
+            if isinstance(spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
+                # The scheduler recycles idle requests' completed windows before
+                # allocation, so in-flight batch scratch is shared across requests.
+                resident = spec.max_admission_blocks_per_request(
+                    0, budget.model_config.max_model_len
+                )
+                blocks = min(
+                    blocks,
+                    resident * num_reqs
+                    + cdiv(shared_scratch, spec.block_size)
+                    + num_reqs
+                    - 1,
+                )
+            group_blocks = max(group_blocks, blocks)
+        total += group_blocks
+    return (
+        max(
+            total,
+            cdiv(
+                _max_memory_usage_bytes_from_groups(config, groups) * target,
+                _pool_bytes_per_block(groups) * config.model_config.max_model_len,
+            ),
+        )
+        + 2
+    )
 
 
 def _estimate_max_model_len_from_groups(
@@ -2606,6 +2665,73 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+
+    token_budget = vllm_config.cache_config.kv_cache_tokens
+    hybrid_experts = (
+        isinstance(vllm_config.additional_config, dict)
+        and vllm_config.additional_config.get("deepseek_v41_hybrid") is not None
+        and vllm_config.cache_config.kv_cache_memory_bytes is None
+        and vllm_config.cache_config.num_gpu_blocks_override is None
+    )
+    if token_budget is not None or hybrid_experts:
+        target = token_budget or vllm_config.model_config.max_model_len
+        max_len = vllm_config.model_config.max_model_len
+        if target < max_len:
+            raise ValueError("kv_cache_tokens must be at least max_model_len")
+        num_reqs = min(vllm_config.scheduler_config.max_num_seqs, target)
+        budget_config = copy.copy(vllm_config)
+        budget_config.model_config = copy.copy(vllm_config.model_config)
+        budget_config.model_config.max_model_len = min(cdiv(target, num_reqs), max_len)
+        blocks = max(
+            (
+                max(
+                    cdiv(
+                        _max_memory_usage_bytes_from_groups(budget_config, groups),
+                        _pool_bytes_per_block(groups),
+                    )
+                    * num_reqs
+                    + (num_reqs - 1) * len(groups),
+                    cdiv(
+                        _max_memory_usage_bytes_from_groups(vllm_config, groups)
+                        * target,
+                        _pool_bytes_per_block(groups) * max_len,
+                    ),
+                )
+                + 2
+                for groups in projected_groups_per_worker
+                if groups
+            ),
+            default=1,
+        )
+        if token_budget is not None and vllm_config.kv_transfer_config is None:
+            blocks = max(
+                (
+                    _token_budget_num_blocks(vllm_config, groups, target, num_reqs)
+                    for groups in projected_groups_per_worker
+                    if groups
+                ),
+                default=1,
+            )
+        reserved_memory = []
+        for rank, (groups, memory) in enumerate(
+            zip(projected_groups_per_worker, available_memory)
+        ):
+            required = blocks * _pool_bytes_per_block(groups) if groups else 0
+            if token_budget is not None and required > memory:
+                raise ValueError(
+                    f"KV cache budget of {target} tokens requires "
+                    f"{required / 1024**3:.3f} GiB on worker {rank}, "
+                    f"but only {memory / 1024**3:.3f} GiB is available"
+                )
+            reserved_memory.append(min(memory, required) if groups else memory)
+        available_memory = reserved_memory
+        logger.info(
+            "Reserving %s GiB KV per worker for %d aggregate tokens "
+            "and up to %d active requests",
+            [round(n / 1024**3, 3) for n in available_memory],
+            target,
+            num_reqs,
+        )
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:

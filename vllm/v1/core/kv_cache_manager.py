@@ -15,7 +15,11 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    ChunkedLocalAttentionManager,
+    MambaManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -608,6 +612,15 @@ class KVCacheManager:
         self.coordinator.remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
         )
+
+    def recycle_sliding_windows(self, request: Request) -> None:
+        """Release completed windows without touching any in-flight attention."""
+        processed = max(0, request.num_computed_tokens - request.num_in_flight_tokens)
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(
+                manager, (SlidingWindowManager, ChunkedLocalAttentionManager)
+            ):
+                manager.remove_skipped_blocks(request.request_id, processed)
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without

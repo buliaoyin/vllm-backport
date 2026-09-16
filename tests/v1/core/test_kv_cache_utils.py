@@ -3992,3 +3992,100 @@ def test_deepseek_v4_annotation_requires_model_type():
     )
 
     assert not any(g.is_eagle_group for g in groups)
+
+
+def test_hybrid_reserves_one_million_tokens_before_expert_cache():
+    """PP workers keep a complete context and leave excess bytes for experts."""
+    model = ModelConfig(max_model_len=512)
+    model.max_model_len = 1048576
+    config = VllmConfig(
+        model_config=model,
+        cache_config=CacheConfig(),
+        additional_config={"deepseek_v41_hybrid": {}},
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1, max_model_len=model.max_model_len, is_encoder_decoder=False
+        ),
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    spec = new_kv_cache_spec(block_size=64)
+    workers = [{"first": spec}, {"second": spec, "third": spec}]
+    required = spec.page_size_bytes * (model.max_model_len // 64 + 2)
+    caches = get_kv_cache_configs(config, workers, [required * 4, required * 8])
+    assert caches[0].num_blocks == caches[1].num_blocks
+    assert (caches[0].num_blocks - 1) * 64 >= model.max_model_len
+    assert sum(t.size for t in caches[0].kv_cache_tensors) == required
+    assert sum(t.size for t in caches[1].kv_cache_tensors) == required * 2
+    with pytest.raises(ValueError, match="KV cache"):
+        get_kv_cache_configs(config, workers, [required // 2, required * 8])
+
+
+def test_explicit_kv_token_budget_reserves_concurrent_capacity_before_experts():
+    """The aggregate budget is independent of one request's context limit."""
+    model = ModelConfig(max_model_len=512)
+    model.max_model_len = 524288
+    config = VllmConfig(
+        model_config=model,
+        cache_config=CacheConfig(kv_cache_tokens=2097152),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=16, max_model_len=model.max_model_len, is_encoder_decoder=False
+        ),
+        additional_config={"deepseek_v41_hybrid": {}},
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    spec = new_kv_cache_spec(block_size=64)
+    workers = [{"first": spec}, {"second": spec, "third": spec}]
+    target = spec.page_size_bytes * (2097152 // 64)
+    caches = get_kv_cache_configs(config, workers, [target * 4, target * 8])
+    assert caches[0].num_blocks == caches[1].num_blocks
+    assert (caches[0].num_blocks - 1) * 64 >= 2097152
+    assert sum(t.size for t in caches[0].kv_cache_tensors) < target * 1.01
+    with pytest.raises(ValueError, match="2097152 tokens requires"):
+        get_kv_cache_configs(config, workers, [target // 2, target * 8])
+
+
+@pytest.mark.parametrize(
+    "windowed", [new_sliding_window_spec, new_chunked_local_attention_spec]
+)
+def test_token_budget_shares_scratch_between_requests(windowed):
+    """Sixteen requests must not reserve sixteen copies of the batch workspace."""
+    model = ModelConfig(max_model_len=2048)
+    config = VllmConfig(
+        model_config=model,
+        cache_config=CacheConfig(kv_cache_tokens=4096),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=16,
+            max_model_len=2048,
+            max_num_batched_tokens=256,
+            is_encoder_decoder=False,
+        ),
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    workers = [{"full": new_kv_cache_spec(), "window": windowed()}]
+    caches = get_kv_cache_configs(config, workers, [1 << 30])
+    # Full KV: 256 blocks; windows/state/alignment and one shared batch:
+    # comfortably below the 256 extra blocks the old formula reserved.
+    assert 256 < caches[0].num_blocks < 384
+    assert get_kv_cache_capacity(config, caches[0])[0] >= 4096
+
+
+@pytest.mark.parametrize("in_flight", [0, 16])
+def test_idle_window_recycling_preserves_inflight_readers(in_flight):
+    """Only the committed prefix may be released before another request runs."""
+    from tests.v1.core.utils import create_requests, create_scheduler
+
+    scheduler = create_scheduler(
+        max_model_len=128,
+        block_size=4,
+        max_num_batched_tokens=32,
+        kv_cache_spec=new_sliding_window_spec(block_size=4, sliding_window=4),
+    )
+    request = create_requests(1, num_tokens=64, block_size=4)[0]
+    manager = scheduler.kv_cache_manager
+    blocks = manager.allocate_slots(request, 32).blocks[0]
+    request.num_computed_tokens = 32
+    request.num_in_flight_tokens = in_flight
+    manager.recycle_sliding_windows(request)
+    # Keep the last window before the oldest unfinished query, plus all writes.
+    first_retained = (32 - in_flight - 3) // 4
+    assert all(b.ref_cnt == 0 for b in blocks[:first_retained])
+    assert all(b.ref_cnt == 1 for b in blocks[first_retained:])

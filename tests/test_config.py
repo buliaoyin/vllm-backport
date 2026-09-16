@@ -1151,6 +1151,72 @@ def test_max_num_new_slots_for_drafting(method, parallel_drafting, expected_slot
     assert speculative_config.max_num_new_slots_for_drafting == expected_slots
 
 
+def test_dspark_query_prefix_reserves_full_backbone_slots():
+    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=3)
+    spec.method = "dspark"
+    spec.parallel_drafting = True
+    spec.draft_sample_method = "greedy"
+    spec.enable_adaptive_verification = False
+    spec.dspark_num_query_tokens = 5
+    spec._verify_args()
+    config = object.__new__(VllmConfig)
+    config.speculative_config = spec
+
+    assert config.num_speculative_tokens == 3
+    assert config.num_lookahead_tokens == 5
+    assert spec.max_num_new_slots_for_drafting == 4
+
+
+@pytest.mark.parametrize("query_tokens", [None, 3, 5])
+def test_dspark_draft_attention_preserves_target_verification(query_tokens):
+    from vllm.config import AttentionConfig
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    from vllm.v1.worker.gpu.spec_decode.dspark.utils import dspark_backbone_vllm_config
+
+    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=3)
+    spec.method = "dspark"
+    spec.dspark_num_query_tokens = query_tokens
+    target = object.__new__(VllmConfig)
+    target.speculative_config = spec
+    target.attention_config = AttentionConfig(use_non_causal=False)
+    draft = dspark_backbone_vllm_config(target)
+
+    assert draft.num_speculative_tokens == (query_tokens or 3)
+    assert target.num_speculative_tokens == 3
+    if query_tokens in (None, 3):
+        assert draft is target
+    else:
+        assert draft is not target
+        assert draft.speculative_config is not spec
+
+    speculator = object.__new__(DSparkSpeculator)
+    speculator.vllm_config = target
+    speculator.requires_non_causal = True
+    attention = speculator.attn_vllm_config
+    assert attention.num_speculative_tokens == (query_tokens or 3)
+    assert attention.attention_config.use_non_causal
+    assert not target.attention_config.use_non_causal
+    assert target.num_speculative_tokens == 3
+
+
+@pytest.mark.parametrize("query_tokens", [0, 2])
+def test_dspark_query_prefix_cannot_omit_proposed_positions(query_tokens):
+    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=3)
+    spec.method = "dspark"
+    spec.draft_sample_method = "greedy"
+    spec.enable_adaptive_verification = False
+    spec.dspark_num_query_tokens = query_tokens
+    with pytest.raises(ValueError, match="cover every proposed token"):
+        spec._verify_args()
+
+
+def test_dspark_query_length_is_rejected_for_other_methods():
+    with pytest.raises(ValueError, match="requires greedy DSpark"):
+        SpeculativeConfig(
+            model="ngram", num_speculative_tokens=3, dspark_num_query_tokens=5
+        )
+
+
 @dataclass
 class _TestConfigFields:
     a: int
@@ -2885,3 +2951,60 @@ def test_revision_resolved_when_weights_match_model(mock_resolve):
     assert isinstance(config.revision, ResolvedRevision)
     assert config.revision.resolved == REVISION
     mock_resolve.assert_any_call(model, None, config.hf_token)
+
+
+def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(monkeypatch):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1 import hybrid
+
+    monkeypatch.setattr(
+        hybrid, "native_libraries", lambda: [Path("ik.so"), Path("cuda.so")]
+    )
+    args = EngineArgs(
+        pipeline_parallel_size=3,
+        max_num_batched_tokens=4096,
+        additional_config={"deepseek_v41_hybrid": {"pipeline_layers": [7, 7, 26]}},
+        speculative_config={"method": "dspark"},
+    )
+    hybrid.apply_hybrid_defaults(args)
+    hybrid.apply_hybrid_defaults(args)
+    assert args.max_num_batched_tokens == 4096
+    assert args.max_num_seqs == 1
+    assert args.enable_prefix_caching is False
+    assert args.kv_cache_memory_bytes is None
+    assert args.limit_mm_per_prompt == {"image": 1}
+    assert args.speculative_config["num_speculative_tokens"] == 3
+    assert args.additional_config["cpu_phase_threads"] == [22, 22]
+    assert "gpu_cache_selections" not in args.additional_config["cpu_moe"]
+
+
+@pytest.mark.parametrize(
+    "extra", [{"kv_cache_memory_bytes": 1024}, {"num_gpu_blocks_override": 10}]
+)
+def test_kv_token_budget_rejects_conflicting_byte_or_block_budgets(extra):
+    from vllm.config import CacheConfig
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        CacheConfig(kv_cache_tokens=2097152, **extra)
+
+
+def test_hybrid_keeps_explicit_concurrency_and_kv_tokens(monkeypatch):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1 import hybrid
+
+    monkeypatch.setattr(
+        hybrid, "native_libraries", lambda: [Path("ik.so"), Path("cuda.so")]
+    )
+    args = EngineArgs(
+        pipeline_parallel_size=4,
+        max_num_seqs=16,
+        max_model_len=524288,
+        kv_cache_tokens=2097152,
+        additional_config={"deepseek_v41_hybrid": {"pipeline_layers": [4, 4, 4, 28]}},
+    )
+    hybrid.apply_hybrid_defaults(args)
+    assert (args.max_num_seqs, args.max_model_len, args.kv_cache_tokens) == (
+        16,
+        524288,
+        2097152,
+    )

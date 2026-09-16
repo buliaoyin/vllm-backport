@@ -30,6 +30,32 @@ _INFLIGHT_REQUEST_POLL_INTERVAL = 0.1
 _ABORT_CLIENT_TIMEOUT = 3
 
 
+@pytest.mark.parametrize(
+    "request_timeout,process_timeout,cleanup_timeout,expected",
+    [
+        (0, 0, 60, 60),
+        (0, 0, 0, 0),
+        (10, 0, 60, 0),
+        (0, 5, 60, 5),
+        (0, None, 60, None),
+        (10, 10, 60, 10),
+    ],
+)
+def test_executor_cleanup_grace_preserves_explicit_request_deadlines(
+    monkeypatch, request_timeout, process_timeout, cleanup_timeout, expected
+):
+    """Immediate abort allows resource teardown without extending drain deadlines."""
+    from vllm.v1.engine import utils as engine_utils
+
+    monkeypatch.setattr(engine_utils.current_platform, "is_rocm", lambda: False)
+    assert (
+        engine_utils.get_engine_process_shutdown_timeout(
+            request_timeout, process_timeout, cleanup_timeout=cleanup_timeout
+        )
+        == expected
+    )
+
+
 def _get_child_pids(parent_pid: int) -> list[int]:
     try:
         parent = psutil.Process(parent_pid)

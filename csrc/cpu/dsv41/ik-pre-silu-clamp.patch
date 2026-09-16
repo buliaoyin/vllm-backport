@@ -1,0 +1,16 @@
+--- a/ggml/src/iqk/iqk_mul_mat.cpp
++++ b/ggml/src/iqk/iqk_mul_mat.cpp
+@@ -151,8 +151,12 @@
+                     auto x = this_info.dst_row(ky);
+                     for (int j = 0; j < this_nrc_x; ++j) x[j] += b[j];
+                 }
++                if (limit > 1e-6f && op == GGML_UNARY_OP_SILU) {
++                    auto gate = this_info.dst_row(ky);
++                    for (int j = 0; j < this_nrc_x; ++j) gate[j] = std::min(gate[j], limit);
++                }
+                 activate(op, this_nrc_x, this_info.dst_row(ky), tmp + ky*xstep);
+-                if (limit > 1e-6f) {
++                if (limit > 1e-6f && op != GGML_UNARY_OP_SILU) {
+                     for (int j = 0; j < this_nrc_x; ++j) tmp[ky*xstep + j] = std::min(tmp[ky*xstep + j], limit);
+                 }
+             }

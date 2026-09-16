@@ -46,6 +46,8 @@ ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S = 15.0
 def get_engine_process_shutdown_timeout(
     request_timeout: float | None,
     process_timeout: float | None,
+    *,
+    cleanup_timeout: float = 0,
 ) -> float | None:
     """Return the EngineCore process-manager shutdown timeout.
 
@@ -53,16 +55,21 @@ def get_engine_process_shutdown_timeout(
     drain. A value of zero therefore tells EngineCore to abort requests as soon
     as it receives SIGTERM. The parent process manager still needs a separate
     window in which the EngineCore can release device resources before it is
-    force-killed. ROCm teardown can take longer than the generic best-effort
-    window, and force-killing during teardown can leave VRAM resident.
+    force-killed. ``cleanup_timeout`` allows executor-owned resources such as
+    CUDA MPS to stop after the workers exit. ROCm teardown can take longer than
+    the generic best-effort window, and force-killing during teardown can leave
+    VRAM resident.
 
     ``process_timeout`` may be a remaining budget computed by an outer process
     manager. Keep it unchanged unless both values are zero: a zero remaining
     budget for a positive request timeout must not receive a fresh grace period
     because EngineCore relies on that deadline to enforce request draining.
     """
-    if request_timeout == 0 and process_timeout == 0 and current_platform.is_rocm():
-        return ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S
+    if request_timeout == 0 and process_timeout == 0:
+        if cleanup_timeout > 0:
+            return cleanup_timeout
+        if current_platform.is_rocm():
+            return ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S
     return process_timeout
 
 
@@ -160,7 +167,12 @@ class CoreEngineProcManager:
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
     ):
+        from vllm.models.deepseek_v4_1.hybrid import hybrid_settings
+
         self._request_shutdown_timeout = vllm_config.shutdown_timeout
+        self._process_cleanup_timeout = (
+            60.0 if hybrid_settings(vllm_config) is not None else 0.0
+        )
         context = get_mp_context()
         common_kwargs = {
             "vllm_config": vllm_config,
@@ -243,11 +255,13 @@ class CoreEngineProcManager:
         self.manager_stopped.set()
         if self._finalizer.detach() is not None:
             process_timeout = get_engine_process_shutdown_timeout(
-                self._request_shutdown_timeout, timeout
+                self._request_shutdown_timeout,
+                timeout,
+                cleanup_timeout=self._process_cleanup_timeout,
             )
             if process_timeout != timeout:
                 logger.info(
-                    "[shutdown] EngineCore process manager: using %ss ROCm "
+                    "[shutdown] EngineCore process manager: using %ss "
                     "cleanup grace after immediate request abort",
                     process_timeout,
                 )

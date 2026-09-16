@@ -23,6 +23,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
+    is_deep_gemm_supported,
     native_next_n_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
@@ -1590,11 +1591,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices.
+            # Match the logits backend: Triton does not consume this schedule.
             # Schedule the sharded rows, not the batch: this is the work
             # decomposition for the very call the shard narrows.
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if is_deep_gemm_supported():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens
                     if decode_shard_bounds is None

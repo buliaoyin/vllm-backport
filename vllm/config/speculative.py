@@ -442,6 +442,11 @@ class SpeculativeConfig:
     speculative methods. This is an experimental option for measuring the
     acceptance-rate impact of reusing that block. It does not disable the
     speculative drafter itself."""
+    dspark_num_query_tokens: int | None = None
+    """Optional DSpark backbone query length, including the predicting anchor.
+    It can exceed num_speculative_tokens to preserve a trained query block while
+    proposing only its prefix. Requires greedy DSpark with
+    sample_from_anchor=True and fixed-length verification."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -1786,6 +1791,21 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.dspark_num_query_tokens is not None:
+            if (
+                not self.use_dspark()
+                or self.draft_sample_method != "greedy"
+                or self.enable_adaptive_verification
+            ):
+                raise ValueError(
+                    "dspark_num_query_tokens requires greedy DSpark with fixed "
+                    "verification length"
+                )
+            if self.dspark_num_query_tokens < self.num_speculative_tokens:
+                raise ValueError(
+                    "dspark_num_query_tokens must cover every proposed token"
+                )
+
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1846,7 +1866,8 @@ class SpeculativeConfig:
         """Return the maximum additional drafting slots per request.
 
         The scheduler budget already includes one query slot per decoding request.
-        Let K be ``num_speculative_tokens``. Standard configurations require:
+        Let K be ``num_speculative_tokens``. A DSpark query-length override Q
+        reserves Q - 1 additional slots. Standard configurations require:
 
         ==================== ============= ======== ================
         Algorithm            Method        Parallel Additional slots
@@ -1862,6 +1883,8 @@ class SpeculativeConfig:
         ==================== ============= ======== ================
         """
         num_draft_tokens = self.num_speculative_tokens
+        if self.use_dspark() and self.dspark_num_query_tokens is not None:
+            return self.dspark_num_query_tokens - 1
 
         if self.use_dflash():
             # DFlash uses one bonus query followed by K mask queries.

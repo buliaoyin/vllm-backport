@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm.config import (
     DeviceConfig,
     KVTransferConfig,
     ModelConfig,
+    ParallelConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -76,3 +79,55 @@ def test_get_kv_connector_cache_layout_with_multi_connector():
         # Test with default settings
         layout = get_kv_connector_cache_layout()
         assert layout == "LBHNC"
+
+
+@pytest.mark.parametrize("requested", [None, "BLNHC"])
+def test_pipeline_stages_resolve_a_layout_supported_by_every_backend(
+    monkeypatch, requested
+):
+    """SWA-only PP stages must not prevent sharing a compressed-KV layout."""
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    if requested:
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", requested)
+    config = VllmConfig(
+        device_config=DeviceConfig("cpu"),
+        parallel_config=ParallelConfig(pipeline_parallel_size=4),
+    )
+    supported = [
+        ["LBNHC", "LBHNC", "BLNHC", "BLHNC", "BHLNC", "LHBNC"],
+        *[["BLHNC", "BLNHC"]] * 3,
+    ]
+    layout = resolve_kv_cache_layout(config, supported)
+    assert layout.name == (requested or "BLHNC")
+    assert config.cache_config.kv_cache_layout == layout.name
+
+
+@pytest.mark.parametrize(
+    ("supported", "requested"),
+    [([["LBNHC"], ["BLHNC"]], None), ([["LBNHC", "BLHNC"], ["BLHNC"]], "LBNHC")],
+)
+def test_pipeline_layout_rejects_incompatible_worker_or_explicit_choice(
+    monkeypatch, supported, requested
+):
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    if requested:
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", requested)
+    config = VllmConfig(
+        device_config=DeviceConfig("cpu"),
+        parallel_config=ParallelConfig(pipeline_parallel_size=2),
+    )
+    with pytest.raises(ValueError, match="supported set"):
+        resolve_kv_cache_layout(config, supported)
+    assert config.cache_config.kv_cache_layout is None
+
+
+def test_tensor_parallel_workers_still_require_identical_layout_preferences():
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    with pytest.raises(AssertionError, match="Workers disagree"):
+        resolve_kv_cache_layout(config, [["BLHNC", "BLNHC"], ["BLHNC"]])

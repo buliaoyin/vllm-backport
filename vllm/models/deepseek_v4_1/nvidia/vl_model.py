@@ -22,7 +22,7 @@ from typing import Annotated
 import torch
 from torch import nn
 
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -31,6 +31,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    StageMissingLayer,
     WeightsMapper,
     maybe_prefix,
 )
@@ -55,6 +56,7 @@ from ..common.mm_preprocess import (
     DeepseekV4VLMultiModalProcessor,
     DeepseekV4VLProcessingInfo,
 )
+from ..hybrid import hybrid_settings
 from .model import (
     DeepseekV41LLMForCausalLM,
     _linear_scale_param_name,
@@ -145,23 +147,28 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
 
-        # The tower is always built; _mark_tower_model stubs it out
-        # (StageMissingLayer, weights skipped) when the image limit is 0.
+        self.owns_vision = (
+            hybrid_settings(vllm_config) is None or get_pp_group().is_first_rank
+        )
         with self._mark_tower_model(vllm_config, {"image"}):
             self.use_data_parallel = is_vit_use_data_parallel(config.vision_n_heads)
-            self.vision = DeepseekV4ViT(config)
-            self.aligner = DeepseekV4Aligner(config)
-            self.image_start = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
-            )
-            self.image_end = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
-            )
-            self.image_newline = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
-            )
-            self.vision.to(dtype=model_config.dtype)
-            self.aligner.to(dtype=model_config.dtype)
+            if self.owns_vision:
+                self.vision = DeepseekV4ViT(config)
+                self.aligner = DeepseekV4Aligner(config)
+                self.image_start = nn.Parameter(
+                    torch.empty(config.hidden_size, dtype=torch.float32)
+                )
+                self.image_end = nn.Parameter(
+                    torch.empty(config.hidden_size, dtype=torch.float32)
+                )
+                self.image_newline = nn.Parameter(
+                    torch.empty(config.hidden_size, dtype=torch.float32)
+                )
+                self.vision.to(dtype=model_config.dtype)
+                self.aligner.to(dtype=model_config.dtype)
+            else:
+                self.vision = StageMissingLayer("image_tower")
+                self.aligner = StageMissingLayer("image_aligner")
 
         with self._mark_language_model(vllm_config):
             self.language_model = DeepseekV41LLMForCausalLM(
@@ -320,6 +327,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            ced_step=kwargs.get("ced_step"),
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -331,20 +339,30 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
 
+    def take_ced_draft_context(self):
+        return self.language_model.take_ced_draft_context()
+
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
-        # The child's load_weights already ran its post-load finalization.
+        loaded_params: set[str] = set()
+
+        def language_weights():
+            # Keep one language-model load call without retaining the entire
+            # checkpoint: its expert finalization needs every shard loaded.
+            for name, weight in self.hf_to_vllm_mapper.apply(weights):
+                if name.startswith("language_model."):
+                    yield name.removeprefix("language_model."), weight
+                elif getattr(self, "owns_vision", True):
+                    loaded_params.update(loader.load_weights(((name, weight),)))
+
+        loaded_params.update(
+            f"language_model.{name}"
+            for name in self.language_model.load_weights(language_weights())
+        )
         self._weights_finalized = True
         return loaded_params
 

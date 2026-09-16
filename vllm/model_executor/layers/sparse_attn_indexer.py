@@ -422,6 +422,7 @@ def sparse_attn_indexer(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    round_logits_allocations: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -647,6 +648,7 @@ def sparse_attn_indexer(
                             cu_seqlen_ks[r0:r1],
                             cu_seqlen_ke[r0:r1],
                             clean_logits=False,
+                            round_allocations=round_logits_allocations,
                         )
                         _apply_prefill_candidates(
                             logits,
@@ -1001,6 +1003,7 @@ def sparse_attn_indexer_fake(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    round_logits_allocations: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -1067,6 +1070,10 @@ class SparseAttnIndexer(CustomOp):
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
         vllm_config = get_current_vllm_config()
+        extra = vllm_config.additional_config
+        self.round_logits_allocations = (
+            isinstance(extra, dict) and extra.get("deepseek_v41_hybrid") is not None
+        )
         parallel_config = vllm_config.parallel_config
         self._parallel_config = parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
@@ -1207,6 +1214,7 @@ class SparseAttnIndexer(CustomOp):
             candidate_blocks=self.candidate_blocks,
             candidate_block_size=self.candidate_block_size,
             candidate_write=self.candidate_write,
+            round_logits_allocations=self.round_logits_allocations,
         )
 
     def forward_xpu(

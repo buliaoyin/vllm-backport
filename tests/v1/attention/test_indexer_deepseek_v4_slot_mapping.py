@@ -2,12 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from tests.v1.attention.utils import create_vllm_config
+from tests.v1.attention.utils import (
+    BatchSpec,
+    create_common_attn_metadata,
+    create_vllm_config,
+)
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla import indexer
 from vllm.v1.attention.backends.mla.compressor_utils import (
     CompressedSlotMappingKernel,
 )
@@ -157,3 +163,42 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_num_states():
         device=device,
     )
     torch.testing.assert_close(valid_slots, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [1, 4, 32])
+def test_decode_metadata_without_deepgemm_architecture_support(
+    monkeypatch, compress_ratio
+):
+    """An installed DeepGEMM must not prevent Triton decode on unsupported GPUs."""
+    monkeypatch.setattr(indexer, "has_deep_gemm", lambda: True)
+    monkeypatch.setattr(indexer, "is_deep_gemm_supported", lambda: False)
+    schedule = Mock(side_effect=AssertionError("DeepGEMM is unsupported"))
+    monkeypatch.setattr(indexer, "get_paged_mqa_logits_metadata", schedule)
+    device = torch.device("cuda")
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=compress_ratio,
+    )
+    config = create_vllm_config(max_model_len=1024)
+    width = get_block_table_width(
+        spec.max_num_blocks_per_req(config, 1024), spec.block_size
+    )
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["dummy"],
+        vllm_config=config,
+        device=device,
+        block_table_width=width,
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[257], query_lens=[1]), spec.block_size, device
+    )
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    assert metadata.decode is not None
+    assert metadata.decode.seq_lens.tolist() == [[257 // compress_ratio]]
+    assert common.seq_lens.tolist() == [257]
+    schedule.assert_not_called()

@@ -1440,6 +1440,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_weight_scale,
             w13_bias,
             w2_bias,
+            inplace=w13_weight.is_contiguous() and w2_weight.is_contiguous(),
         )
 
     num_experts = w13_weight.shape[0]

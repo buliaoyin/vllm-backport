@@ -135,6 +135,10 @@ class MultiprocExecutor(Executor):
         )
         set_multiprocessing_worker_envs(num_local_procs)
 
+        from vllm.models.deepseek_v4_1.hybrid_runtime import HybridExecutorResources
+
+        self.hybrid_resources = HybridExecutorResources(self.vllm_config)
+
         if aiter_requires_tcp_store():
             distributed_init_method = get_distributed_init_method(
                 get_loopback_ip(), get_open_port()
@@ -556,6 +560,8 @@ class MultiprocExecutor(Executor):
                 mq.shutdown()
             self.response_mqs = []
 
+        if resources := getattr(self, "hybrid_resources", None):
+            resources.close()
         logger.debug_once("[shutdown] Executor: complete")
 
     def check_health(self) -> None:

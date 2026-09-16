@@ -544,6 +544,7 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
+    kv_cache_tokens: int | None = CacheConfig.kv_cache_tokens
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
@@ -1256,6 +1257,7 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
+        cache_group.add_argument("--kv-cache-tokens", **cache_kwargs["kv_cache_tokens"])
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
@@ -2028,6 +2030,9 @@ class EngineArgs:
         """
         current_platform.pre_register_and_update()
 
+        from vllm.models.deepseek_v4_1.hybrid import apply_hybrid_defaults
+
+        apply_hybrid_defaults(self)
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
 
         envs.validate_environ(self.fail_on_environ_validation)
@@ -2050,6 +2055,11 @@ class EngineArgs:
             )
 
         model_config = self.create_model_config()
+        if (
+            "deepseek_v41_hybrid" in self.additional_config
+            and model_config.hf_config.model_type != "deepseek_v41"
+        ):
+            raise ValueError("deepseek_v41_hybrid requires a DeepSeek-V4.1 model")
         self.model = model_config.model
         self.model_weights = model_config.model_weights
         self.tokenizer = model_config.tokenizer
@@ -2078,6 +2088,7 @@ class EngineArgs:
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
+            kv_cache_tokens=self.kv_cache_tokens,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,

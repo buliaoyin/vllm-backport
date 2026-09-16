@@ -309,8 +309,12 @@ def _repack_marlin_experts(
     size_n: int,
     size_k: int,
     is_a_8bit: bool,
+    *,
+    inplace: bool = False,
 ) -> torch.Tensor:
-    """Repack each expert to marlin format into a preallocated output."""
+    """Repack experts, optionally reusing their packed weight storage."""
+    if inplace and not weight.is_contiguous():
+        raise ValueError("In-place expert repacking requires contiguous weights")
     num_experts = weight.shape[0]
     out: torch.Tensor | None = None
     for i in range(num_experts):
@@ -323,11 +327,15 @@ def _repack_marlin_experts(
             is_a_8bit=is_a_8bit,
         )
         if out is None:
-            out = torch.empty(
-                (num_experts, *marlin_qweight.shape),
-                dtype=marlin_qweight.dtype,
-                device=marlin_qweight.device,
-            )
+            shape = (num_experts, *marlin_qweight.shape)
+            if inplace:
+                out = weight.view(marlin_qweight.dtype).view(shape)
+            else:
+                out = torch.empty(
+                    shape,
+                    dtype=marlin_qweight.dtype,
+                    device=marlin_qweight.device,
+                )
         out[i] = marlin_qweight
     assert out is not None
     return out
@@ -583,6 +591,8 @@ def prepare_moe_mxfp4_layer_for_marlin(
     w2_scale: torch.Tensor,
     w13_bias: torch.Tensor | None,
     w2_bias: torch.Tensor | None,
+    *,
+    inplace: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -591,10 +601,10 @@ def prepare_moe_mxfp4_layer_for_marlin(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Pure-function version of prepare_moe_fp4_layer_for_marlin for MXFP4.
+    """Return MXFP4 weights and scales transformed for Marlin.
 
-    Takes weight tensors as inputs and returns transformed tensors.
-    Does NOT modify the layer in-place.
+    With ``inplace=True``, packed weight storage is overwritten one expert at
+    a time to avoid allocating another full copy of the expert weights.
     """
     input_dtype = get_marlin_input_dtype()
     if (
@@ -625,7 +635,9 @@ def prepare_moe_mxfp4_layer_for_marlin(
 
         assert weight.shape == (e, size_n, size_k // 2)
 
-        return _repack_marlin_experts(weight, size_n, size_k, is_a_8bit)
+        return _repack_marlin_experts(
+            weight, size_n, size_k, is_a_8bit, inplace=inplace
+        )
 
     w13 = repack_weight(w13, "w13")
     w2 = repack_weight(w2, "w2")

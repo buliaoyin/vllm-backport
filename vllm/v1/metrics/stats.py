@@ -183,6 +183,32 @@ class SchedulerIterationDetails:
 
 
 @dataclass
+class ExpertCacheStats:
+    """Hybrid expert cache deltas; routes include speculative verification work."""
+
+    gpu_hits: int = 0
+    cpu_misses: int = 0
+    decode_checks: int = 0
+    updates: int = 0
+    experts_reloaded: int = 0
+    reload_seconds: float = 0.0
+    host_lru_hits: int = 0
+    repacked_experts: int = 0
+
+    def accumulate(self, other: "ExpertCacheStats") -> None:
+        for name in self.__dataclass_fields__:
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+
+    def delta(self, previous: "ExpertCacheStats") -> "ExpertCacheStats":
+        return ExpertCacheStats(
+            **{
+                name: getattr(self, name) - getattr(previous, name)
+                for name in self.__dataclass_fields__
+            }
+        )
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -204,6 +230,7 @@ class SchedulerStats:
     kv_cache_eviction_events: list[KVCacheEvictionEvent] = field(default_factory=list)
 
     spec_decoding_stats: SpecDecodingStats | None = None
+    expert_cache_stats: ExpertCacheStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
 
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)

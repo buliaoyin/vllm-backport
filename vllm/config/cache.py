@@ -237,6 +237,14 @@ class CacheConfig:
     NOTE: KV cache sharing is not supported for MRv2 (v2 model runner).
     """
 
+    kv_cache_tokens: int | None = Field(default=None, gt=0)
+    """Requested aggregate KV token capacity per engine, independent of the
+    per-request max_model_len. Limits the physical KV allocation to this capacity
+    plus bounded per-request state, in-flight scratch, and block alignment,
+    leaving remaining memory for other uses (including hybrid expert caches).
+    This is not a scheduler limit on logical token counts. Cannot be combined
+    with kv_cache_memory_bytes or num_gpu_blocks_override."""
+
     kv_cache_memory_bytes: int | None = None
     """Size of KV Cache per GPU in bytes. By default, this is set to None
     and vllm can automatically infer the kv cache size based on
@@ -273,6 +281,7 @@ class CacheConfig:
             # Runtime/derived knobs that don't affect compiled graph shape
             "gpu_memory_utilization",
             "kv_cache_memory_bytes",
+            "kv_cache_tokens",
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",
@@ -299,6 +308,18 @@ class CacheConfig:
 
         factors = get_hash_factors(self, ignored_factors)
         return hash_factors(factors)
+
+    @model_validator(mode="after")
+    def _validate_token_budget(self) -> "CacheConfig":
+        if self.kv_cache_tokens is not None and (
+            self.kv_cache_memory_bytes is not None
+            or self.num_gpu_blocks_override is not None
+        ):
+            raise ValueError(
+                "kv_cache_tokens cannot be combined with kv_cache_memory_bytes "
+                "or num_gpu_blocks_override"
+            )
+        return self
 
     def metrics_info(self):
         # convert cache_config to dict(key: str, value: str) for prometheus

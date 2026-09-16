@@ -354,6 +354,80 @@ def test_extra_cache_nan_free_provenance_gate(monkeypatch) -> None:
     assert not mod._trust_dsv4_extra_cache_nan_free("fp8_ds_mla", False, True)
 
 
+@pytest.mark.parametrize(
+    "query_lens,seq_lens,gather_lens,query_base,ratio,width,topk",
+    [
+        ([1], [1], [1], 0, 0, 512, 0),
+        ([127], [127], [127], 9, 0, 512, 0),
+        ([128], [32768], [128], 1024, 1, 512, 512),
+        ([129], [32768], [256], 0, 2, 512, 512),
+        ([0, 3, 0, 129], [0, 3, 9, 32768], [0, 3, 1, 256], 21, 2, 32, 512),
+        ([512, 1, 511], [512, 32768, 2048], [512, 129, 640], 99, 2, 520, 512),
+        ([2048], [32768], [2176], 0, 2, 512, 512),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_dsv41_ampere_prefill_indices_match_torch(
+    query_lens, seq_lens, gather_lens, query_base, ratio, width, topk, dtype
+):
+    """Preserve short rows, mixed chunk bases, invalid top-k and SWA replay rows."""
+    from vllm.models.deepseek_v4_1.amd.rocm import (
+        combine_topk_swa_indices as reference,
+    )
+    from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
+        DeepseekV41AmpereMLAAttention,
+    )
+
+    combine_topk_swa_indices = DeepseekV41AmpereMLAAttention._combine_prefill_indices
+
+    torch.manual_seed(41)
+    num_tokens = sum(query_lens)
+    n = 0 if ratio == 0 else 33152 // ratio
+    m = n + 128 + 2048
+    # A non-contiguous view also exercises the checkpoint index buffer layout.
+    topk_indices = torch.randint(
+        -4, max(n + 3, 1), (num_tokens, width * 2), device="cuda", dtype=dtype
+    )[:, ::2]
+    starts = [query_base]
+    for count in query_lens:
+        starts.append(starts[-1] + count)
+    query = torch.tensor(starts, device="cuda", dtype=torch.int32)
+    seqs = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+    gathers = torch.tensor(gather_lens, device="cuda", dtype=torch.int32)
+    args = (topk_indices, query, seqs, gathers, 128, ratio, topk, m, n)
+    expected = reference(*args)
+    actual = combine_topk_swa_indices(*args)
+    for result, baseline in zip(actual, expected):
+        torch.testing.assert_close(result, baseline, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_dsv41_ampere_prefill_indices_capture_without_host_sync():
+    from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
+        DeepseekV41AmpereMLAAttention,
+    )
+
+    combine_topk_swa_indices = DeepseekV41AmpereMLAAttention._combine_prefill_indices
+
+    topk = torch.arange(512, device="cuda", dtype=torch.int32).expand(128, -1)
+    query = torch.tensor([1024, 1152], device="cuda", dtype=torch.int32)
+    seqs = torch.tensor([32768], device="cuda", dtype=torch.int32)
+    gathers = torch.tensor([128], device="cuda", dtype=torch.int32)
+    args = (topk, query, seqs, gathers, 128, 1, 512, 34432, 33152)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        expected = combine_topk_swa_indices(*args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = combine_topk_swa_indices(*args)
+    graph.replay()
+    for result, baseline in zip(actual, expected):
+        torch.testing.assert_close(result, baseline, atol=0, rtol=0)
+
+
 @torch.inference_mode()
 def test_sparse_attn_prefill_ragged_kernel() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (

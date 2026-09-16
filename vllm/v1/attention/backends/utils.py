@@ -206,7 +206,12 @@ def get_supported_kv_cache_layouts(
         for backend in backends
         if (layouts := backend.supported_kv_cache_layouts()) is not None
     ] or [_DEFAULT_LAYOUT_PREFERENCE]
+    return _get_common_kv_cache_layouts(supported_layouts_lists)
 
+
+def _get_common_kv_cache_layouts(
+    supported_layouts_lists: Sequence[Sequence[KVCacheLayout]],
+) -> list[KVCacheLayout]:
     first = supported_layouts_lists[0]
     if all(layouts == first for layouts in supported_layouts_lists[1:]):
         return list(first)
@@ -248,9 +253,10 @@ def resolve_kv_cache_layout(
     """Resolve one KV cache layout for the whole model.
 
     Runs once in the engine core. Every worker reports the layouts its backends
-    support, most preferred first (``get_supported_kv_cache_layouts``); all
-    ranks run the same backends, so their lists must agree. Specs mixing HNC
-    shapes narrow the candidates to block-compact layouts. An explicit
+    support, most preferred first (``get_supported_kv_cache_layouts``). Pipeline
+    stages may run different backends, so their supported sets are intersected;
+    without PP the lists must agree. Specs mixing HNC shapes narrow the
+    candidates to block-compact layouts. An explicit
     ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
     with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
     connector's preference is used when compatible and dropped with a warning
@@ -266,10 +272,13 @@ def resolve_kv_cache_layout(
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
     )
-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
+    if any(names != supported_layouts[0] for names in supported_layouts[1:]):
+        assert vllm_config.parallel_config.pipeline_parallel_size > 1, (
+            f"Workers disagree on supported KV cache layouts: {supported_layouts}."
+        )
+    candidates = _get_common_kv_cache_layouts(
+        [[_layout_from_name(name) for name in names] for names in supported_layouts]
     )
-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of

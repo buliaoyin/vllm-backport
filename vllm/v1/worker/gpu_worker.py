@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -141,6 +141,7 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -455,6 +456,12 @@ class Worker(WorkerBase):
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
+            from vllm.models.deepseek_v4_1.hybrid_runtime import (
+                initialize_hybrid_devices,
+            )
+
+            initialize_hybrid_devices(self)
+
             # Now take memory snapshot after NCCL is initialized
             gc.collect()
             torch.accelerator.empty_cache()
@@ -510,6 +517,12 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        from vllm.models.deepseek_v4_1.hybrid import hybrid_settings
+
+        if hybrid_settings(self.vllm_config) is not None:
+            from vllm.models.deepseek_v4_1.hybrid_runtime import physical_cpus
+
+            os.sched_setaffinity(0, physical_cpus())
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -783,6 +796,12 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        from vllm.models.deepseek_v4_1.hybrid import hybrid_settings
+        from vllm.models.deepseek_v4_1.hybrid_runtime import (
+            activate_hybrid_cache,
+            initialize_hybrid_cache,
+        )
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -838,6 +857,9 @@ class Worker(WorkerBase):
             # A workspace resize after capture frees what the graphs point at.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
 
+        # Include lazy kernel/communication allocations in the expert budget.
+        initialize_hybrid_cache(self)
+
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
@@ -858,8 +880,10 @@ class Worker(WorkerBase):
                 100 * diff / max(cuda_graph_memory_bytes, 1),
             )
 
-        if self.cache_config.kv_cache_memory_bytes is None and hasattr(
-            self, "peak_activation_memory"
+        if (
+            self.cache_config.kv_cache_memory_bytes is None
+            and hasattr(self, "peak_activation_memory")
+            and hybrid_settings(self.vllm_config) is None
         ):
             # Suggests optimal kv cache memory size if we rely on
             # memory_profiling to guess the kv cache memory size which
@@ -973,6 +997,10 @@ class Worker(WorkerBase):
         # Startup is done; steady-state serving gets no benefit from torch
         # intra-op parallelism.
         set_torch_threads_for_runtime()
+        activate_hybrid_cache(self)
+        if self.use_v2_model_runner:
+            runner = cast("GPUModelRunnerV2", self.model_runner)
+            runner.model_state.reset_expert_cache_stats()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

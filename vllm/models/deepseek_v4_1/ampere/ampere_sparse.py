@@ -10,9 +10,19 @@ fused aiter norm+quant self-disable off ROCm), and
 where Triton refuses native fp8 converts.
 """
 
+from dataclasses import replace
+
+import torch
+
 from vllm.models.deepseek_v4_1.amd.rocm import (
     DeepseekV4ROCMAiterMLASparseBackend,
     DeepseekV41ROCMAiterMLAAttention,
+)
+from vllm.models.deepseek_v4_1.ampere.prefill_metadata import (
+    combine_topk_swa_indices,
+)
+from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
+    DeepseekV4FlashInferSM120Attention,
 )
 from vllm.platforms.interface import DeviceCapability
 
@@ -24,13 +34,20 @@ class DeepseekV41AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 8
+        return capability.major in (8, 12)
 
 
 class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
     """SM8x DeepSeek V4.1 attention: ROCm Triton path on CUDA Ampere."""
 
     backend_cls = DeepseekV41AmpereMLASparseBackend
+
+    @staticmethod
+    def _combine_prefill_indices(*args, **kwargs):
+        # Bound live eager intermediates after removing Torch's implicit syncs.
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.current_stream().synchronize()
+        return combine_topk_swa_indices(*args, **kwargs)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -42,3 +59,49 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
         # which dequantizes wo_a to a plain bf16 [g*r, d] weight at load time;
         # _get_cached_wo_a_bf16 then only views it (no second dequant).
         self.wo_a.is_bmm = True
+
+
+class DeepseekV41SM120DecodeAttention(DeepseekV41AmpereMLAAttention):
+    """Portable prefill with FlashInfer SM120 sparse decode."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # FlashInfer's SM120 decode specializes its primary cache to 64 rows.
+        self.swa_cache_layer.block_size = 64
+        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
+
+        self._decode_widths = tuple(
+            width
+            for width in (128, 192, 256, 512, 1024)
+            if has_flashinfer_sparse_mla_sm120_config(self.padded_heads, width)
+        )
+        if not self._decode_widths:
+            raise RuntimeError(
+                "FlashInfer has no compatible SM120 sparse decode kernel"
+            )
+        self._get_workspace(
+            torch.device("cuda", torch.accelerator.current_device_index())
+        )
+
+    _get_workspace = staticmethod(DeepseekV4FlashInferSM120Attention._get_workspace)
+    _as_sparse_cache = staticmethod(DeepseekV4FlashInferSM120Attention._as_sparse_cache)
+    _prepare_query = DeepseekV4FlashInferSM120Attention._prepare_query
+
+    def _forward_decode(
+        self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
+    ):
+        indices = swa_metadata.decode_swa_indices
+        width = indices.shape[-1]
+        native_width = next((w for w in self._decode_widths if w >= width), None)
+        if native_width is None:
+            return super()._forward_decode(
+                q, kv_cache, swa_metadata, attn_metadata, swa_only, output
+            )
+        if native_width != width:
+            indices = torch.nn.functional.pad(
+                indices, (0, native_width - width), value=-1
+            )
+            swa_metadata = replace(swa_metadata, decode_swa_indices=indices)
+        DeepseekV4FlashInferSM120Attention._forward_decode(
+            self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
+        )
