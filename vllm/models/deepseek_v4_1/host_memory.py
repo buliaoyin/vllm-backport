@@ -2,12 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Bounded, exact-size host allocations for resident hybrid weights."""
 
+import ctypes
 import math
 import mmap
 from contextlib import suppress
 from pathlib import Path
 
 import torch
+
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4_numa import (
+    host_memory_nodes,
+)
+from vllm.utils.numa_utils import get_libnuma
+
+logger = init_logger(__name__)
 
 GiB = 1024**3
 LOAD_CHUNK_BYTES = 64 * 1024**2
@@ -49,6 +58,39 @@ def check_host_headroom(additional_bytes=0):
         path = path.parent
 
 
+def interleave_host_mapping(owner):
+    """Spread shared Engram/LRU pages before copying or CUDA registration."""
+    nodes = host_memory_nodes()
+    if len(nodes) < 2:
+        return
+    libnuma = get_libnuma()
+    if libnuma is None:
+        logger.warning_once("Host NUMA interleave unavailable: libnuma is missing")
+        return
+    bits = ctypes.sizeof(ctypes.c_ulong) * 8
+    mask = (ctypes.c_ulong * ((max(nodes) + bits) // bits))()
+    for node in nodes:
+        mask[node // bits] |= 1 << (node % bits)
+    # MPOL_INTERLEAVE before first touch. Linux consumes maxnode - 1 mask bits.
+    rc = libnuma.mbind(
+        ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(owner))),
+        ctypes.c_ulong(len(owner)),
+        ctypes.c_int(3),
+        mask,
+        ctypes.c_ulong(len(mask) * bits + 1),
+        ctypes.c_uint(0),
+    )
+    if rc:
+        logger.warning_once(
+            "Host NUMA interleave unavailable; Engram/LRU use inherited memory "
+            "placement. Check container memory-policy permissions."
+        )
+    else:
+        logger.info_once(
+            "Hybrid Engram/LRU memory interleaved over NUMA nodes %s", nodes
+        )
+
+
 class RegisteredMapping(mmap.mmap):
     """Anonymous storage; registration grows only as checkpoint chunks arrive."""
 
@@ -60,6 +102,7 @@ class RegisteredMapping(mmap.mmap):
 
     def __init__(self, size):
         self.registered = []
+        interleave_host_mapping(self)
         self.cudart = torch.cuda.cudart()
 
     def register(self, base, offset, size):

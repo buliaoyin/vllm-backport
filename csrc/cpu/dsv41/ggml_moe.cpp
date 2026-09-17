@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -63,6 +64,7 @@ struct MoE {
   std::unique_ptr<Graph> execution;
 #ifdef DSV41_IK
   CompactMoE compact;
+  dsv41::NumaPlan numa;
   bool use_compact = true;
 #endif
 
@@ -142,9 +144,7 @@ struct MoE {
     // four groups of four E2M1 bytes per row. Convert directly from HF, without
     // an intermediate tensor or the generic repacker's per-matrix thread pool.
     const int row_blocks = weight->ne[0] / 32;
-  #pragma omp parallel for num_threads( \
-          load_threads) if (weight->ne[0] * weight->ne[1] >= 1048576)
-    for (int row = 0; row < weight->ne[1]; row += 8) {
+    const auto convert_row = [&](int row) {
       for (int block = 0; block < row_blocks; ++block) {
         auto* dst = destination + (size_t(row / 8) * row_blocks + block) * 136;
         for (int lane = 0; lane < 8; ++lane) {
@@ -177,6 +177,13 @@ struct MoE {
   #endif
         }
       }
+    };
+    if (numa.enabled()) {
+      numa.weight_rows(weight->ne[1], load_threads, true, convert_row);
+    } else {
+  #pragma omp parallel for num_threads( \
+          load_threads) if (weight->ne[0] * weight->ne[1] >= 1048576)
+      for (int row = 0; row < weight->ne[1]; row += 8) convert_row(row);
     }
 #else
     const size_t blocks = size_t(hidden) * intermediate / 32;
@@ -212,9 +219,7 @@ struct MoE {
     const auto* source =
         static_cast<const uint8_t*>(weight->data) + expert * weight->nb[2];
     const int row_blocks = weight->ne[0] / 32;
-  #pragma omp parallel for num_threads( \
-          load_threads) if (weight->ne[0] * weight->ne[1] >= 1048576)
-    for (int row = 0; row < weight->ne[1]; row += 8) {
+    const auto convert_row = [&](int row) {
       for (int block = 0; block < row_blocks; ++block) {
         const auto* src = source + (size_t(row / 8) * row_blocks + block) * 136;
         for (int lane = 0; lane < 8; ++lane) {
@@ -249,6 +254,13 @@ struct MoE {
   #endif
         }
       }
+    };
+    if (numa.enabled()) {
+      numa.weight_rows(weight->ne[1], load_threads, false, convert_row);
+    } else {
+  #pragma omp parallel for num_threads( \
+          load_threads) if (weight->ne[0] * weight->ne[1] >= 1048576)
+      for (int row = 0; row < weight->ne[1]; row += 8) convert_row(row);
     }
 #else
     throw std::runtime_error("Expert export requires the IK R8 backend");
@@ -314,11 +326,16 @@ struct MoE {
       }
     }
 #ifdef DSV41_IK
-    if (use_compact && tokens <= 64) {
-      // Keep the CED replay graph, but release larger profiling workspaces.
+    if (use_compact && (tokens <= 64 || numa.enabled())) {
+      // Bound workspace for replay/concurrent DSpark batches on NUMA hosts.
       if (execution && execution->tokens > 128) execution.reset();
-      compact.forward(weights, tokens, topk, num_threads, limit, input, ids,
-                      routes, output);
+      for (int first = 0; first < tokens; first += 128) {
+        compact.forward(weights, std::min(128, tokens - first), topk,
+                        num_threads, limit, input + size_t(first) * hidden,
+                        ids + size_t(first) * topk,
+                        routes + size_t(first) * topk,
+                        output + size_t(first) * hidden, numa);
+      }
       return;
     }
 #endif
@@ -379,12 +396,121 @@ void* dsv41_moe_create(int experts, int hidden, int intermediate, int topk,
 
 void dsv41_moe_destroy(void* handle) { delete static_cast<MoE*>(handle); }
 
+int dsv41_moe_configure_numa(void* handle, int count, const int* node_ids,
+                             const int* offsets, const int* cpus) {
+  try {
+#ifdef DSV41_IK
+    if (!handle || count < 1 || !node_ids || !offsets || !cpus || offsets[0])
+      throw std::invalid_argument("Invalid CPU NUMA topology");
+    auto* moe = static_cast<MoE*>(handle);
+    if (std::any_of(moe->loaded.begin(), moe->loaded.end(),
+                    [](bool b) { return b; }))
+      throw std::invalid_argument(
+          "NUMA topology must be set before loading weights");
+    auto& plan = moe->numa;
+    plan.nodes.clear();
+    plan.cores = offsets[count];
+    std::vector<int> unique;
+    for (int n = 0; n < count; ++n) {
+      if (node_ids[n] < 0 || offsets[n + 1] <= offsets[n])
+        throw std::invalid_argument("Empty or invalid CPU NUMA node");
+      plan.nodes.push_back({node_ids[n],
+                            offsets[n],
+                            {cpus + offsets[n], cpus + offsets[n + 1]}});
+      unique.insert(unique.end(), cpus + offsets[n], cpus + offsets[n + 1]);
+    }
+    std::sort(unique.begin(), unique.end());
+    if (unique.front() < 0 ||
+        std::adjacent_find(unique.begin(), unique.end()) != unique.end())
+      throw std::invalid_argument("Invalid or duplicate CPU in NUMA topology");
+    plan.load_team = plan.team(moe->load_threads);
+    plan.compute_team = plan.team(moe->num_threads);
+    if (plan.enabled()) {
+      // Large pages can straddle several row owners. Keep first-touch granular.
+      const auto page = uintptr_t(sysconf(_SC_PAGESIZE));
+      const auto base = reinterpret_cast<uintptr_t>(
+          ggml_backend_buffer_get_base(moe->weights_buffer));
+      const auto first = (base + page - 1) & ~(page - 1);
+      const auto last =
+          (base + ggml_backend_buffer_get_size(moe->weights_buffer)) &
+          ~(page - 1);
+      if (last > first)
+        madvise(reinterpret_cast<void*>(first), last - first, MADV_NOHUGEPAGE);
+      dsv41::LocalMemoryPolicy probe(true);
+      plan.local_policy = probe.changed;
+      return probe.error;
+    }
+    return 0;
+#else
+    throw std::invalid_argument("NUMA sharding requires the IK CPU backend");
+#endif
+  } catch (const std::exception& e) {
+    last_error = e.what();
+    return -1;
+  }
+}
+
+int dsv41_moe_numa_pages(void* handle, uint64_t* counts) {
+#ifdef DSV41_IK
+  try {
+    if (!handle || !counts) return EINVAL;
+    auto* moe = static_cast<MoE*>(handle);
+    const auto& plan = moe->numa;
+    std::fill_n(counts, 4, 0);
+    if (!plan.enabled()) return 0;
+    std::vector<void*> pages;
+    std::vector<int> expected;
+    const size_t page_size = sysconf(_SC_PAGESIZE);
+    for (const auto* weight : moe->weights) {
+      const int tiles = (weight->ne[1] + plan.tile_rows - 1) / plan.tile_rows;
+      for (int e = 0; e < moe->experts; e += std::max(1, moe->experts / 8)) {
+        const auto base =
+            reinterpret_cast<uintptr_t>(weight->data) + e * weight->nb[2];
+        for (int n = 0; n < int(plan.nodes.size()); ++n) {
+          const auto begin =
+              base + plan.boundary(tiles, n) * plan.tile_rows * weight->nb[1];
+          const auto end =
+              base + std::min(int(weight->ne[1]),
+                              plan.boundary(tiles, n + 1) * plan.tile_rows) *
+                         weight->nb[1];
+          if (end <= begin) continue;
+          const auto address =
+              ((begin + (end - begin) / 2) / page_size) * page_size;
+          if (address >= begin && address + page_size <= end) {
+            pages.push_back(reinterpret_cast<void*>(address));
+            expected.push_back(plan.nodes[n].id);
+          }
+        }
+      }
+    }
+    if (pages.empty()) return 0;
+    std::vector<int> status(pages.size());
+    // Query only: do not migrate or replicate resident weights.
+    if (syscall(SYS_move_pages, 0, pages.size(), pages.data(), nullptr,
+                status.data(), 0) < 0)
+      return errno;
+    counts[0] = pages.size();
+    for (size_t i = 0; i < pages.size(); ++i)
+      ++counts[status[i] < 0 ? 3 : (status[i] == expected[i] ? 1 : 2)];
+    return 0;
+  } catch (const std::bad_alloc&) {
+    return ENOMEM;
+  }
+#else
+  return ENOSYS;
+#endif
+}
+
 int dsv41_moe_set_threads(void* handle, int threads) {
   try {
     if (!handle || threads <= 0) {
       throw std::invalid_argument("Invalid MoE handle or thread count");
     }
     auto* moe = static_cast<MoE*>(handle);
+#ifdef DSV41_IK
+    if (!moe->numa.nodes.empty())
+      moe->numa.compute_team = moe->numa.team(threads);
+#endif
     ggml_backend_cpu_set_n_threads(moe->backend, threads);
     moe->num_threads = threads;
     return 0;

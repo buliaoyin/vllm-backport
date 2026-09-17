@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -510,3 +511,137 @@ def test_configure_subprocess_numa_fallback(monkeypatch):
     with numa_utils.configure_subprocess(node_config, local_rank=0):
         assert multiprocessing.spawn.get_executable() == before
         assert numa_utils._NUMACTL_ARGS_ENV not in os.environ
+
+
+@pytest.mark.parametrize("sockets", [1, 2])
+@pytest.mark.parametrize("nps", [1, 2, 4])
+def test_hybrid_topology_preserves_socket_cores_and_cpuset(
+    monkeypatch, tmp_path, sockets, nps
+):
+    """Repeated core IDs, sparse node IDs and SMT masks must not lose sockets."""
+    from vllm.model_executor.layers.fused_moe.experts import cpu_mxfp4_numa as topology
+
+    cpu_root, node_root = tmp_path / "cpu", tmp_path / "node"
+    node_root.mkdir()
+    monkeypatch.setattr(topology, "CPU_SYSFS", cpu_root)
+    monkeypatch.setattr(topology, "NODE_SYSFS", node_root)
+    cores = sockets * nps * 3
+    allowed = set(range(cores * 2)) - {0, cores + 1}
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _: allowed)
+    node_ids = [2 * i + 1 for i in range(sockets * nps)]
+    (node_root / "online").write_text(",".join(map(str, node_ids)))
+    expected = []
+    for i, node_id in enumerate(node_ids):
+        node_path = node_root / f"node{node_id}"
+        node_path.mkdir()
+        local = list(range(i * 3, i * 3 + 3))
+        (node_path / "cpulist").write_text(
+            ",".join(str(cpu) for c in local for cpu in (c, c + cores))
+        )
+        for c in local:
+            for cpu in (c, c + cores):
+                root = cpu_root / f"cpu{cpu}" / "topology"
+                root.mkdir(parents=True)
+                (root / "physical_package_id").write_text(str(i // nps))
+                (root / "core_id").write_text(str(c % (nps * 3)))
+        expected.append(
+            topology.NumaNode(
+                node_id, tuple(sorted(c if c in allowed else c + cores for c in local))
+            )
+        )
+    assert topology.cpu_numa_nodes() == tuple(expected)
+    assert len(topology.physical_cpus()) == cores
+    assert set(topology.physical_cpus()) <= allowed
+    status = tmp_path / "status"
+    memory_nodes = node_ids[::2]
+    status.write_text("Mems_allowed_list:\t" + ",".join(map(str, memory_nodes)))
+    monkeypatch.setattr(topology, "THREAD_STATUS", status)
+    assert topology.host_memory_nodes() == tuple(memory_nodes)
+
+
+def test_hybrid_missing_topology_does_not_widen_affinity(monkeypatch, tmp_path):
+    from vllm.model_executor.layers.fused_moe.experts import cpu_mxfp4_numa as topology
+
+    monkeypatch.setattr(topology, "CPU_SYSFS", tmp_path)
+    monkeypatch.setattr(topology, "NODE_SYSFS", tmp_path)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _: {3, 17})
+    assert topology.cpu_numa_nodes() == (topology.NumaNode(-1, (3, 17)),)
+
+
+@pytest.mark.parametrize(
+    "mode,policy_available,expected",
+    [
+        (0, True, (1, 3)),
+        (0, False, ()),
+        *[(mode, True, ()) for mode in (1, 2, 3, 4, 5, 6, 2 | (1 << 15))],
+    ],
+)
+def test_hybrid_shared_memory_preserves_explicit_policy(
+    monkeypatch, tmp_path, mode, policy_available, expected
+):
+    import ctypes
+    import mmap
+
+    from vllm.model_executor.layers.fused_moe.experts import cpu_mxfp4_numa as topology
+    from vllm.models.deepseek_v4_1 import host_memory
+
+    status = tmp_path / "status"
+    status.write_text("Mems_allowed_list:\t1,3")
+    monkeypatch.setattr(topology, "THREAD_STATUS", status)
+    monkeypatch.setattr(
+        topology,
+        "cpu_numa_nodes",
+        # Engram can use allowed memory even where no compute CPU is assigned.
+        lambda: (topology.NumaNode(1, (0,)),),
+    )
+
+    def get_mempolicy(mode_ptr, mask, *_):
+        ctypes.cast(mode_ptr, ctypes.POINTER(ctypes.c_int))[0] = mode
+        mask[0] = (1 << 1) | (1 << 3)
+        return 0 if policy_available else -1
+
+    monkeypatch.setattr(
+        topology, "get_libnuma", lambda: SimpleNamespace(get_mempolicy=get_mempolicy)
+    )
+    assert topology.host_memory_nodes() == expected
+    if not expected:
+
+        def unexpected_mbind(*args):
+            pytest.fail("An explicit or unreadable policy must remain inherited")
+
+        monkeypatch.setattr(
+            host_memory, "get_libnuma", lambda: SimpleNamespace(mbind=unexpected_mbind)
+        )
+        with mmap.mmap(-1, mmap.PAGESIZE) as mapping:
+            host_memory.interleave_host_mapping(mapping)
+
+
+@pytest.mark.parametrize("hybrid,fail", [(True, False), (True, True), (False, False)])
+def test_hybrid_restores_caller_cpuset_after_communication_init(
+    monkeypatch, hybrid, fail
+):
+    """NCCL's GPU-local binding must not hide other CPU expert NUMA nodes."""
+    from vllm.models.deepseek_v4_1.hybrid_runtime import preserve_hybrid_cpu_affinity
+
+    original = {2, 5, 11, 16}
+    affinity = original.copy()
+
+    def set_affinity(pid, cpus):
+        nonlocal affinity
+        assert pid == 0
+        affinity = set(cpus)
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _: affinity.copy())
+    monkeypatch.setattr(os, "sched_setaffinity", set_affinity)
+    config = SimpleNamespace(
+        additional_config={"deepseek_v41_hybrid": {}} if hybrid else {}
+    )
+    expected_error = pytest.raises(RuntimeError, match="init failed")
+    with (
+        expected_error if fail else nullcontext(),
+        preserve_hybrid_cpu_affinity(config),
+    ):
+        os.sched_setaffinity(0, {2})
+        if fail:
+            raise RuntimeError("init failed")
+    assert affinity == (original if hybrid else {2})

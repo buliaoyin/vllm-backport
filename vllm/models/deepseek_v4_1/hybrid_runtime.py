@@ -7,6 +7,7 @@ import random
 import shutil
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ import torch
 
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4_numa import physical_cpus
+from vllm.utils.torch_utils import set_default_torch_num_threads
 
 from .host_memory import check_host_headroom
 from .hybrid import GiB, hybrid_settings, plan_expert_cache
@@ -21,16 +24,20 @@ from .hybrid import GiB, hybrid_settings, plan_expert_cache
 logger = init_logger(__name__)
 
 
-def physical_cpus():
-    chosen: dict[tuple[str, ...], int] = {}
-    for cpu in sorted(os.sched_getaffinity(0)):
-        root = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        key = tuple(
-            (root / name).read_text().strip()
-            for name in ("physical_package_id", "core_id")
-        )
-        chosen.setdefault(key, cpu)
-    return list(chosen.values())
+@contextmanager
+def preserve_hybrid_cpu_affinity(config):
+    """Keep communication initialization from narrowing CPU expert resources."""
+    affinity = os.sched_getaffinity(0) if hybrid_settings(config) is not None else None
+    try:
+        yield
+    finally:
+        if affinity is not None and os.sched_getaffinity(0) != affinity:
+            os.sched_setaffinity(0, affinity)
+            logger.info(
+                "Restored hybrid CPU affinity after communication initialization: "
+                "%d allowed logical CPUs",
+                len(affinity),
+            )
 
 
 class HybridExecutorResources:
@@ -257,7 +264,10 @@ def initialize_hybrid_cache(worker):
             selected = random.Random(20260915 + layer).sample(
                 range(hf.n_routed_experts), count
             )
-            cache.select_static(selected)
+            # Packing alternates native export with small Torch CPU copies.
+            # Keep those copies serial instead of repeatedly resizing the team.
+            with set_default_torch_num_threads(1):
+                cache.select_static(selected)
             cache.finalize(module.async_tokens)
             cache.warmup()
             sm = torch.cuda.get_device_capability(device)[0]

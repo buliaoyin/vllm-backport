@@ -7,6 +7,7 @@
 #include "compact_profile.h"
 #include "ggml.h"
 #include "iqk/iqk_mul_mat.h"
+#include "numa.h"
 
 #include <algorithm>
 #include <array>
@@ -43,20 +44,22 @@ struct CompactMoE {
 
   void forward(const std::array<ggml_tensor*, 3>& weights, int tokens, int topk,
                int threads, float limit, const float* input, const int32_t* ids,
-               const float* routes, float* output) {
+               const float* routes, float* output,
+               const dsv41::NumaPlan& numa) {
     if (profile.record(tokens, weights[0]->ne[0], topk, input, ids, routes)) {
       forward_impl<true>(weights, tokens, topk, threads, limit, input, ids,
-                         routes, output);
+                         routes, output, numa);
     } else {
       forward_impl<false>(weights, tokens, topk, threads, limit, input, ids,
-                          routes, output);
+                          routes, output, numa);
     }
   }
 
   template <bool Profile>
   void forward_impl(const std::array<ggml_tensor*, 3>& weights, int tokens,
                     int topk, int threads, float limit, const float* input,
-                    const int32_t* ids, const float* routes, float* output) {
+                    const int32_t* ids, const float* routes, float* output,
+                    const dsv41::NumaPlan& numa) {
     uint64_t begin_ns = 0, parallel_ns = 0;
     if constexpr (Profile) {
       profile.start(threads);
@@ -100,7 +103,9 @@ struct CompactMoE {
     grow(input_q, size_t(tokens) * input_stride);
     grow(activation_q, size_t(count) * activation_stride);
     grow(activation, size_t(count) * intermediate);
-    const int down_tile = ((hidden / 8 + threads - 1) / threads) * 8;
+    const int down_tile = numa.enabled()
+                              ? dsv41::NumaPlan::tile_rows
+                              : ((hidden / 8 + threads - 1) / threads) * 8;
     grow(down, size_t(threads) * count * down_tile);
     const int input_tiles = (hidden + up_tile - 1) / up_tile;
     const int up_tiles = (intermediate + up_tile - 1) / up_tile;
@@ -116,9 +121,15 @@ struct CompactMoE {
                  input_q.data() + token * input_stride, hidden);
       }
     }
+    dsv41::NumaPlan::Binding caller(numa);
+    caller.bind_team();
+    numa.check_affinity();
     if constexpr (Profile) parallel_ns = CompactProfile::now();
 #pragma omp parallel num_threads(threads)
     {
+      dsv41::NumaPlan::Binding binding(numa, true);
+      if (numa.enabled())
+        binding.bind(numa.compute_team[omp_get_thread_num()].cpu);
       CompactProfile::Worker* worker = nullptr;
       if constexpr (Profile) {
         worker = &profile.workers[omp_get_thread_num()];
@@ -142,8 +153,7 @@ struct CompactMoE {
         worker->marks[1] = worker->marks[2] = CompactProfile::now();
       }
 
-#pragma omp for schedule(dynamic, 1) nowait
-      for (int task = 0; task < group_count * up_tiles; ++task) {
+      const auto run_up = [&](int task) {
         const auto& group = groups[task / up_tiles];
         const int tile = task % up_tiles;
         const int begin = tile * up_tile;
@@ -186,6 +196,21 @@ struct CompactMoE {
         }
         if constexpr (Profile)
           worker->quant += CompactProfile::now() - quant_begin;
+      };
+      if (numa.enabled()) {
+        for (int s = omp_get_thread_num(); s < int(numa.compute_team.size());
+             s += omp_get_num_threads()) {
+          const auto& slot = numa.compute_team[s];
+          binding.bind(slot.cpu);
+          const int first = numa.boundary(up_tiles, slot.node);
+          const int width = numa.boundary(up_tiles, slot.node + 1) - first;
+          for (int task = slot.rank; task < group_count * width;
+               task += slot.workers)
+            run_up((task / width) * up_tiles + first + task % width);
+        }
+      } else {
+#pragma omp for schedule(dynamic, 1) nowait
+        for (int task = 0; task < group_count * up_tiles; ++task) run_up(task);
       }
       if constexpr (Profile) worker->marks[3] = CompactProfile::now();
 #pragma omp barrier
@@ -193,9 +218,7 @@ struct CompactMoE {
 
       auto* partial =
           down.data() + size_t(omp_get_thread_num()) * count * down_tile;
-      auto run_down = [&](int tile) {
-        const int begin = (hidden / 8 * tile / down_tiles) * 8;
-        const int end = (hidden / 8 * (tile + 1) / down_tiles) * 8;
+      auto run_down = [&](int begin, int end) {
         const int rows = end - begin;
         if (!rows) return;
         uint64_t down_begin = 0, reduce_begin = 0;
@@ -244,13 +267,29 @@ struct CompactMoE {
         if constexpr (Profile)
           worker->reduce += CompactProfile::now() - reduce_begin;
       };
-      if (flags & 2) {
+      const auto run_tile = [&](int tile) {
+        run_down((hidden / 8 * tile / down_tiles) * 8,
+                 (hidden / 8 * (tile + 1) / down_tiles) * 8);
+      };
+      if (numa.enabled()) {
+        const int tiles = (hidden + down_tile - 1) / down_tile;
+        for (int s = omp_get_thread_num(); s < int(numa.compute_team.size());
+             s += omp_get_num_threads()) {
+          const auto& slot = numa.compute_team[s];
+          binding.bind(slot.cpu);
+          const int end = numa.boundary(tiles, slot.node + 1);
+          for (int tile = numa.boundary(tiles, slot.node) + slot.rank;
+               tile < end; tile += slot.workers)
+            run_down(tile * down_tile,
+                     std::min((tile + 1) * down_tile, hidden));
+        }
+      } else if (flags & 2) {
         for (int tile = omp_get_thread_num(); tile < down_tiles;
              tile += omp_get_num_threads())
-          run_down(tile);
+          run_tile(tile);
       } else {
 #pragma omp for schedule(dynamic, 1) nowait
-        for (int tile = 0; tile < down_tiles; ++tile) run_down(tile);
+        for (int tile = 0; tile < down_tiles; ++tile) run_tile(tile);
       }
       if constexpr (Profile) worker->marks[5] = CompactProfile::now();
       if (!(flags & 4)) {
@@ -258,6 +297,7 @@ struct CompactMoE {
       }
       if constexpr (Profile) worker->marks[6] = CompactProfile::now();
     }
+    if (numa.enabled()) numa.check_affinity();
     if constexpr (Profile)
       profile.finish(begin_ns, parallel_ns, CompactProfile::now());
   }

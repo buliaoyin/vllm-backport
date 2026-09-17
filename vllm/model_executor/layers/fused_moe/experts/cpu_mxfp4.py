@@ -6,12 +6,18 @@ from __future__ import annotations
 
 import ctypes
 import importlib.util
+import os
 from dataclasses import dataclass, replace
 from functools import cache
 from pathlib import Path
 from typing import Any, Literal
 
 import torch
+
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4_numa import cpu_numa_nodes
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -106,6 +112,18 @@ def _native_library(path: str):
         pointer,
     )
     library.dsv41_moe_forward.restype = integer
+    if hasattr(library, "dsv41_moe_configure_numa"):
+        library.dsv41_moe_configure_numa.argtypes = [
+            pointer,
+            integer,
+            pointer,
+            pointer,
+            pointer,
+        ]
+        library.dsv41_moe_configure_numa.restype = integer
+    if hasattr(library, "dsv41_moe_numa_pages"):
+        library.dsv41_moe_numa_pages.argtypes = [pointer, pointer]
+        library.dsv41_moe_numa_pages.restype = integer
     if hasattr(library, "dsv41_moe_set_threads"):
         library.dsv41_moe_set_threads.argtypes = [pointer, integer]
         library.dsv41_moe_set_threads.restype = integer
@@ -212,6 +230,7 @@ class CPUMXFP4Experts:
         self.max_tokens = max_tokens
         self.swiglu_limit = swiglu_limit
         self._handle = None
+        self._numa_enabled = self._numa_logged = False
         self._cuda_tasks: dict[tuple[int, ...], int] = {}
         self._cuda_library = (
             _cuda_library(config.cuda_library_path)
@@ -235,6 +254,67 @@ class CPUMXFP4Experts:
             )
             if not self._handle:
                 raise RuntimeError(self._library.dsv41_moe_error().decode())
+            if config.backend == "ik":
+                self._configure_numa()
+
+    def _configure_numa(self) -> None:
+        nodes = cpu_numa_nodes()
+        if not nodes or nodes[0].node_id < 0:
+            return
+        if not hasattr(self._library, "dsv41_moe_configure_numa"):
+            if len(nodes) > 1:
+                raise RuntimeError(
+                    "This IK library lacks NUMA sharding. Rebuild libdsv41_ik "
+                    "from this branch before running on multiple NUMA nodes."
+                )
+            return
+        self._numa_enabled = len(nodes) > 1
+        cpus = [cpu for node in nodes for cpu in node.cpus]
+        offsets = [0]
+        for node in nodes:
+            offsets.append(offsets[-1] + len(node.cpus))
+        integers = lambda values: (ctypes.c_int * len(values))(*values)
+        result = self._library.dsv41_moe_configure_numa(
+            self._handle,
+            len(nodes),
+            integers([node.node_id for node in nodes]),
+            integers(offsets),
+            integers(cpus),
+        )
+        if result < 0:
+            raise RuntimeError(self._library.dsv41_moe_error().decode())
+        if result:
+            logger.warning_once(
+                "CPU expert local memory policy unavailable (%s); using pinned "
+                "first-touch with the inherited memory policy.",
+                os.strerror(result),
+                scope="process",
+            )
+        logger.info_once(
+            "CPU expert NUMA: nodes/physical CPUs=%s, threads=%d, "
+            "row sharding=%s, placement=%s; explicit membind preserved; "
+            "one resident weight copy",
+            tuple((node.node_id, node.cpus) for node in nodes),
+            self.config.num_threads,
+            len(nodes) > 1,
+            "pinned first-touch" if self._numa_enabled else "inherited",
+            scope="process",
+        )
+
+    def numa_page_counts(self) -> tuple[int, int, int, int] | None:
+        """Sample total/local/remote/unknown weight pages without moving them."""
+        if not self._numa_enabled:
+            return None
+        counts = (ctypes.c_uint64 * 4)()
+        result = self._library.dsv41_moe_numa_pages(self._handle, counts)
+        if result:
+            logger.warning_once(
+                "Cannot query CPU expert NUMA page placement: %s",
+                os.strerror(result),
+                scope="process",
+            )
+            return None
+        return counts[0], counts[1], counts[2], counts[3]
 
     def set_num_threads(self, threads: int) -> None:
         """Change CPU parallelism after all forwards and CUDA replays complete."""
@@ -401,6 +481,20 @@ class CPUMXFP4Experts:
     def prepare(self) -> None:
         if len(self._loaded) != self.num_experts * 3:
             raise RuntimeError("CPU expert weights are incomplete")
+        if self._numa_enabled and not self._numa_logged:
+            counts = self.numa_page_counts()
+            if counts is not None and counts[0]:
+                total, local, remote, unknown = counts
+                logger.info_once(
+                    "CPU expert NUMA sampled pages: local=%.1f%% remote=%.1f%% "
+                    "unknown=%d samples=%d (no page migration)",
+                    100 * local / total,
+                    100 * remote / total,
+                    unknown,
+                    total,
+                    scope="process",
+                )
+            self._numa_logged = True
         if self.config.backend != "kt" or self._kt_moe is not None:
             return
         extension = _kt_extension(self.config.library_path)

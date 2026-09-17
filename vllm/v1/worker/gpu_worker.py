@@ -442,23 +442,25 @@ class Worker(WorkerBase):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
-            init_worker_distributed_environment(
-                self.vllm_config,
-                self.rank,
-                self.distributed_init_method,
-                self.local_rank,
-                current_platform.dist_backend,
+            from vllm.models.deepseek_v4_1.hybrid_runtime import (
+                initialize_hybrid_devices,
+                preserve_hybrid_cpu_affinity,
             )
+
+            with preserve_hybrid_cpu_affinity(self.vllm_config):
+                init_worker_distributed_environment(
+                    self.vllm_config,
+                    self.rank,
+                    self.distributed_init_method,
+                    self.local_rank,
+                    current_platform.dist_backend,
+                )
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
 
             # Set random seed.
             set_random_seed(self.model_config.seed)
-
-            from vllm.models.deepseek_v4_1.hybrid_runtime import (
-                initialize_hybrid_devices,
-            )
 
             initialize_hybrid_devices(self)
 
@@ -520,7 +522,9 @@ class Worker(WorkerBase):
         from vllm.models.deepseek_v4_1.hybrid import hybrid_settings
 
         if hybrid_settings(self.vllm_config) is not None:
-            from vllm.models.deepseek_v4_1.hybrid_runtime import physical_cpus
+            from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4_numa import (
+                physical_cpus,
+            )
 
             os.sched_setaffinity(0, physical_cpus())
         with (

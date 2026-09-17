@@ -53,8 +53,7 @@ def test_static_cache_selects_capacity_and_device_per_layer():
     assert cpu_moe_config(config, 20).gpu_cache_dynamic == {"mutable_experts": [2]}
     assert cpu_moe_config(config, 21).gpu_cache_dynamic is None
     config.scheduler_config.max_num_seqs = 2
-    with pytest.raises(ValueError, match="single request"):
-        cpu_moe_config(config, 20)
+    assert cpu_moe_config(config, 20).gpu_cache_dynamic == {"mutable_experts": [2]}
     config.scheduler_config.max_num_seqs = 1
     with pytest.raises(ValueError, match="Missing static expert selection"):
         cpu_moe_config(config, 22)
@@ -321,9 +320,10 @@ def load_weights(backend, gpu_cache=None):
     return reference_weights
 
 
+@pytest.mark.parametrize("numa_partitions", [0, 4], indirect=True)
 @pytest.mark.parametrize("hidden,intermediate", [(256, 128), (5120, 2304)])
 def test_native_export_preserves_bytes_after_checkpoint_is_released(
-    backend_config, hidden, intermediate
+    backend_config, hidden, intermediate, numa_partitions
 ):
     """GPU refills must need only resident weights, including exact scale bytes."""
     if backend_config.backend != "ik":
@@ -436,7 +436,13 @@ def test_ik_compact_matches_graph_with_cached_routes(
                     for threads in (1, 4):
                         backend.set_num_threads(threads)
                         actual = backend.forward(x, selected, routes)
-                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                        if backend._numa_enabled and tokens > 128:
+                            # NUMA chunks can select GEMV for the final token.
+                            torch.testing.assert_close(
+                                actual, expected, atol=1e-7, rtol=1e-5
+                            )
+                        else:
+                            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                 if tokens > 128:
                     small = backend.forward(x[:1], selected[:1], routes[:1])
                     backend.set_execution_mode("graph")
@@ -633,7 +639,10 @@ def test_cpu_experts_skip_padding_and_replay_new_inputs(backend_config):
         module.backend.close()
 
 
-def test_native_cpu_callback_replays_without_python_and_masks_padding(backend_config):
+@pytest.mark.parametrize("numa_partitions", [0, 4], indirect=True)
+def test_native_cpu_callback_replays_without_python_and_masks_padding(
+    backend_config, numa_partitions
+):
     cuda_library = os.environ.get("DSV41_TEST_CUDA_LIBRARY")
     if backend_config.backend == "kt" or not cuda_library:
         pytest.skip("Build the optional CUDA host-callback library for llama/ik")
@@ -1303,3 +1312,212 @@ def test_decode_refresh_visits_one_layer_per_step_and_limits_nearly_finished_req
     assert state.cpu_async_modules[-1].gpu_cache.refresh_decode.call_args.kwargs == {
         "remaining_steps": pytest.approx(1 / 3)
     }
+
+
+@pytest.fixture
+def numa_partitions(request, monkeypatch):
+    """Exercise node ownership even on single-node CI, without fake OS nodes."""
+    from vllm.model_executor.layers.fused_moe.experts import cpu_mxfp4 as adapter
+    from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4_numa import (
+        NumaNode,
+        cpu_numa_nodes,
+    )
+
+    count = request.param
+    if not count:
+        return 0
+    available = cpu_numa_nodes()
+    if available[0].node_id < 0 or len(available[0].cpus) < count * 2:
+        pytest.skip("Need enough cores on one real node to emulate row partitions")
+    cpus = available[0].cpus[: count * 2]
+    # Unequal core counts exercise proportional row ownership as well.
+    sizes = [1, 3] + [2] * (count - 2)
+    nodes, first = [], 0
+    for size in sizes:
+        nodes.append(NumaNode(available[0].node_id, cpus[first : first + size]))
+        first += size
+    monkeypatch.setattr(adapter, "cpu_numa_nodes", lambda: tuple(nodes))
+    return count * 2
+
+
+@pytest.mark.parametrize("numa_partitions", [0, 2, 4, 8], indirect=True)
+def test_native_numa_rows_survive_thread_switches_and_large_batches(
+    backend_config, numa_partitions
+):
+    """Node-local scheduling must preserve graph numerics, cached routes and tails."""
+    if backend_config.backend != "ik":
+        pytest.skip("NUMA row sharding uses IK")
+    backend = CPUMXFP4Experts(backend_config, 4, 512, 1056, 3, 0.125, 257)
+    original_affinity = os.sched_getaffinity(0)
+    try:
+        load_weights(backend)
+        assert os.sched_getaffinity(0) == original_affinity
+        pages = backend.numa_page_counts()
+        if pages is not None:
+            assert pages[0] > 0
+            assert pages[0] == sum(pages[1:])
+            # MPOL_LOCAL permits fallback, and malloc can reuse resident pages.
+            assert pages[3] == 0
+        with pytest.raises(RuntimeError, match="before loading"):
+            backend._configure_numa()
+        generator = torch.Generator().manual_seed(93)
+        for tokens in (1, 4, 8, 96, 128, 257):
+            x = torch.randn(tokens, 512, generator=generator).bfloat16()
+            ids = torch.stack(
+                [torch.randperm(4, generator=generator)[:3] for _ in range(tokens)]
+            )
+            ids[::2, 0] = -2
+            routes = torch.rand(tokens, 3, generator=generator)
+            backend.set_execution_mode("graph")
+            expected = backend.forward(x, ids, routes)
+            backend.set_execution_mode("compact")
+            partitioned = None
+            for threads in dict.fromkeys((1, 3, numa_partitions or 4, 4)):
+                backend.set_num_threads(threads)
+                actual = backend.forward(x, ids, routes)
+                # Chunking can select GEMV for the last token instead of GEMM.
+                torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-5)
+                if partitioned is None:
+                    partitioned = actual.clone()
+                else:
+                    torch.testing.assert_close(actual, partitioned, atol=0, rtol=0)
+                assert os.sched_getaffinity(0) == original_affinity
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("numa_partitions", [0, 4], indirect=True)
+@pytest.mark.parametrize("reuse_workers", [False, True])
+def test_native_numa_callback_workers_inherit_all_configured_nodes(
+    backend_config, numa_partitions, reuse_workers, monkeypatch
+):
+    """GPU-local callers must not strand OpenMP workers on one node at barriers."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm.model_executor.layers.fused_moe.experts import cpu_mxfp4 as adapter
+    from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4_numa import NumaNode
+
+    nodes = adapter.cpu_numa_nodes()
+    if backend_config.backend != "ik" or len(nodes) < 2:
+        pytest.skip("Requires IK and multiple NUMA row partitions")
+    backend = CPUMXFP4Experts(backend_config, 4, 128, 96, 3, 0.125, 4)
+    cpus = {cpu for node in nodes for cpu in node.cpus}
+    local = set(nodes[0].cpus)
+    unsharded = None
+    try:
+        load_weights(backend)
+        if reuse_workers:
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    adapter,
+                    "cpu_numa_nodes",
+                    lambda: (NumaNode(nodes[0].node_id, tuple(sorted(cpus))),),
+                )
+                unsharded = CPUMXFP4Experts(backend_config, 4, 128, 96, 3, 0.125, 4)
+            load_weights(unsharded)
+        x = torch.randn(4, 128)
+        ids = torch.tensor([[0, 1, 3]] * 4)
+        routes = torch.full((4, 3), 0.5)
+        expected = backend.forward(x, ids, routes)
+        previous = {int(p.name) for p in Path("/proc/self/task").iterdir()}
+
+        def callback():
+            os.sched_setaffinity(0, local)
+            if unsharded is not None:
+                unsharded.forward(x, ids, routes)
+            result = backend.forward(x, ids, routes)
+            assert os.sched_getaffinity(0) == local
+            return threading.get_native_id(), result
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            caller, actual = executor.submit(callback).result()
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            created = {int(p.name) for p in Path("/proc/self/task").iterdir()}
+            workers = created - previous - {caller}
+            assert len(workers) == backend_config.num_threads - 1
+            assert all(os.sched_getaffinity(tid) == cpus for tid in workers)
+    finally:
+        if unsharded is not None:
+            unsharded.close()
+        backend.close()
+
+
+def test_registered_host_mapping_interleaves_before_first_touch(monkeypatch):
+    """Pinning/copying must follow policy setup without allocating extra storage."""
+    import ctypes
+    import mmap
+
+    from vllm.models.deepseek_v4_1 import host_memory
+
+    calls = []
+
+    def mbind(address, length, mode, mask, maxnode, flags):
+        calls.append(
+            (length.value, mode.value, tuple(mask), maxnode.value, flags.value)
+        )
+        return 0
+
+    monkeypatch.setattr(host_memory, "host_memory_nodes", lambda: (1, 3, 67))
+    monkeypatch.setattr(
+        host_memory, "get_libnuma", lambda: SimpleNamespace(mbind=mbind)
+    )
+    with mmap.mmap(-1, mmap.PAGESIZE) as owner:
+        host_memory.interleave_host_mapping(owner)
+        bits = ctypes.sizeof(ctypes.c_ulong) * 8
+        expected = [0] * ((67 + bits) // bits)
+        for node in (1, 3, 67):
+            expected[node // bits] |= 1 << (node % bits)
+        assert calls == [
+            (mmap.PAGESIZE, 3, tuple(expected), len(expected) * bits + 1, 0)
+        ]
+        assert owner[:8] == bytes(8)
+
+
+def test_registered_host_mapping_keeps_highest_node_in_kernel_policy(monkeypatch):
+    """Linux subtracts one from maxnode; a mask's last node must survive that."""
+    import ctypes
+    import mmap
+
+    from vllm.models.deepseek_v4_1 import host_memory
+
+    nodes = host_memory.host_memory_nodes()
+    libnuma = host_memory.get_libnuma()
+    if not nodes or libnuma is None:
+        pytest.skip("NUMA policy APIs unavailable")
+    node = max(nodes)
+    bits = ctypes.sizeof(ctypes.c_ulong) * 8
+    mask = (ctypes.c_ulong * max(16, (node + bits) // bits))()
+    mask[node // bits] = 1 << (node % bits)
+    with mmap.mmap(
+        -1, mmap.PAGESIZE, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+    ) as probe:
+        address = ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(probe)))
+        rc = libnuma.mbind(
+            address,
+            ctypes.c_ulong(len(probe)),
+            3,
+            mask,
+            ctypes.c_ulong(len(mask) * bits + 1),
+            0,
+        )
+        if rc:
+            pytest.skip("Kernel denies mbind for this test process")
+    # A duplicate real node exercises policy setup on single-node test hosts.
+    monkeypatch.setattr(host_memory, "host_memory_nodes", lambda: (node, node))
+    with mmap.mmap(
+        -1, mmap.PAGESIZE, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+    ) as owner:
+        host_memory.interleave_host_mapping(owner)
+        mode = ctypes.c_int()
+        actual = type(mask)()
+        address = ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(owner)))
+        rc = libnuma.get_mempolicy(
+            ctypes.byref(mode),
+            actual,
+            ctypes.c_ulong(len(actual) * bits + 1),
+            address,
+            2,
+        )
+        assert rc == 0 and mode.value == 3
+        assert tuple(actual) == tuple(mask)

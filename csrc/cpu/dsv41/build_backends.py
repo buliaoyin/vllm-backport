@@ -110,6 +110,9 @@ def main():
     manifest["compact_avx2_sha256"] = hashlib.sha256(
         (wrapper_root / "compact_avx2.h").read_bytes()
     ).hexdigest()
+    manifest["numa_executor_sha256"] = hashlib.sha256(
+        (wrapper_root / "numa.h").read_bytes()
+    ).hexdigest()
     for name in args.backends:
         source, build = source_root / name, build_root / name
         if args.download:
