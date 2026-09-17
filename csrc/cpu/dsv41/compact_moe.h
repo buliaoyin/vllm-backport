@@ -7,11 +7,13 @@
 #include "compact_profile.h"
 #include "ggml.h"
 #include "iqk/iqk_mul_mat.h"
+#include "iqk/iqk_quantize.h"
 #include "numa.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include <omp.h>
@@ -106,24 +108,24 @@ struct CompactMoE {
     const int flags = schedule < 0
                           ? (tokens == 1 ? 15 : (numa.enabled() ? 10 : 8))
                           : schedule;
-    int down_tile = numa.enabled() ? dsv41::NumaPlan::tile_rows
+    int down_tile = numa.enabled() ? numa.tile_rows
                                    : ((hidden / 8 + threads - 1) / threads) * 8;
     if (numa.enabled() && (flags & 2)) {
-      const int tiles = (hidden + dsv41::NumaPlan::tile_rows - 1) /
-                        dsv41::NumaPlan::tile_rows;
+      const int tiles = (hidden + numa.tile_rows - 1) / numa.tile_rows;
       down_tile = 0;
       for (const auto& slot : numa.compute_team) {
-        const int first =
-            numa.boundary(tiles, slot.node) * dsv41::NumaPlan::tile_rows;
-        const int end = std::min(hidden, numa.boundary(tiles, slot.node + 1) *
-                                             dsv41::NumaPlan::tile_rows);
+        const int first = numa.boundary(tiles, slot.node) * numa.tile_rows;
+        const int end = std::min(
+            hidden, numa.boundary(tiles, slot.node + 1) * numa.tile_rows);
         down_tile = std::max(down_tile, ((end - first) / 8 + slot.workers - 1) /
                                             slot.workers * 8);
       }
     }
     grow(down, size_t(threads) * count * down_tile);
     const int input_tiles = (hidden + up_tile - 1) / up_tile;
-    const int up_tiles = (intermediate + up_tile - 1) / up_tile;
+    const int up_rows_per_task = numa.enabled() ? numa.tile_rows : up_tile;
+    const int up_tiles =
+        (intermediate + up_rows_per_task - 1) / up_rows_per_task;
     const int down_tiles = threads;
     const size_t quant_tile_bytes = ggml_row_size(type, up_tile);
     const int group_count = groups.size();
@@ -174,8 +176,8 @@ struct CompactMoE {
       const auto run_up = [&](int task) {
         const auto& group = groups[task / up_tiles];
         const int tile = task % up_tiles;
-        const int begin = tile * up_tile;
-        const int rows = std::min(up_tile, intermediate - begin);
+        const int begin = tile * up_rows_per_task;
+        const int rows = std::min(up_rows_per_task, intermediate - begin);
         const auto address = [&](int projection) {
           const auto* weight = weights[projection];
           return static_cast<const char*>(weight->data) +
@@ -207,10 +209,26 @@ struct CompactMoE {
           worker->up += quant_begin - up_begin;
         }
         for (int row = group.first; row < group.first + group.count; ++row) {
-          quantize(activation.data() + size_t(row) * intermediate + begin,
-                   activation_q.data() + row * activation_stride +
-                       tile * quant_tile_bytes,
-                   rows);
+          const float* source =
+              activation.data() + size_t(row) * intermediate + begin;
+          auto* destination = activation_q.data() + row * activation_stride;
+          if (rows == up_tile || begin >= intermediate / up_tile * up_tile) {
+            const size_t offset = begin / up_tile * quant_tile_bytes +
+                                  begin % up_tile / QK8_2 * sizeof(block_q8_2);
+            quantize(source, destination + offset, rows);
+          } else {
+            // Preserve the 32-value scales in IQK's 128-value packed groups.
+            block_q8_2 partial[2];
+            quantize(source, partial, rows);
+            auto& block =
+                reinterpret_cast<block_q8_2_x4*>(destination)[begin / up_tile];
+            const int first = begin % up_tile / QK8_2;
+            for (int q = 0; q < rows / QK8_2; ++q) {
+              block.d[first + q] = partial[q].d;
+              block.d[first + q + 4] = partial[q].s;
+              std::memcpy(block.qs + (first + q) * QK8_2, partial[q].qs, QK8_2);
+            }
+          }
         }
         if constexpr (Profile)
           worker->quant += CompactProfile::now() - quant_begin;
@@ -291,7 +309,7 @@ struct CompactMoE {
                  (hidden / 8 * (tile + 1) / down_tiles) * 8);
       };
       if (numa.enabled()) {
-        const int tile_rows = dsv41::NumaPlan::tile_rows;
+        const int tile_rows = numa.tile_rows;
         const int tiles = (hidden + tile_rows - 1) / tile_rows;
         for (int s = omp_get_thread_num(); s < int(numa.compute_team.size());
              s += omp_get_num_threads()) {

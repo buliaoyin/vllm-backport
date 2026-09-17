@@ -56,7 +56,7 @@ struct LocalMemoryPolicy {
 };
 
 struct NumaPlan {
-  static constexpr int tile_rows = 128;
+  int tile_rows = 128;
   struct Node {
     int id, first_core;
     std::vector<int> cpus;
@@ -76,6 +76,20 @@ struct NumaPlan {
     const int prefix =
         node == int(nodes.size()) ? cores : nodes[node].first_core;
     return int(int64_t(tiles) * prefix / cores);
+  }
+
+  void balance_rows(int rows) {
+    const auto worst = [&](int tile) {
+      const int tiles = (rows + tile - 1) / tile;
+      double result = 0;
+      for (int n = 0; n < int(nodes.size()); ++n) {
+        const int first = std::min(rows, boundary(tiles, n) * tile);
+        const int end = std::min(rows, boundary(tiles, n + 1) * tile);
+        result = std::max(result, double(end - first) / nodes[n].cpus.size());
+      }
+      return result;
+    };
+    tile_rows = worst(64) < worst(128) ? 64 : 128;
   }
 
   std::vector<Slot> team(int threads) const {

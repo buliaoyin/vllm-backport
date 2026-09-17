@@ -423,6 +423,7 @@ int dsv41_moe_configure_numa(void* handle, int count, const int* node_ids,
     if (unique.front() < 0 ||
         std::adjacent_find(unique.begin(), unique.end()) != unique.end())
       throw std::invalid_argument("Invalid or duplicate CPU in NUMA topology");
+    plan.balance_rows(moe->intermediate);
     plan.load_team = plan.team(moe->load_threads);
     plan.compute_team = plan.team(moe->num_threads);
     if (plan.enabled()) {

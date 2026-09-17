@@ -408,7 +408,7 @@ def test_native_moe_preserves_routing_and_clipped_swiglu(backend_config, limit):
 
 
 @pytest.mark.parametrize("limit", [0.0, 0.125])
-@pytest.mark.parametrize("intermediate", [128, 160])
+@pytest.mark.parametrize("intermediate", [96, 128, 160, 224])
 def test_ik_compact_matches_graph_with_cached_routes(
     backend_config, limit, intermediate
 ):
@@ -1341,14 +1341,16 @@ def numa_partitions(request, monkeypatch):
 
 
 @pytest.mark.parametrize("numa_partitions", [0, 2, 4, 8], indirect=True)
-@pytest.mark.parametrize("hidden", [512, 5120])
+@pytest.mark.parametrize(
+    "hidden,intermediate", [(512, 1056), (5120, 1056), (5120, 2304)]
+)
 def test_native_numa_rows_survive_thread_switches_and_large_batches(
-    backend_config, numa_partitions, hidden
+    backend_config, numa_partitions, hidden, intermediate
 ):
     """Node-local scheduling must preserve graph numerics, cached routes and tails."""
     if backend_config.backend != "ik":
         pytest.skip("NUMA row sharding uses IK")
-    backend = CPUMXFP4Experts(backend_config, 4, hidden, 1056, 3, 0.125, 257)
+    backend = CPUMXFP4Experts(backend_config, 4, hidden, intermediate, 3, 0.125, 257)
     original_affinity = os.sched_getaffinity(0)
     try:
         load_weights(backend)
