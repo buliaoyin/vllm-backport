@@ -5,6 +5,7 @@
 import ctypes
 import math
 import mmap
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 
@@ -56,6 +57,76 @@ def check_host_headroom(additional_bytes=0):
                     "DeepSeek hybrid host allocation exceeds cgroup headroom"
                 )
         path = path.parent
+
+
+class CheckpointPageReclaimer:
+    """Release consumed private checkpoint pages in bounded batches."""
+
+    def __init__(self):
+        self.weights: list[torch.Tensor] = []
+        self.pending_bytes = 0
+        self.executor: ThreadPoolExecutor | None = None
+        self.pending: Future[None] | None = None
+
+    def add(self, *weights: torch.Tensor):
+        for weight in weights:
+            if weight.device.type == "cpu" and weight.is_contiguous():
+                self.weights.append(weight)
+                self.pending_bytes += weight.numel() * weight.element_size()
+        if self.pending_bytes >= LOAD_CHUNK_BYTES:
+            self._submit()
+
+    def _submit(self):
+        if self.pending is not None:
+            self.pending.result()
+            self.pending = None
+        if not self.weights:
+            return
+        if self.executor is None:
+            self.executor = ThreadPoolExecutor(max_workers=1)
+        weights, self.weights = self.weights, []
+        self.pending_bytes = 0
+        self.pending = self.executor.submit(self._reclaim, weights)
+
+    def flush(self):
+        try:
+            self._submit()
+            if self.pending is not None:
+                self.pending.result()
+        finally:
+            if self.executor is not None:
+                self.executor.shutdown(wait=True)
+            self.executor = self.pending = None
+
+    @staticmethod
+    def _reclaim(weights):
+        try:
+            mappings = []
+            for line in Path("/proc/self/maps").read_text().splitlines():
+                fields = line.split(maxsplit=5)
+                if (
+                    len(fields) == 6
+                    and fields[1].endswith("p")
+                    and fields[5].endswith(".safetensors")
+                ):
+                    mappings.append(tuple(int(x, 16) for x in fields[0].split("-")))
+        except OSError:
+            return
+        pageout = ctypes.CDLL(None, use_errno=True).madvise
+        pageout.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        pageout.restype = ctypes.c_int
+        for weight in weights:
+            base = weight.data_ptr()
+            limit = base + weight.numel() * weight.element_size()
+            if not any(first <= base < limit <= last for first, last in mappings):
+                continue
+            first = (base + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
+            last = limit // mmap.PAGESIZE * mmap.PAGESIZE
+            # PAGEOUT preserves private modifications; never advise target storage.
+            if last > first and pageout(first, last - first, 21):
+                logger.warning_once(
+                    "CPU expert checkpoint page reclaim failed: %d", ctypes.get_errno()
+                )
 
 
 def interleave_host_mapping(owner):

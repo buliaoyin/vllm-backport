@@ -37,7 +37,7 @@ struct CompactMoE {
   }
 
   CompactProfile profile;
-  // Bits: 1 serial input, 2 fixed down tiles, 4 one final barrier;
+  // Bits: 1 serial input, 2 balanced down ranges, 4 one final barrier;
   // 8 AVX2 up/gate and 16 AVX2 down for single-token expert groups.
   // -1 selects the schedule validated for each batch size.
   int schedule = -1;
@@ -103,9 +103,24 @@ struct CompactMoE {
     grow(input_q, size_t(tokens) * input_stride);
     grow(activation_q, size_t(count) * activation_stride);
     grow(activation, size_t(count) * intermediate);
-    const int down_tile = numa.enabled()
-                              ? dsv41::NumaPlan::tile_rows
-                              : ((hidden / 8 + threads - 1) / threads) * 8;
+    const int flags = schedule < 0
+                          ? (tokens == 1 ? 15 : (numa.enabled() ? 10 : 8))
+                          : schedule;
+    int down_tile = numa.enabled() ? dsv41::NumaPlan::tile_rows
+                                   : ((hidden / 8 + threads - 1) / threads) * 8;
+    if (numa.enabled() && (flags & 2)) {
+      const int tiles = (hidden + dsv41::NumaPlan::tile_rows - 1) /
+                        dsv41::NumaPlan::tile_rows;
+      down_tile = 0;
+      for (const auto& slot : numa.compute_team) {
+        const int first =
+            numa.boundary(tiles, slot.node) * dsv41::NumaPlan::tile_rows;
+        const int end = std::min(hidden, numa.boundary(tiles, slot.node + 1) *
+                                             dsv41::NumaPlan::tile_rows);
+        down_tile = std::max(down_tile, ((end - first) / 8 + slot.workers - 1) /
+                                            slot.workers * 8);
+      }
+    }
     grow(down, size_t(threads) * count * down_tile);
     const int input_tiles = (hidden + up_tile - 1) / up_tile;
     const int up_tiles = (intermediate + up_tile - 1) / up_tile;
@@ -113,7 +128,6 @@ struct CompactMoE {
     const size_t quant_tile_bytes = ggml_row_size(type, up_tile);
     const int group_count = groups.size();
 
-    const int flags = schedule < 0 ? (tokens == 1 ? 15 : 8) : schedule;
     const bool serial_input = flags & 1;
     if (serial_input) {
       for (int token = 0; token < tokens; ++token) {
@@ -122,6 +136,7 @@ struct CompactMoE {
       }
     }
     dsv41::NumaPlan::Binding caller(numa);
+    const auto [caller_slot, caller_cpu] = caller.local_slot(numa.compute_team);
     caller.bind_team();
     numa.check_affinity();
     if constexpr (Profile) parallel_ns = CompactProfile::now();
@@ -129,7 +144,10 @@ struct CompactMoE {
     {
       dsv41::NumaPlan::Binding binding(numa, true);
       if (numa.enabled())
-        binding.bind(numa.compute_team[omp_get_thread_num()].cpu);
+        binding.bind(dsv41::NumaPlan::slot(numa.compute_team,
+                                           omp_get_thread_num(), caller_slot,
+                                           caller_cpu)
+                         .cpu);
       CompactProfile::Worker* worker = nullptr;
       if constexpr (Profile) {
         worker = &profile.workers[omp_get_thread_num()];
@@ -200,7 +218,8 @@ struct CompactMoE {
       if (numa.enabled()) {
         for (int s = omp_get_thread_num(); s < int(numa.compute_team.size());
              s += omp_get_num_threads()) {
-          const auto& slot = numa.compute_team[s];
+          const auto& slot = dsv41::NumaPlan::slot(numa.compute_team, s,
+                                                   caller_slot, caller_cpu);
           binding.bind(slot.cpu);
           const int first = numa.boundary(up_tiles, slot.node);
           const int width = numa.boundary(up_tiles, slot.node + 1) - first;
@@ -272,16 +291,26 @@ struct CompactMoE {
                  (hidden / 8 * (tile + 1) / down_tiles) * 8);
       };
       if (numa.enabled()) {
-        const int tiles = (hidden + down_tile - 1) / down_tile;
+        const int tile_rows = dsv41::NumaPlan::tile_rows;
+        const int tiles = (hidden + tile_rows - 1) / tile_rows;
         for (int s = omp_get_thread_num(); s < int(numa.compute_team.size());
              s += omp_get_num_threads()) {
-          const auto& slot = numa.compute_team[s];
+          const auto& slot = dsv41::NumaPlan::slot(numa.compute_team, s,
+                                                   caller_slot, caller_cpu);
           binding.bind(slot.cpu);
+          const int first = numa.boundary(tiles, slot.node);
           const int end = numa.boundary(tiles, slot.node + 1);
-          for (int tile = numa.boundary(tiles, slot.node) + slot.rank;
-               tile < end; tile += slot.workers)
-            run_down(tile * down_tile,
-                     std::min((tile + 1) * down_tile, hidden));
+          if (flags & 2) {
+            const int begin_row = first * tile_rows;
+            const int rows = std::min(end * tile_rows, hidden) - begin_row;
+            run_down(
+                begin_row + (rows / 8 * slot.rank / slot.workers) * 8,
+                begin_row + (rows / 8 * (slot.rank + 1) / slot.workers) * 8);
+          } else {
+            for (int tile = first + slot.rank; tile < end; tile += slot.workers)
+              run_down(tile * tile_rows,
+                       std::min((tile + 1) * tile_rows, hidden));
+          }
         }
       } else if (flags & 2) {
         for (int tile = omp_get_thread_num(); tile < down_tiles;

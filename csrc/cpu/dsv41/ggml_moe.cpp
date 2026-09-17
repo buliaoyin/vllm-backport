@@ -450,11 +450,12 @@ int dsv41_moe_configure_numa(void* handle, int count, const int* node_ids,
   }
 }
 
-int dsv41_moe_numa_pages(void* handle, uint64_t* counts) {
+static int query_numa_pages(void* handle, int expert, uint64_t* counts) {
 #ifdef DSV41_IK
   try {
     if (!handle || !counts) return EINVAL;
     auto* moe = static_cast<MoE*>(handle);
+    if (expert < -1 || expert >= moe->experts) return EINVAL;
     const auto& plan = moe->numa;
     std::fill_n(counts, 4, 0);
     if (!plan.enabled()) return 0;
@@ -463,7 +464,10 @@ int dsv41_moe_numa_pages(void* handle, uint64_t* counts) {
     const size_t page_size = sysconf(_SC_PAGESIZE);
     for (const auto* weight : moe->weights) {
       const int tiles = (weight->ne[1] + plan.tile_rows - 1) / plan.tile_rows;
-      for (int e = 0; e < moe->experts; e += std::max(1, moe->experts / 8)) {
+      const int first = expert < 0 ? 0 : expert;
+      const int end_expert = expert < 0 ? moe->experts : expert + 1;
+      const int stride = expert < 0 ? std::max(1, moe->experts / 8) : 1;
+      for (int e = first; e < end_expert; e += stride) {
         const auto base =
             reinterpret_cast<uintptr_t>(weight->data) + e * weight->nb[2];
         for (int n = 0; n < int(plan.nodes.size()); ++n) {
@@ -499,6 +503,15 @@ int dsv41_moe_numa_pages(void* handle, uint64_t* counts) {
 #else
   return ENOSYS;
 #endif
+}
+
+int dsv41_moe_numa_pages(void* handle, uint64_t* counts) {
+  return query_numa_pages(handle, -1, counts);
+}
+
+int dsv41_moe_numa_expert_pages(void* handle, int expert, uint64_t* counts) {
+  if (expert < 0) return EINVAL;
+  return query_numa_pages(handle, expert, counts);
 }
 
 int dsv41_moe_set_threads(void* handle, int threads) {

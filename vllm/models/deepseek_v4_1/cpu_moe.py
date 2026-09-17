@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4 import (
     CPUMoEConfig,
     CPUMXFP4Experts,
 )
+from vllm.models.deepseek_v4_1.host_memory import CheckpointPageReclaimer
 from vllm.v1.metrics.stats import ExpertCacheStats
 
 logger = init_logger(__name__)
@@ -136,6 +137,7 @@ class CPUExpertModule(nn.Module):
             )
         self.pending: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
         self.num_loaded = 0
+        self.checkpoint_pages = CheckpointPageReclaimer()
         self.async_host: tuple[torch.Tensor, ...] | None = None
         self.async_tokens = max(
             16,
@@ -170,9 +172,14 @@ class CPUExpertModule(nn.Module):
                 self.gpu_cache.load_weight(
                     expert, projection, pair["weight"], pair["weight_scale"]
                 )
+            if self.backend.config.backend != "kt" and (
+                self.gpu_cache is None or self.gpu_cache.weight_source is not None
+            ):
+                self.checkpoint_pages.add(pair["weight"], pair["weight_scale"])
             del self.pending[expert, projection]
             self.num_loaded += 1
             if self.num_loaded == 3 * self.backend.num_experts:
+                self.checkpoint_pages.flush()
                 self.backend.prepare()
 
     def finalize(self) -> None:

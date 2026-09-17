@@ -1341,13 +1341,14 @@ def numa_partitions(request, monkeypatch):
 
 
 @pytest.mark.parametrize("numa_partitions", [0, 2, 4, 8], indirect=True)
+@pytest.mark.parametrize("hidden", [512, 5120])
 def test_native_numa_rows_survive_thread_switches_and_large_batches(
-    backend_config, numa_partitions
+    backend_config, numa_partitions, hidden
 ):
     """Node-local scheduling must preserve graph numerics, cached routes and tails."""
     if backend_config.backend != "ik":
         pytest.skip("NUMA row sharding uses IK")
-    backend = CPUMXFP4Experts(backend_config, 4, 512, 1056, 3, 0.125, 257)
+    backend = CPUMXFP4Experts(backend_config, 4, hidden, 1056, 3, 0.125, 257)
     original_affinity = os.sched_getaffinity(0)
     try:
         load_weights(backend)
@@ -1358,11 +1359,16 @@ def test_native_numa_rows_survive_thread_switches_and_large_batches(
             assert pages[0] == sum(pages[1:])
             # MPOL_LOCAL permits fallback, and malloc can reuse resident pages.
             assert pages[3] == 0
+            per_expert = [backend.numa_page_counts(e) for e in range(4)]
+            assert tuple(map(sum, zip(*per_expert))) == pages
+        for invalid_expert in (-1, 4):
+            with pytest.raises(ValueError, match="Invalid expert index"):
+                backend.numa_page_counts(invalid_expert)
         with pytest.raises(RuntimeError, match="before loading"):
             backend._configure_numa()
         generator = torch.Generator().manual_seed(93)
         for tokens in (1, 4, 8, 96, 128, 257):
-            x = torch.randn(tokens, 512, generator=generator).bfloat16()
+            x = torch.randn(tokens, hidden, generator=generator).bfloat16()
             ids = torch.stack(
                 [torch.randperm(4, generator=generator)[:3] for _ in range(tokens)]
             )
@@ -1403,7 +1409,7 @@ def test_native_numa_callback_workers_inherit_all_configured_nodes(
         pytest.skip("Requires IK and multiple NUMA row partitions")
     backend = CPUMXFP4Experts(backend_config, 4, 128, 96, 3, 0.125, 4)
     cpus = {cpu for node in nodes for cpu in node.cpus}
-    local = set(nodes[0].cpus)
+    local = {nodes[-1].cpus[-1]}
     unsharded = None
     try:
         load_weights(backend)
@@ -1521,3 +1527,55 @@ def test_registered_host_mapping_keeps_highest_node_in_kernel_policy(monkeypatch
         )
         assert rc == 0 and mode.value == 3
         assert tuple(actual) == tuple(mask)
+
+
+def test_checkpoint_reclaim_preserves_private_data_and_excludes_other_storage(
+    tmp_path, monkeypatch
+):
+    """Reclaim only full, consumed checkpoint pages after the native copy."""
+    import ctypes
+    import mmap
+
+    from vllm.models.deepseek_v4_1 import host_memory
+
+    if not Path("/proc/self/maps").exists():
+        pytest.skip("Checkpoint page reclaim uses Linux mappings")
+    page = mmap.PAGESIZE
+    path = tmp_path / "experts.safetensors"
+    path.write_bytes(bytes(5 * page + 300))
+    calls = []
+    native = ctypes.CDLL(None, use_errno=True).madvise
+    native.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    native.restype = ctypes.c_int
+
+    def pageout(address, length, advice):
+        calls.append((address, length, advice))
+        return native(address, length, advice)
+
+    monkeypatch.setattr(
+        host_memory.ctypes, "CDLL", lambda *a, **k: SimpleNamespace(madvise=pageout)
+    )
+    with path.open("rb") as file:
+        owner = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_COPY)
+    source = torch.frombuffer(owner, dtype=torch.uint8)
+    try:
+        source[2 * page] = 113
+        reclaimer = host_memory.CheckpointPageReclaimer()
+        reclaimer.add(source[3:-7], torch.zeros(4 * page), source[::2])
+        assert not calls
+        reclaimer.flush()
+        assert calls == [(source.data_ptr() + page, 4 * page, 21)]
+        assert source[2 * page].item() == 113
+        assert source.sum().item() == 113
+        assert not reclaimer.weights and reclaimer.pending_bytes == 0
+        reclaimer.flush()
+        assert len(calls) == 1
+        monkeypatch.setattr(host_memory, "LOAD_CHUNK_BYTES", page)
+        reclaimer.add(source[3:-7])
+        reclaimer.add(source[3:-7])
+        reclaimer.flush()
+        assert len(calls) == 3
+        assert reclaimer.executor is None and reclaimer.pending is None
+    finally:
+        del source
+        owner.close()

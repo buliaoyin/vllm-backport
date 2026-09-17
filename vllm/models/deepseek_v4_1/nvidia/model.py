@@ -71,6 +71,7 @@ from vllm.models.deepseek_v4_1.cpu_moe import (
     CPUExpertModule,
     cpu_moe_config,
 )
+from vllm.models.deepseek_v4_1.host_memory import CheckpointPageReclaimer
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -539,6 +540,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.engram_layout = EngramLayout.from_config(config)
         self.pp_shared_kv = None
         additional = vllm_config.additional_config
+        self.reclaim_expert_checkpoints = isinstance(additional, dict) and bool(
+            additional.get("cpu_moe")
+        )
         if isinstance(additional, dict) and additional.get("pp_kv_transfer", False):
             from vllm.distributed.utils import get_pp_indices
             from vllm.models.deepseek_v4_1.pp_kv import IncrementalPPKV
@@ -843,6 +847,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        checkpoint_pages = CheckpointPageReclaimer()
 
         # TP for attention
         tp_size = get_tensor_model_parallel_world_size()
@@ -942,6 +947,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             return_success=True,
                         )
                         if success:
+                            if self.reclaim_expert_checkpoints and param.is_cuda:
+                                checkpoint_pages.add(loaded_weight)
                             name = name_mapped
                             break
                     loaded_params.add(name_mapped)
@@ -972,6 +979,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     loaded_params.add(name)
                     continue
 
+        checkpoint_pages.flush()
         return loaded_params
 
     @staticmethod

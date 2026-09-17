@@ -124,6 +124,9 @@ def _native_library(path: str):
     if hasattr(library, "dsv41_moe_numa_pages"):
         library.dsv41_moe_numa_pages.argtypes = [pointer, pointer]
         library.dsv41_moe_numa_pages.restype = integer
+    if hasattr(library, "dsv41_moe_numa_expert_pages"):
+        library.dsv41_moe_numa_expert_pages.argtypes = [pointer, integer, pointer]
+        library.dsv41_moe_numa_expert_pages.restype = integer
     if hasattr(library, "dsv41_moe_set_threads"):
         library.dsv41_moe_set_threads.argtypes = [pointer, integer]
         library.dsv41_moe_set_threads.restype = integer
@@ -301,12 +304,24 @@ class CPUMXFP4Experts:
             scope="process",
         )
 
-    def numa_page_counts(self) -> tuple[int, int, int, int] | None:
-        """Sample total/local/remote/unknown weight pages without moving them."""
+    def numa_page_counts(
+        self, expert: int | None = None
+    ) -> tuple[int, int, int, int] | None:
+        """Sample total/local/remote/unknown pages for a layer or one expert."""
+        if expert is not None and (
+            type(expert) is not int or not 0 <= expert < self.num_experts
+        ):
+            raise ValueError("Invalid expert index for NUMA page query")
         if not self._numa_enabled:
             return None
         counts = (ctypes.c_uint64 * 4)()
-        result = self._library.dsv41_moe_numa_pages(self._handle, counts)
+        if expert is None:
+            result = self._library.dsv41_moe_numa_pages(self._handle, counts)
+        else:
+            query = getattr(self._library, "dsv41_moe_numa_expert_pages", None)
+            if query is None:
+                return None
+            result = query(self._handle, expert, counts)
         if result:
             logger.warning_once(
                 "Cannot query CPU expert NUMA page placement: %s",

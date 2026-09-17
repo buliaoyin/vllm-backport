@@ -11,6 +11,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#include <utility>
 
 #include <linux/mempolicy.h>
 #include <sched.h>
@@ -125,6 +126,25 @@ struct NumaPlan {
       if (worker && select_team()) previous = selected;
     }
 
+    // Keep the caller on its current core when that node owns a work slot.
+    std::pair<int, int> local_slot(const std::vector<Slot>& team) const {
+      const int current_cpu = sched_getcpu();
+      for (int s = 0; s < int(team.size()); ++s)
+        if (team[s].cpu == current_cpu) return {s, current_cpu};
+      for (int s = 0; s < int(team.size()); ++s) {
+        const auto& cpus = plan.nodes[team[s].node].cpus;
+        if (std::find(cpus.begin(), cpus.end(), current_cpu) != cpus.end())
+          return {s, current_cpu};
+      }
+      for (int s = 0; s < int(team.size()); ++s) {
+        const int cpu = team[s].cpu;
+        if (cpu >= 0 && size_t(cpu / 64) < previous.size() &&
+            (previous[cpu / 64] & (1UL << (cpu % 64))))
+          return {s, cpu};
+      }
+      return {0, team.empty() ? -1 : team[0].cpu};
+    }
+
     void bind(int cpu) {
       if (cpu == current || previous.empty()) return;
       std::fill(selected.begin(), selected.end(), 0UL);
@@ -175,6 +195,15 @@ struct NumaPlan {
     }
   };
 
+  static Slot slot(const std::vector<Slot>& team, int index, int caller_slot,
+                   int caller_cpu) {
+    auto result = team[index == 0             ? caller_slot
+                       : index == caller_slot ? 0
+                                              : index];
+    if (index == 0) result.cpu = caller_cpu;
+    return result;
+  }
+
   void check_affinity() const {
     if (int error = affinity_error.exchange(0))
       throw std::runtime_error(
@@ -189,6 +218,7 @@ struct NumaPlan {
                    const Work& work) const {
     // New OpenMP workers inherit this mask, not a GPU-local callback mask.
     Binding caller(*this);
+    const auto [caller_slot, caller_cpu] = caller.local_slot(load_team);
     caller.bind_team();
     check_affinity();
 #pragma omp parallel num_threads(threads)
@@ -198,7 +228,8 @@ struct NumaPlan {
       const int tiles = (rows + tile_rows - 1) / tile_rows;
       for (int s = omp_get_thread_num(); s < int(load_team.size());
            s += omp_get_num_threads()) {
-        const auto& slot = load_team[s];
+        const auto& slot =
+            NumaPlan::slot(load_team, s, caller_slot, caller_cpu);
         binding.bind(slot.cpu);
         const int end = boundary(tiles, slot.node + 1);
         for (int tile = boundary(tiles, slot.node) + slot.rank; tile < end;
