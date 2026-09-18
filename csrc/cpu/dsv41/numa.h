@@ -123,6 +123,18 @@ struct NumaPlan {
 
     explicit Binding(const NumaPlan& p, bool worker = false) : plan(p) {
       if (!plan.enabled()) return;
+      if (worker) {
+        size_t words = 16;
+        for (const auto& node : plan.nodes)
+          for (int cpu : node.cpus)
+            words = std::max(words, size_t(cpu / 64 + 1));
+        previous.resize(words);
+        selected.resize(words);
+        // Workers leave the parallel region with the configured team mask.
+        // Reading their inherited mask would only be discarded below.
+        if (select_team()) previous = selected;
+        return;
+      }
       previous.resize(16);
       while (sched_getaffinity(0, previous.size() * sizeof(unsigned long),
                                reinterpret_cast<cpu_set_t*>(previous.data()))) {
@@ -134,10 +146,6 @@ struct NumaPlan {
         previous.resize(previous.size() * 2);
       }
       selected.resize(previous.size());
-      // Reused OpenMP workers may have inherited a GPU-local mask. Release
-      // them to the configured CPU set before the implicit join. The outer
-      // guard separately restores the calling thread's original mask.
-      if (worker && select_team()) previous = selected;
     }
 
     // Keep the caller on its current core when that node owns a work slot.

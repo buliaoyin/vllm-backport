@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.platforms import current_platform
 
 # These Triton kernels are also the CUDA SM8x (Ampere) sparse-MLA path, not
@@ -367,9 +368,18 @@ def test_extra_cache_nan_free_provenance_gate(monkeypatch) -> None:
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("bounded_submission", [False, True])
 @torch.inference_mode()
 def test_dsv41_ampere_prefill_indices_match_torch(
-    query_lens, seq_lens, gather_lens, query_base, ratio, width, topk, dtype
+    query_lens,
+    seq_lens,
+    gather_lens,
+    query_base,
+    ratio,
+    width,
+    topk,
+    dtype,
+    bounded_submission,
 ):
     """Preserve short rows, mixed chunk bases, invalid top-k and SWA replay rows."""
     from vllm.models.deepseek_v4_1.amd.rocm import (
@@ -377,6 +387,7 @@ def test_dsv41_ampere_prefill_indices_match_torch(
     )
     from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
         DeepseekV41AmpereMLAAttention,
+        PrefillSubmission,
     )
 
     combine_topk_swa_indices = DeepseekV41AmpereMLAAttention._combine_prefill_indices
@@ -397,15 +408,23 @@ def test_dsv41_ampere_prefill_indices_match_torch(
     gathers = torch.tensor(gather_lens, device="cuda", dtype=torch.int32)
     args = (topk_indices, query, seqs, gathers, 128, ratio, topk, m, n)
     expected = reference(*args)
-    actual = combine_topk_swa_indices(*args)
+    context = ForwardContext({}, {}, {})
+    if bounded_submission:
+        context.additional_kwargs["dsv41_prefill_submission"] = PrefillSubmission()
+    with override_forward_context(context):
+        # Reuse the checkpoint across calls, as successive attention layers do.
+        combine_topk_swa_indices(*args)
+        actual = combine_topk_swa_indices(*args)
     for result, baseline in zip(actual, expected):
         torch.testing.assert_close(result, baseline, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("bounded_submission", [False, True])
 @torch.inference_mode()
-def test_dsv41_ampere_prefill_indices_capture_without_host_sync():
+def test_dsv41_ampere_prefill_indices_capture_without_host_sync(bounded_submission):
     from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
         DeepseekV41AmpereMLAAttention,
+        PrefillSubmission,
     )
 
     combine_topk_swa_indices = DeepseekV41AmpereMLAAttention._combine_prefill_indices
@@ -417,13 +436,18 @@ def test_dsv41_ampere_prefill_indices_capture_without_host_sync():
     args = (topk, query, seqs, gathers, 128, 1, 512, 34432, 33152)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        expected = combine_topk_swa_indices(*args)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = combine_topk_swa_indices(*args)
-    graph.replay()
+    context = ForwardContext({}, {}, {})
+    if bounded_submission:
+        context.additional_kwargs["dsv41_prefill_submission"] = PrefillSubmission()
+    with override_forward_context(context):
+        with torch.cuda.stream(stream):
+            expected = combine_topk_swa_indices(*args)
+        torch.cuda.current_stream().wait_stream(stream)
+        combine_topk_swa_indices(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = combine_topk_swa_indices(*args)
+        graph.replay()
     for result, baseline in zip(actual, expected):
         torch.testing.assert_close(result, baseline, atol=0, rtol=0)
 

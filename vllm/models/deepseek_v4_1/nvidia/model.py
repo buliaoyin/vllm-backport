@@ -72,6 +72,7 @@ from vllm.models.deepseek_v4_1.cpu_moe import (
     cpu_moe_config,
 )
 from vllm.models.deepseek_v4_1.host_memory import CheckpointPageReclaimer
+from vllm.models.deepseek_v4_1.hybrid import hybrid_settings
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -538,6 +539,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         self.engram_layout = EngramLayout.from_config(config)
+        self.prefill_submission = None
+        if hybrid_settings(vllm_config) is not None:
+            from vllm.models.deepseek_v4_1.ampere.ampere_sparse import PrefillSubmission
+
+            self.prefill_submission = PrefillSubmission()
         self.pp_shared_kv = None
         additional = vllm_config.additional_config
         self.reclaim_expert_checkpoints = isinstance(additional, dict) and bool(
@@ -679,6 +685,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         lookback_token_ids: torch.Tensor | None = None,
         ced_step: CEDStep | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if self.prefill_submission is not None and is_forward_context_available():
+            get_forward_context().additional_kwargs["dsv41_prefill_submission"] = (
+                self.prefill_submission
+            )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

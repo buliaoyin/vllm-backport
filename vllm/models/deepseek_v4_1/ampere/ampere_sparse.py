@@ -14,6 +14,7 @@ from dataclasses import replace
 
 import torch
 
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v4_1.amd.rocm import (
     DeepseekV4ROCMAiterMLASparseBackend,
     DeepseekV41ROCMAiterMLAAttention,
@@ -25,6 +26,22 @@ from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.platforms.interface import DeviceCapability
+
+
+class PrefillSubmission:
+    """Keep at most one attention interval ahead of the previous checkpoint."""
+
+    def __init__(self):
+        self.events: dict[torch.cuda.Stream, torch.cuda.Event] = {}
+
+    def wait(self):
+        stream = torch.cuda.current_stream()
+        event = self.events.get(stream)
+        if event is None:
+            event = self.events[stream] = torch.cuda.Event()
+        else:
+            event.synchronize()
+        event.record(stream)
 
 
 class DeepseekV41AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
@@ -44,9 +61,17 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
 
     @staticmethod
     def _combine_prefill_indices(*args, **kwargs):
-        # Bound live eager intermediates after removing Torch's implicit syncs.
         if not torch.cuda.is_current_stream_capturing():
-            torch.cuda.current_stream().synchronize()
+            submission = None
+            if is_forward_context_available():
+                submission = get_forward_context().additional_kwargs.get(
+                    "dsv41_prefill_submission"
+                )
+            # Bound live eager intermediates while overlapping host submission.
+            if submission is not None:
+                submission.wait()
+            else:
+                torch.cuda.current_stream().synchronize()
         return combine_topk_swa_indices(*args, **kwargs)
 
     def __init__(self, *args, **kwargs):

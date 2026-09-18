@@ -326,8 +326,8 @@ struct MoE {
       }
     }
 #ifdef DSV41_IK
-    if (use_compact && (tokens <= 64 || numa.enabled())) {
-      // Bound workspace for replay/concurrent DSpark batches on NUMA hosts.
+    if (use_compact && (tokens <= 128 || numa.enabled())) {
+      // Keep tail replay compact and bound concurrent NUMA workspace.
       if (execution && execution->tokens > 128) execution.reset();
       for (int first = 0; first < tokens; first += 128) {
         compact.forward(weights, std::min(128, tokens - first), topk,

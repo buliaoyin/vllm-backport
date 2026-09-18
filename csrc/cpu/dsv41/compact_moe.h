@@ -106,7 +106,7 @@ struct CompactMoE {
     grow(activation_q, size_t(count) * activation_stride);
     grow(activation, size_t(count) * intermediate);
     const int flags = schedule < 0
-                          ? (tokens == 1 ? 15 : (numa.enabled() ? 10 : 8))
+                          ? (tokens == 1 ? 15 : (numa.enabled() ? 14 : 8))
                           : schedule;
     int down_tile = numa.enabled() ? numa.tile_rows
                                    : ((hidden / 8 + threads - 1) / threads) * 8;

@@ -419,7 +419,7 @@ def test_ik_compact_matches_graph_with_cached_routes(
     load_weights(backend)
     generator = torch.Generator().manual_seed(93)
     try:
-        for tokens in (1, 4, 16, 17, 32, 64, 65, 129, 1):
+        for tokens in (1, 4, 16, 17, 32, 64, 65, 128, 129, 1):
             x = torch.randn(tokens, 256, generator=generator).bfloat16()
             ids = torch.stack(
                 [torch.randperm(4, generator=generator)[:3] for _ in range(tokens)]
