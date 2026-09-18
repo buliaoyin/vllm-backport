@@ -110,10 +110,27 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
-            self._mamba_block_size = (
-                self.cache_config.mamba_block_size or self.cache_config.block_size
-            )
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+
+    @property
+    def _mamba_block_size(self) -> int:
+        """The mamba group's block size, resolved on read.
+
+        This must not be cached in `__init__`: at that point
+        `cache_config.mamba_block_size` is still unset and
+        `cache_config.block_size` still holds the attention default, so the
+        value comes out far smaller than the real mamba block size (16 vs 1152
+        on GLM-5.3-Flash). Both only settle once the KV cache groups are built,
+        which is also where `_mamba_spec` -- the authoritative source -- becomes
+        available.
+
+        `add_request` would otherwise seed `state_idx` with an out-of-range
+        block_table column, which the fused align pre-copy reads out of bounds
+        (vllm#53142).
+        """
+        if self._mamba_spec is not None:
+            return self._mamba_spec.block_size
+        return self.cache_config.mamba_block_size or self.cache_config.block_size
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)

@@ -40,9 +40,13 @@ def tokenizer_for(text, special_calls):
 
 
 def parser_for(tokenizer, controls):
+    return parser_for_name("deepseek_v41", tokenizer, controls)
+
+
+def parser_for_name(parser_name, tokenizer, controls):
     cls = ParserManager.get_parser(
-        tool_parser_name="deepseek_v41",
-        reasoning_parser_name="deepseek_v41",
+        tool_parser_name=parser_name,
+        reasoning_parser_name=parser_name,
         enable_auto_tools=True,
     )
     return cls(tokenizer, chat_template_kwargs=controls)
@@ -144,3 +148,200 @@ def test_python_argument_conversion_and_partial_values():
         "bad": "[broken",
         "text": "  a<b",
     }
+
+
+# The checkpoint drops the space that separates V4.1 tags from the V4 ones, and
+# at long context emits the unspaced V4 wrapper outright. deepseek_v41_config
+# rebuilds ``terminals`` wholesale, so it has to restate the variant tuples that
+# deepseek_v4_config declares; otherwise a non-canonical spelling has no
+# transition at all and the whole block leaks into content with no tool call.
+def _spaced_block(wrapper):
+    return (
+        f"\n\n{wrapper}\n"
+        '<｜DSML｜ invoke name="get_weather">\n'
+        '<｜DSML｜ parameter name="city" string="true">杭州'
+        "</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+
+
+# A block that fell back to the V4 family is unspaced throughout: tolerating
+# only its opener would strand the parser in TOOL_PREAMBLE.
+V4_FAMILY_CALLS = (
+    '\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="get_weather">\n'
+    '<｜DSML｜parameter name="city" string="true">杭州</｜DSML｜parameter>\n'
+    "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+)
+
+TOLERATED_BLOCKS = [
+    pytest.param(_spaced_block("<｜DSML｜ calls>"), id="canonical-spaced"),
+    pytest.param(_spaced_block("<｜DSML｜calls>"), id="wrapper-space-dropped"),
+    pytest.param(_spaced_block("<｜DSML｜ call>"), id="wrapper-truncated"),
+    pytest.param(V4_FAMILY_CALLS, id="unspaced-v4-family"),
+]
+
+
+@pytest.mark.parametrize("block", TOLERATED_BLOCKS)
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+def test_streaming_recovers_every_tolerated_wrapper_spelling(block, chunk_size):
+    text = "Checking." + block
+    tokenizer, tokens = tokenizer_for(text, False)
+    parser = parser_for(tokenizer, {"thinking": False})
+    output = collect_output(
+        replay_streaming(
+            parser,
+            tokens,
+            chunk_size=chunk_size,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+            prompt_token_ids=[51],
+        )
+    )
+    assert [call["name"] for call in output.tool_calls] == ["get_weather"]
+    assert json.loads(output.tool_calls[0]["arguments"]) == {"city": "杭州"}
+    assert output.content.strip() == "Checking."
+    assert "DSML" not in output.content
+
+
+@pytest.mark.parametrize("block", TOLERATED_BLOCKS)
+def test_non_streaming_recovers_every_tolerated_wrapper_spelling(block):
+    text = "Checking." + block
+    tokenizer, tokens = tokenizer_for(text, False)
+    parser = parser_for(tokenizer, {"thinking": False})
+    reasoning, content, calls = parser.parse(
+        text,
+        _test_request(tools=DUMMY_TOOLS),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    assert [call.name for call in calls] == ["get_weather"]
+    assert json.loads(calls[0].arguments) == {"city": "杭州"}
+    assert (content or "").strip() == "Checking."
+    assert "DSML" not in (content or "")
+
+
+def test_variants_never_displace_the_canonical_spelling():
+    """The first declared spelling is the one the format reports.
+
+    ``terminal_literal`` backs the renderer, structural-tag grammars and any
+    stop string handed to the sampler, so a tolerated misspelling must never
+    become the spelling vLLM itself emits.
+    """
+    config = deepseek_v41_config()
+    assert config.terminal_literal("TOOL_START") == "<｜DSML｜ calls>"
+    assert config.terminal_literal("TOOL_END") == "</｜DSML｜ calls>"
+    assert config.terminal_literal("INVOKE_PREFIX") == '<｜DSML｜ invoke name="'
+
+
+def test_token_id_terminals_stay_single_canonical_strings():
+    """Token-id matching has no variant form.
+
+    ``token_id_terminals`` is typed ``dict[str, str]``: a special token is
+    either in the vocab or it is not, so widening the text terminals must not
+    leak tuples into it.
+    """
+    config = deepseek_v41_config()
+    assert all(isinstance(v, str) for v in config.token_id_terminals.values())
+    assert config.token_id_terminals["TOOL_START"] == "<｜DSML｜ calls>"
+    assert config.token_id_terminals["TOOL_END"] == "</｜DSML｜ calls>"
+
+
+def test_v4_misspelling_tolerance_is_not_regressed_by_v41_overrides():
+    """The V4 parser keeps its own #56141 variants independently."""
+    from vllm.parser.deepseek_v4 import deepseek_v4_config
+
+    v4 = deepseek_v4_config().terminals["TOOL_START"]
+    assert isinstance(v4, tuple)
+    assert "<｜DSML｜tool_calls>" in v4
+    assert "<｜DSML｜toolcalls>" in v4
+    assert "<｜DSML｜tool>" in v4
+
+
+# Prose that merely talks about the markup. The tolerated spellings enter the
+# ordinary TOOL_START transition rather than the validated orphan-recovery
+# path, so quoting one must never be enough to synthesise a tool call.
+PROSE_FIXTURES = [
+    pytest.param(
+        "Wrap the call in <｜DSML｜tool_calls> and close it again.",
+        id="mentions-v4-wrapper",
+    ),
+    pytest.param(
+        "The V4.1 spelling is <｜DSML｜ calls>, not <｜DSML｜tool_calls>.",
+        id="mentions-both-spellings",
+    ),
+    pytest.param(
+        "Never emit <｜DSML｜tool> or <｜DSML｜toolcalls> as literal text.",
+        id="mentions-misspellings",
+    ),
+    pytest.param(
+        'An example is <｜DSML｜ invoke name="get_weather"> in prose.',
+        id="mentions-orphan-invoke",
+    ),
+]
+
+
+def _stream_prose(parser_name, prose):
+    tokenizer, tokens = tokenizer_for(prose, False)
+    parser = parser_for_name(parser_name, tokenizer, {"thinking": False})
+    return collect_output(
+        replay_streaming(
+            parser,
+            tokens,
+            chunk_size=1,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+            prompt_token_ids=[51],
+        )
+    )
+
+
+@pytest.mark.parametrize("prose", PROSE_FIXTURES)
+def test_tolerated_variants_do_not_fabricate_calls_from_prose(prose):
+    """Widening TOOL_START must not turn quoted markup into a tool call.
+
+    An opener with no matching close is swallowed rather than emitted, which is
+    long-standing V4 behaviour and the reason the strict-admission gate exists;
+    it is not what this asserts. What must hold is that an unclosed mention
+    never yields a call, and that V4.1 does not diverge from the parser whose
+    variants it now shares.
+    """
+    outputs = {
+        name: _stream_prose(name, prose) for name in ("deepseek_v41", "deepseek_v4")
+    }
+    for name, output in outputs.items():
+        assert output.tool_calls == [], f"{name}: fabricated {output.tool_calls}"
+    v41, v4 = outputs["deepseek_v41"], outputs["deepseek_v4"]
+    assert bool(v41.content.strip()) == bool(v4.content.strip()), (
+        "V4.1 and V4 disagree on whether the mention survives: "
+        f"{v41.content!r} vs {v4.content!r}"
+    )
+
+
+# A closed block naming a tool the request never declared is committed by both
+# parsers: only the orphan-invoke recovery carries ``validate_tool_name``, so a
+# properly wrapped block is trusted. That is pre-existing upstream behaviour and
+# not this change's to fix -- but widening the wrapper spellings must not make
+# V4.1 answer differently from V4 on the same shape.
+UNDECLARED_BLOCK = {
+    "deepseek_v4": (
+        "Example:\n<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="delete_everything">\n'
+        '<｜DSML｜parameter name="path" string="true">/</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ),
+    "deepseek_v41": (
+        "Example:\n<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="delete_everything">\n'
+        '<｜DSML｜ parameter name="path" string="true">/</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    ),
+}
+
+
+def test_wrapped_block_handling_matches_v4():
+    results = {
+        name: [c["name"] for c in _stream_prose(name, block).tool_calls]
+        for name, block in UNDECLARED_BLOCK.items()
+    }
+    assert results["deepseek_v41"] == results["deepseek_v4"], results

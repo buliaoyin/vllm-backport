@@ -299,7 +299,8 @@ def test_moe_align_block_size_with_expert_map(
     )
 
 
-def test_moe_align_block_size_deterministic():
+def test_moe_align_block_size_deterministic(monkeypatch):
+    monkeypatch.setenv("VLLM_DETERMINISTIC_MOE_ALIGN", "1")
     m, topk, num_experts, block_size = 128, 2, 32, 64
 
     torch.manual_seed(42)

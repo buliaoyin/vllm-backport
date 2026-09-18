@@ -3362,7 +3362,7 @@ def prefill_query_block_size(num_heads: int, head_dim: int) -> int:
     # forced env value is honored verbatim -- whoever sets it owns the trade.
     if envs.VLLM_SPARSE_DENSE_QUERY_BLOCK == -1:
         smem_limit = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
+            torch.accelerator.current_device_index()
         ).shared_memory_per_block_optin
         if smem_limit < 160 * 1024:
             return 0
@@ -3401,7 +3401,7 @@ def decode_block_tile(
     # fits A100's 163 KB but not sm86/sm89's ~99 KB. Decline rather than let
     # a forced env value hit Triton's OutOfResources at launch.
     smem_limit = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
+        torch.accelerator.current_device_index()
     ).shared_memory_per_block_optin
     if block_m * 17920 > smem_limit:
         return 0
@@ -3608,6 +3608,11 @@ def _decode_partial_iters(
     return main_iters + extra_iters
 
 
+# Split-K decode partial kernel warps. 8 on CUDA: A100 TP4 DSv4 single-stream
+# decode measures ~7% more steps/s than 4 (16 is worse). ROCm keeps the tuned 4.
+_DECODE_PARTIAL_NUM_WARPS = 8 if current_platform.is_cuda() else 4
+
+
 def _decode_num_splits(
     num_queries: int,
     heads_blocks: int,
@@ -3809,6 +3814,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         assert out.dtype == torch.bfloat16, (
             f"expected out dtype {torch.bfloat16}, got {out.dtype}"
         )
+    assert out.stride(-1) == 1, "out must have a contiguous last dimension"
     heads_blocks = triton.cdiv(num_heads, block_h)
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
@@ -3867,6 +3873,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
             avg_extra_len,
             block_k,
         )
+    elif envs.VLLM_DSV4_FIXED_DECODE_SPLITS > 0:
+        num_splits = min(envs.VLLM_DSV4_FIXED_DECODE_SPLITS, 16)
     else:
         # Average per-query segment lengths, read sync-free from the ragged
         # index sizes, let the split heuristic avoid over-splitting.
@@ -3978,7 +3986,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_K=block_k,
             NUM_SPLITS=num_splits,
             NUM_STAGES=1,
-            num_warps=4,
+            num_warps=_DECODE_PARTIAL_NUM_WARPS,
         )
 
     _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](

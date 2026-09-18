@@ -782,53 +782,6 @@ def test_sparse_attn_decode_scrubs_untrusted_cache_by_default() -> None:
     assert torch.equal(actual, torch.zeros_like(actual))
 
 
-@pytest.mark.parametrize("on_gfx950", [False, True])
-@torch.inference_mode()
-def test_rocm_ragged_graph_buffer_view_tracks_source_width(
-    monkeypatch, on_gfx950: bool
-) -> None:
-    from vllm.models.deepseek_v4.amd import rocm as rocm_mod
-
-    monkeypatch.setattr(rocm_mod, "_ON_GFX950", on_gfx950)
-
-    indices_buffer = torch.full((16,), -1, dtype=torch.int32)
-    indptr_buffer = torch.full((3,), -1, dtype=torch.int32)
-    first_indices = torch.tensor([3, 5, 7], dtype=torch.int32)
-    first_indptr = torch.tensor([0, 1, 3], dtype=torch.int32)
-    first_view, first_indptr_view = rocm_mod._copy_ragged_to_graph_buffers(
-        first_indices,
-        first_indptr,
-        indices_buffer,
-        indptr_buffer,
-        num_rows=2,
-        max_entries_per_row=8,
-    )
-
-    second_indices = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32)
-    second_indptr = torch.tensor([0, 2, 6], dtype=torch.int32)
-    second_view, second_indptr_view = rocm_mod._copy_ragged_to_graph_buffers(
-        second_indices,
-        second_indptr,
-        indices_buffer,
-        indptr_buffer,
-        num_rows=2,
-        max_entries_per_row=8,
-    )
-
-    expected_first_entries = (
-        first_indices.numel() if on_gfx950 else indices_buffer.numel()
-    )
-    expected_second_entries = (
-        second_indices.numel() if on_gfx950 else indices_buffer.numel()
-    )
-    assert first_view.numel() == expected_first_entries
-    assert second_view.numel() == expected_second_entries
-    assert first_view.data_ptr() == second_view.data_ptr() == indices_buffer.data_ptr()
-    assert first_indptr_view.data_ptr() == second_indptr_view.data_ptr()
-    assert torch.equal(second_view[: second_indices.numel()], second_indices)
-    assert torch.equal(second_indptr_view, second_indptr)
-
-
 def test_rocm_capture_metadata_sets_adaptive_marker(monkeypatch) -> None:
     from vllm.models.deepseek_v4.amd import rocm as rocm_mod
     from vllm.models.deepseek_v4.sparse_mla import (
@@ -1720,7 +1673,7 @@ def test_build_ragged_into_caller_buffers_matches_allocating_form(num_rows) -> N
 
 @torch.inference_mode()
 def test_build_ragged_into_graph_buffers_returns_stable_views() -> None:
-    """The metadata builder helper must hand back views of the graph buffers."""
+    """Changing source width must preserve graph addresses and buffer capacity."""
     from vllm.models.deepseek_v4.amd.rocm import _build_ragged_into_graph_buffers
 
     device = torch.device("cuda")
@@ -1731,18 +1684,21 @@ def test_build_ragged_into_graph_buffers_returns_stable_views() -> None:
 
     indices_buf = torch.empty(num_rows * width, dtype=torch.int32, device=device)
     indptr_buf = torch.empty(num_rows + 1, dtype=torch.int32, device=device)
-    ragged, indptr = _build_ragged_into_graph_buffers(
-        dense, lengths, indices_buf, indptr_buf, num_rows, width
-    )
+    for source_width in (width, width // 2):
+        source = dense[:, :source_width]
+        ragged, indptr = _build_ragged_into_graph_buffers(
+            source, lengths, indices_buf, indptr_buf, num_rows, width
+        )
 
-    assert ragged.data_ptr() == indices_buf.data_ptr()
-    assert indptr.data_ptr() == indptr_buf.data_ptr()
-    assert indptr.shape == (num_rows + 1,)
-    expected_lens = lengths.clamp(min=0, max=width)
-    assert torch.equal(indptr[1:] - indptr[:-1], expected_lens)
-    for row in range(num_rows):
-        start, end = int(indptr[row]), int(indptr[row + 1])
-        assert torch.equal(ragged[start:end], dense[row, : end - start])
+        assert ragged.data_ptr() == indices_buf.data_ptr()
+        assert indptr.data_ptr() == indptr_buf.data_ptr()
+        assert ragged.numel() == num_rows * width
+        assert indptr.shape == (num_rows + 1,)
+        expected_lens = lengths.clamp(min=0, max=source_width)
+        assert torch.equal(indptr[1:] - indptr[:-1], expected_lens)
+        for row in range(num_rows):
+            start, end = int(indptr[row]), int(indptr[row + 1])
+            assert torch.equal(ragged[start:end], source[row, : end - start])
 
 
 @torch.inference_mode()

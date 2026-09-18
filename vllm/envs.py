@@ -309,7 +309,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
-    VLLM_DETERMINISTIC_MOE_ALIGN: bool = True
+    VLLM_DETERMINISTIC_MOE_ALIGN: bool = False
     VLLM_DISABLE_MULTI_STREAM_PARALLEL: bool = False
     VLLM_MHC_POST_FUSE_SQRSUM: bool = False
     VLLM_MHC_PRENORM_SHARD: bool = False
@@ -318,7 +318,7 @@ if TYPE_CHECKING:
     VLLM_INDEXER_QUERY_SHARD_QPATH: bool = False
     VLLM_SPARSE_PREFILL_EXACT_TILE: bool = False
     VLLM_SPARSE_RAGGED_FAST_SCAN: bool = False
-    VLLM_DSV4_FIXED_DECODE_SPLITS: int = 16
+    VLLM_DSV4_FIXED_DECODE_SPLITS: int = 0
     VLLM_DSV4_LOGITS_ROW_CHUNK: int = 128
     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
     VLLM_TOKEN_BUCKET_PAD: bool = True
@@ -2211,15 +2211,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION", "0"))
     ),
     # Deterministic moe_align_block_size (stable sort instead of FCFS atomics).
-    # The Marlin MoE GEMM is permutation-sensitive at the ulp level, so the
-    # atomic ordering makes temp=0 outputs non-reproducible (#50576). Set to 0
-    # to restore the historical CUDA kernel path. Cost note from the sm80
-    # branch (8xA100 TP8): the stable sort adds ~15 ms cold TTFT@8K and
-    # ~0.6 ms/token ITL there; we keep it ON because batch>1 corruption
-    # (#50576) traces back to batch-composition-dependent numerics and this
-    # is one of the pinned sources. Set 0 to trade determinism for latency.
+    # The CUDA kernel orders tokens within an expert by atomic claim order, so
+    # the Marlin MoE GEMM's row partition, and hence ulp-level rounding, can
+    # vary run to run at temp=0. The replacement launches ~57 kernels per MoE
+    # layer instead of 1 (~75 us/layer under CUDA graphs; ~20% of DSv4 decode
+    # on A100) and does not make outputs reproducible on its own, since other
+    # batch- and schedule-dependent kernels remain. Set 1 to opt in.
     "VLLM_DETERMINISTIC_MOE_ALIGN": lambda: bool(
-        int(os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "1"))
+        int(os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "0"))
     ),
     # Debug kill-switch: force execute_in_parallel/maybe_execute_in_parallel
     # to run serially on the default stream (no aux-stream overlap).
@@ -2291,18 +2290,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FUSED_MARKOV": lambda: (
         os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "1"
     ),
-    # Fix the DSv4 sparse-decode flash-decode split count to this value instead
-    # of the batch-adaptive heuristic. The heuristic picks splits from the
-    # total query count and batch-average KV lengths, so a request's reduction
-    # order (and hence bf16 rounding) depends on what else is in the batch;
-    # pinning the split count makes decode attention batch-invariant. Default
-    # 16 = index_topk(512) / BLOCK_K(32): every ragged row is bounded by
-    # index_topk, so 16 is the largest split count that still lowers the
-    # per-program iteration count -- best single-stream occupancy at equal
-    # invariance (measured perf-neutral at c8 on A6000 TP4). Set 0 to restore
-    # the adaptive heuristic.
+    # Fix the DSv4 split-K sparse-decode split count (capped at 16) instead of
+    # the batch-adaptive heuristic, which picks splits from the query count and
+    # batch-average KV lengths so a request's reduction order can depend on the
+    # rest of the batch. 0 (default) keeps the heuristic. Not applied on gfx950,
+    # which has its own split tuning.
     "VLLM_DSV4_FIXED_DECODE_SPLITS": lambda: int(
-        os.environ.get("VLLM_DSV4_FIXED_DECODE_SPLITS", "16")
+        os.environ.get("VLLM_DSV4_FIXED_DECODE_SPLITS", "0")
     ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient

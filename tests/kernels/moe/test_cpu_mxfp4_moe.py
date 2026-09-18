@@ -745,7 +745,10 @@ def test_gpu_cache_preserves_mixed_routes_across_prefill_and_graph_replay(
     ):
         pytest.skip("A CUDA bridge and the requested cache GPU are required")
     from vllm.forward_context import ForwardContext, override_forward_context
-    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+        SharedExperts,
+        SharedExpertsOrder,
+    )
     from vllm.models.deepseek_v4_1.cpu_moe import CPUExpertModule
     from vllm.utils.torch_utils import current_stream
 
@@ -833,8 +836,9 @@ def test_gpu_cache_preserves_mixed_routes_across_prefill_and_graph_replay(
     def forward():
         result = module(hidden, ids, routes)
         assert current_stream() == torch.cuda.current_stream(origin_device)
-        assert shared.maybe_forward_async(result)
-        shared.wait()
+        assert not shared.maybe_forward_async(result)
+        shared.maybe_sync_shared_experts_stream(result)
+        shared(result, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED)
         return result, shared.output
 
     try:

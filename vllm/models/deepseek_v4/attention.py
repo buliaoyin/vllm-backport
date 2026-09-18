@@ -903,7 +903,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_fns[2] = indexer_compressor_kv_score
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
-            lambda: self._fused_wqa_wkv_gemm(hidden_states),
+            lambda: self._fused_wqa_wkv_gemm(gemm_in),
             aux_fns,
             self.ln_events[0],
             self.ln_events[1:4],

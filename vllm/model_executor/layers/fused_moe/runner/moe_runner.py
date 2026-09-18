@@ -645,6 +645,10 @@ class MoERunner(MoERunnerInterface):
         if shared_experts_overlapping:
             assert self._shared_experts is not None
             self._shared_experts.wait()
+        else:
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            )
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
@@ -890,13 +894,18 @@ class MoERunner(MoERunnerInterface):
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
 
-        # If using multi-stream overlap for shared experts, we must launch it
-        # before routed expert dispatch.
+        # Multi-stream shared-expert overlap: ROCm launches the shared experts
+        # here, before routed dispatch; CUDA marks the aux stream's start point
+        # here and runs them after the routed experts are enqueued.
         shared_experts_overlapping = False
         if self._shared_experts is not None:
             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
                 shared_experts_input
             )
+            if not shared_experts_overlapping:
+                self._shared_experts.maybe_sync_shared_experts_stream(
+                    shared_experts_input
+                )
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the

@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsConfig,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    find_matched_target,
     should_ignore_layer,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -164,6 +165,31 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
         raise NotImplementedError
 
 
+def _compressed_tensors_quantizes_ple(
+    quant_config: CompressedTensorsConfig, prefix: str
+) -> bool:
+    """Whether a compressed-tensors config group explicitly targets the PLE table.
+
+    compressed-tensors exports (e.g. the AWQ W4A16 checkpoints) quantize
+    ``Linear``/``RoutedExperts`` targets only, so the embedding table stays in
+    the checkpoint dtype whether or not ``ignore`` lists it.
+    """
+    ignore = quant_config.ignore
+    fused_mapping = quant_config.packed_modules_mapping
+    if should_ignore_layer(
+        prefix, ignore=ignore, fused_mapping=fused_mapping
+    ) or should_ignore_layer(
+        f"{prefix}.shard_0", ignore=ignore, fused_mapping=fused_mapping
+    ):
+        return False
+    targets = list(quant_config.target_scheme_map)
+    module = nn.Embedding(1, 1)
+    return any(
+        find_matched_target(name, module, targets, fused_mapping) is not None
+        for name in (prefix, f"{prefix}.shard_0")
+    )
+
+
 class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
     """Quantization interface shared by resident and pinned PLE tables."""
 
@@ -190,23 +216,13 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         ) and quant_config.is_layer_excluded(prefix):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if isinstance(quant_config, CompressedTensorsConfig):
-            # compressed-tensors exports (e.g. the AWQ W4A16 checkpoints) only
-            # quantize Linear targets and list the PLE table under `ignore`,
-            # so its shards stay in the checkpoint dtype.
-            if should_ignore_layer(
-                prefix,
-                ignore=quant_config.ignore,
-                fused_mapping=quant_config.packed_modules_mapping,
-            ) or should_ignore_layer(
-                f"{prefix}.shard_0",
-                ignore=quant_config.ignore,
-                fused_mapping=quant_config.packed_modules_mapping,
-            ):
-                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
-            raise NotImplementedError(
-                "Qwen4Exp PLE embedding requires compressed-tensors checkpoints "
-                f"to leave {prefix} unquantized (add it to `ignore`)."
-            )
+            if _compressed_tensors_quantizes_ple(quant_config, prefix):
+                raise NotImplementedError(
+                    "Qwen4Exp PLE embedding does not support compressed-tensors "
+                    f"quantization of {prefix}; leave it unquantized (add it "
+                    "to `ignore`)."
+                )
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
             raise NotImplementedError(
                 "Qwen4Exp PLE embedding does not support quantization config "
@@ -378,6 +394,9 @@ class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
         )
 
 
+_FP8_STORAGE_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
 @triton.jit
 def _lookup_ple_embedding_from_pinned_kernel(
     weight_ptr,
@@ -491,10 +510,19 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            # The lookup is a pure row gather, so fp8 tables move as raw bytes:
+            # Triton cannot even take an fp8e4nv pointer on pre-SM89 (it rejects
+            # the dtype at compile time), and e4m3 is one byte per element, so
+            # the uint8 view keeps the row width and copies bit-exactly.
+            weight = self._uva_weight
+            out_view = output
+            if weight.dtype in _FP8_STORAGE_DTYPES:
+                weight = weight.view(torch.uint8)
+                out_view = out_view.view(torch.uint8)
             _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self._uva_weight,
+                weight,
                 flat_ids,
-                output,
+                out_view,
                 self.embedding_dim,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
