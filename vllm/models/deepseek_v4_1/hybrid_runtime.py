@@ -19,7 +19,7 @@ from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4_numa import physical
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
 from .host_memory import check_host_headroom
-from .hybrid import GiB, hybrid_settings, plan_expert_cache
+from .hybrid import GiB, hybrid_settings, plan_engram_cache, plan_expert_cache
 
 logger = init_logger(__name__)
 
@@ -50,9 +50,23 @@ class HybridExecutorResources:
         hf = config.model_config.hf_config
         expert_bytes = 3 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
         resident = (hf.num_hidden_layers - 20) * hf.n_routed_experts * expert_bytes
-        resident += sum(hf.engram_num_embeddings) * (
+        engram_bytes = sum(hf.engram_num_embeddings) * (
             hf.engram_head_dim + hf.engram_head_dim // 32
         )
+        if settings.get("engram_storage", "ram") == "ram":
+            resident += engram_bytes
+        else:
+            resident += sum(
+                plan_engram_cache(
+                    settings, hf.engram_num_embeddings, hf.engram_head_dim
+                )
+            )
+            if settings.get("engram_cache_gib", 1) > engram_bytes / GiB:
+                logger.info(
+                    "Engram SSD cache request exceeds table size; "
+                    "limiting total host row cache to %.3f GiB",
+                    engram_bytes / GiB,
+                )
         check_host_headroom(
             resident + int(settings.get("host_cache_gib", 12) * GiB) + 16 * GiB
         )

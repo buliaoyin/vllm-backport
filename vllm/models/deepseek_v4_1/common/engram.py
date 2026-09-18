@@ -724,13 +724,20 @@ class ParallelEngramEmbedding(nn.Module):
         head_sizes: tuple[int, ...],
         block_size: int = 32,
         cpu_offload: bool = False,
+        storage: str = "ram",
+        max_tokens: int = 2048,
+        cache_bytes: int = 0,
     ):
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
-        if cpu_offload and not is_uva_available():
+        if storage not in ("ram", "ssd"):
+            raise ValueError("Engram storage must be 'ram' or 'ssd'")
+        if storage == "ssd" and tp_size != 1:
+            raise ValueError("Engram SSD currently requires TP1")
+        if cpu_offload and storage == "ram" and not is_uva_available():
             raise RuntimeError("Engram CPU offload requires UVA support")
         self.num_embeddings = num_embeddings
         self.dim = dim
@@ -744,6 +751,7 @@ class ParallelEngramEmbedding(nn.Module):
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         self.tp_size = tp_size
         self.cpu_offload = cpu_offload
+        self.ssd = None
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
         self._num_sms = torch.cuda.get_device_properties(
@@ -756,7 +764,21 @@ class ParallelEngramEmbedding(nn.Module):
         deferred = (
             cpu_offload and self.part_num_embeddings * dim >= _ENGRAM_LOAD_CHUNK_BYTES
         )
-        if deferred:
+        if storage == "ssd":
+            from .engram_ssd import EngramSSD
+
+            self.ssd = EngramSSD(
+                dim,
+                block_size,
+                self.part_n_hash_cols,
+                max_tokens,
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+                cache_bytes,
+            )
+            # Retain checkpoint names and shapes without allocating table storage.
+            self._allocate_embedding_parameters(dim, block_size, {"device": "meta"})
+        elif deferred:
             from vllm.models.deepseek_v4_1.host_memory import empty_registered
 
             weight, weight_owner = empty_registered(
@@ -777,11 +799,13 @@ class ParallelEngramEmbedding(nn.Module):
             set_weight_attrs(
                 param,
                 {
-                    "weight_loader": _engram_head_shard_weight_loader,
+                    "weight_loader": (
+                        self.ssd.load if self.ssd else _engram_head_shard_weight_loader
+                    ),
                     "engram_vocab_start": self.vocab_start_idx,
                 },
             )
-        if cpu_offload:
+        if cpu_offload and self.ssd is None:
             logger.info(
                 "Engram host table: %d rows x %d, %.2f GiB per rank; deferred=%s",
                 self.part_num_embeddings,
@@ -834,6 +858,10 @@ class ParallelEngramEmbedding(nn.Module):
         """
         rows = indices.shape[0] * self.part_n_hash_cols
         if not rows:
+            return
+        ssd = getattr(self, "ssd", None)
+        if ssd is not None:
+            ssd.lookup(indices, out, background=background)
             return
         weight, scales = self._storage()
         # The table dwarfs TLB reach, so a persistent grid near the SM count
@@ -1018,12 +1046,21 @@ class Engram(nn.Module):
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
         # suffix rule.
-        engram_config = get_current_vllm_config().engram_config
+        from ..hybrid import hybrid_settings, plan_engram_cache
+
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
+        settings = hybrid_settings(vllm_config) or {}
         self.embed_tokens = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=engram_config.cpu_offload if engram_config else True,
+            storage=settings.get("engram_storage", "ram"),
+            max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+            cache_bytes=plan_engram_cache(
+                settings, layout.num_embeddings, layout.head_dim
+            )[layer_hash_index],
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
@@ -1053,11 +1090,18 @@ class Engram(nn.Module):
         )
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        """Gather this layer's rows on the main stream before decoder layers."""
-        self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
+        """Prepare rows early; SSD reads overlap the preceding local layers."""
+        self.embed_tokens.lookup(
+            hash_ids,
+            self.staged_rows[: hash_ids.shape[0]],
+            background=getattr(self.embed_tokens, "ssd", None) is not None,
+        )
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
         """Gather heads, returning only local tokens when SP is enabled."""
+        ssd = getattr(self.embed_tokens, "ssd", None)
+        if ssd is not None:
+            ssd.wait()
         rows = self.staged_rows[: hash_ids.shape[0]]
         if self.embed_tokens.tp_size == 1:
             return rows

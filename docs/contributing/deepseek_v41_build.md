@@ -68,6 +68,10 @@ IK 源码目录，版本为 `3bb386eb68ffee0a5dc7db21da0735d594929eeb`。
 这种情况下需改用源码构建，或完成上述增量构建；只改 Python 不能补齐原生算子。
 修改 C++ 后，应重新编译并重启服务。
 
+Engram SSD 的直接 I/O 后端也包含在 `libdsv41_cuda` 中，无需额外安装
+libaio 或 GDS。启用 `engram_storage="ssd"` 前需使用本分支的新库；
+旧库会报告需要重建，不能只更新 Python 文件。
+
 ## CPU NUMA / NPS
 
 IK 专家后端读取 Linux 暴露的节点、插槽和物理核拓扑，自动适配单／双路的

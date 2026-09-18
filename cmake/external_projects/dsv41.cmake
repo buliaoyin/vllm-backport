@@ -69,7 +69,8 @@ function(vllm_add_dsv41_backends)
       $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-O3>)
   endforeach()
 
-  add_library(libdsv41_cuda SHARED "${wrapper_dir}/cuda_host_moe.cpp")
+  add_library(libdsv41_cuda SHARED "${wrapper_dir}/cuda_host_moe.cpp"
+    "${wrapper_dir}/engram_ssd.cpp")
   target_link_libraries(libdsv41_cuda PRIVATE CUDA::cudart)
   set_target_properties(libdsv41_cuda PROPERTIES
     INSTALL_RPATH "$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/cu13/lib"

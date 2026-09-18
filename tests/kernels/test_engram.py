@@ -487,6 +487,8 @@ def test_v2_model_state_gathers_lookback_window():
     state.rope_state = None
     state.supports_mm_inputs = False
     state.prompt_embeds_state = None
+    state.cpu_async_modules = []
+    state.requires_eager_prefill = False
     state.lookback_token_ids = torch.full(
         (max_num_reqs, depth), -1, dtype=torch.int32, device="cuda"
     )
@@ -503,7 +505,8 @@ def test_v2_model_state_gathers_lookback_window():
     # Batch rows -> request state rows: a request two decode steps in, a fresh
     # request, and one at the end of a 5-token prompt.
     input_batch = SimpleNamespace(
-        idx_mapping=torch.tensor([2, 0, 3], dtype=torch.int64, device="cuda")
+        idx_mapping=torch.tensor([2, 0, 3], dtype=torch.int64, device="cuda"),
+        has_prefill=False,
     )
     window = state.prepare_inputs(input_batch, req_states)["lookback_token_ids"]
     assert window.cpu().tolist() == [
@@ -848,3 +851,196 @@ def test_engram_deferred_registration_preserves_uva_across_chunks(
     assert view[-1, -1].item() == 11
     assert view[1, 1].item() == 7
     torch.accelerator.synchronize()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("num_tokens", [1, 4, 128, 2048])
+@pytest.mark.parametrize("capture", ["eager", "full", "breakable", "breakable_full"])
+@pytest.mark.parametrize("cache_bytes", [0, 4096])
+def test_engram_ssd_replay_reads_current_rows(
+    tmp_path, monkeypatch, num_tokens, capture, cache_bytes
+):
+    """Direct I/O preserves bytes, duplicate/invalid IDs and changing graph inputs.
+
+    The table crosses multiple I/O batches, starts inside a disk page and ends
+    in a partial page. No table tensor remains resident after loading.
+    """
+    from safetensors.torch import safe_open, save_file
+
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.config import CUDAGraphMode
+    from vllm.models.deepseek_v4_1.common import engram_ssd as ssd_ops
+
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
+    torch.manual_seed(17)
+    heads = (16381, 16387, 16369, 16402)
+    rows, dim = sum(heads), 256
+    weight = torch.randn(rows, dim).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (rows, dim // 32), dtype=torch.uint8)
+    path = tmp_path / "engram.safetensors"
+    save_file({"weight": weight, "scales": scales}, path)
+    with torch.device("cuda"):
+        layer = ParallelEngramEmbedding(
+            rows,
+            dim,
+            heads,
+            storage="ssd",
+            max_tokens=num_tokens,
+            cache_bytes=cache_bytes,
+        )
+    with safe_open(path, framework="pt") as checkpoint:
+        layer.weight.weight_loader(layer.weight, checkpoint.get_tensor("weight"))
+        layer.weight_scale_inv.weight_loader(
+            layer.weight_scale_inv, checkpoint.get_tensor("scales")
+        )
+    assert layer.weight.is_meta and layer.weight_scale_inv.is_meta
+    engram = Engram.__new__(Engram)
+    torch.nn.Module.__init__(engram)
+    engram.embed_tokens = layer
+    engram.use_sequence_parallel = False
+    engram.staged_rows = torch.empty(
+        num_tokens, len(heads), dim, dtype=torch.bfloat16, device="cuda"
+    )
+    hashes = torch.zeros(num_tokens, 2, len(heads), dtype=torch.int32, device="cuda")
+    ids = hashes[:, 1]
+    out = torch.empty_like(engram.staged_rows)
+
+    def step(cap=None):
+        engram.prepare_embeddings(ids)
+        if cap is not None:
+            cap.add_eager(lambda: None)
+        out.copy_(engram.embed(ids))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.accelerator.synchronize()
+    graph = None
+    if capture == "full":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            step()
+    elif capture in ("breakable", "breakable_full"):
+        if capture == "breakable_full":
+            monkeypatch.setattr(ssd_ops, "is_forward_context_available", lambda: True)
+            monkeypatch.setattr(
+                ssd_ops,
+                "get_forward_context",
+                lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL),
+            )
+        graph = BreakableCUDAGraphCapture()
+        with torch.cuda.stream(stream), graph:
+            step(graph if capture == "breakable" else None)
+    try:
+        for iteration in range(3):
+            current = torch.randint(
+                0, rows, (num_tokens, len(heads)), dtype=torch.int32
+            )
+            current[0] = torch.tensor([-1, rows, 0, rows - 1])
+            if iteration == 2:
+                current.fill_(-1)
+            ids.copy_(current.cuda())
+            expected = _reference_lookup(weight, scales, current, 0, rows)
+            if graph is None:
+                step()
+            else:
+                graph.replay()
+            if cache_bytes and iteration == 1:
+                layer.ssd.clear_cache()
+            else:
+                torch.accelerator.synchronize()
+            layer.ssd.check_errors()
+            torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        stats = layer.ssd.stats()
+        assert stats["read_bytes"] > 0
+        assert stats["weight_pages"] <= stats["valid_rows"] * 2
+        assert stats["scale_pages"] <= stats["valid_rows"] * 2
+    finally:
+        # Captured graphs must be discarded before closing their reader.
+        del graph
+        layer.ssd.close()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_engram_ssd_reports_checkpoint_truncation(tmp_path):
+    """A failed direct read cannot silently become an all-zero embedding."""
+    from safetensors.torch import safe_open, save_file
+
+    from vllm.models.deepseek_v4_1.common.engram_ssd import EngramSSD
+
+    rows = 8192
+    path = tmp_path / "engram.safetensors"
+    save_file(
+        {
+            "weight": torch.zeros(rows, 256, dtype=torch.uint8),
+            "scales": torch.full((rows, 8), 127, dtype=torch.uint8),
+        },
+        path,
+    )
+    reader = EngramSSD(256, 32, 1, 1, 0, rows)
+    with safe_open(path, framework="pt") as checkpoint:
+        for name in ("weight", "scales"):
+            tensor = checkpoint.get_tensor(name)
+            reader.load(torch.empty(tensor.shape, device="meta"), tensor)
+    del tensor
+    path.write_bytes(b"")
+    reader.ids.fill_(0)
+    reader.tasks[1] = reader.library.dsv41_engram_ssd_task(reader.handle, 1)
+    try:
+        rc = reader.library.dsv41_engram_ssd_enqueue(
+            reader.tasks[1], reader.stream.cuda_stream
+        )
+        assert rc == 0
+        reader.stream.synchronize()
+        with pytest.raises(RuntimeError, match="truncated"):
+            reader.check_errors()
+        assert reader.status.item() == 1
+    finally:
+        reader.close()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_engram_ssd_cache_preserves_bytes_on_hits_and_eviction(tmp_path):
+    """Repeated rows avoid I/O, while misses/evictions still return exact bytes."""
+    from safetensors.torch import safe_open, save_file
+
+    from vllm.models.deepseek_v4_1.common.engram_ssd import EngramSSD
+
+    rows = 128
+    torch.manual_seed(42)
+    weight = torch.randn(rows, 256).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 133, (rows, 8), dtype=torch.uint8)
+    blob = tmp_path / "checkpoint-blob"
+    path = tmp_path / "engram.safetensors"
+    save_file({"weight": weight, "scales": scales}, blob)
+    path.symlink_to(blob)
+    reader = EngramSSD(256, 32, 1, 64, 0, rows, cache_bytes=2240)
+    with safe_open(path, framework="pt") as checkpoint:
+        for name in ("weight", "scales"):
+            tensor = checkpoint.get_tensor(name)
+            reader.load(torch.empty(tensor.shape, device="meta"), tensor)
+
+    def lookup(ids):
+        indices = torch.tensor(ids, dtype=torch.int32, device="cuda").reshape(-1, 1)
+        out = torch.empty(len(ids), 1, 256, dtype=torch.bfloat16, device="cuda")
+        reader.lookup(indices, out)
+        torch.accelerator.synchronize()
+        expected = _reference_lookup(weight, scales, indices.cpu(), 0, rows)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        return reader.stats()
+
+    try:
+        first = lookup([0, 1, 2, 3])
+        warm = lookup([0, 1, 2, 3])
+        assert warm["read_bytes"] == first["read_bytes"]
+        assert warm["cached_rows"] - first["cached_rows"] == 4
+        full = lookup(list(range(4, 64)))
+        evicted = lookup([0, 1, 2, 3])
+        assert evicted["read_bytes"] > full["read_bytes"]
+        reader.clear_cache()
+        assert lookup([0, 1, 2, 3])["read_bytes"] > evicted["read_bytes"]
+    finally:
+        reader.close()

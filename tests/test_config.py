@@ -3057,3 +3057,95 @@ def test_hybrid_keeps_explicit_concurrency_and_kv_tokens(monkeypatch):
         524288,
         2097152,
     )
+
+
+@pytest.mark.parametrize(
+    "storage,strategy,cache_gib",
+    [
+        ("ssd", "lazy", None),
+        ("ram", None, None),
+        ("ssd", "lazy", 16),
+        ("ssd", "lazy", 1e300),
+    ],
+)
+def test_dsv41_engram_storage_keeps_lazy_ssd_loading(
+    monkeypatch, storage, strategy, cache_gib
+):
+    """SSD mode must not pull the full table into RAM during checkpoint loading."""
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1 import hybrid
+
+    monkeypatch.setattr(hybrid, "native_libraries", lambda: [Path("ik"), Path("cuda")])
+    args = EngineArgs(
+        pipeline_parallel_size=3,
+        additional_config={
+            "deepseek_v41_hybrid": {
+                "pipeline_layers": [7, 8, 25],
+                "engram_storage": storage,
+            }
+        },
+    )
+    if cache_gib is not None:
+        args.additional_config["deepseek_v41_hybrid"]["engram_cache_gib"] = cache_gib
+    hybrid.apply_hybrid_defaults(args)
+    assert args.safetensors_load_strategy == strategy
+
+
+@pytest.mark.parametrize(
+    "cache_gib", [-1, True, "16", None, float("nan"), float("inf")]
+)
+def test_dsv41_engram_cache_rejects_invalid_budget(cache_gib):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1.hybrid import apply_hybrid_defaults
+
+    args = EngineArgs(
+        additional_config={
+            "deepseek_v41_hybrid": {
+                "engram_storage": "ssd",
+                "engram_cache_gib": cache_gib,
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="finite non-negative"):
+        apply_hybrid_defaults(args)
+
+
+@pytest.mark.parametrize(
+    "cache_gib,expected_gib",
+    [
+        (None, (0.5, 0.5)),
+        (0, (0, 0)),
+        (6, (3.9375, 2.0625)),
+        (16, (8.25, 2.0625)),
+        (1e300, (8.25, 2.0625)),
+    ],
+)
+def test_dsv41_engram_cache_caps_tables_and_redistributes_budget(
+    cache_gib, expected_gib
+):
+    """Oversized requests must not reserve memory beyond the actual table sizes."""
+    from vllm.models.deepseek_v4_1.hybrid import GiB, plan_engram_cache
+
+    settings = {} if cache_gib is None else {"engram_cache_gib": cache_gib}
+    assert plan_engram_cache(settings, (2**28, 2**26), 32) == tuple(
+        int(size * GiB) for size in expected_gib
+    )
+
+
+@pytest.mark.parametrize("strategy", ["eager", "prefetch"])
+def test_dsv41_engram_ssd_rejects_whole_table_loading(strategy):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1.hybrid import apply_hybrid_defaults
+
+    args = EngineArgs(
+        pipeline_parallel_size=3,
+        safetensors_load_strategy=strategy,
+        additional_config={
+            "deepseek_v41_hybrid": {
+                "pipeline_layers": [7, 8, 25],
+                "engram_storage": "ssd",
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="lazy safetensors"):
+        apply_hybrid_defaults(args)

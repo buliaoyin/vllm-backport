@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scoped defaults and memory planning for CPU hybrid serving."""
 
+import math
 from pathlib import Path
 
 from vllm.logger import init_logger
@@ -21,9 +22,33 @@ def apply_hybrid_defaults(args):
         return
     if not isinstance(settings, dict):
         raise ValueError("deepseek_v41_hybrid must be an object")
-    unknown = set(settings) - {"pipeline_layers", "cpu_threads", "host_cache_gib"}
+    unknown = set(settings) - {
+        "pipeline_layers",
+        "cpu_threads",
+        "host_cache_gib",
+        "engram_storage",
+        "engram_cache_gib",
+    }
     if unknown:
         raise ValueError(f"Unknown DeepSeek hybrid options: {sorted(unknown)}")
+    storage = settings.get("engram_storage", "ram")
+    if storage not in ("ram", "ssd"):
+        raise ValueError("engram_storage must be 'ram' or 'ssd'")
+    if storage == "ssd":
+        cache = settings.get("engram_cache_gib", 1)
+        if (
+            type(cache) not in (int, float)
+            or cache < 0
+            or (isinstance(cache, float) and not math.isfinite(cache))
+        ):
+            raise ValueError("engram_cache_gib must be a finite non-negative number")
+        if args.load_format not in ("auto", "safetensors") or (
+            args.safetensors_load_strategy not in (None, "lazy")
+        ):
+            raise ValueError("Engram SSD requires lazy safetensors loading")
+        args.safetensors_load_strategy = "lazy"
+    elif "engram_cache_gib" in settings:
+        raise ValueError("engram_cache_gib requires engram_storage='ssd'")
     layers = settings.get("pipeline_layers")
     if (
         not isinstance(layers, list)
@@ -95,6 +120,19 @@ def apply_hybrid_defaults(args):
         cpu_phase_threads=threads,
     )
     args._dsv41_hybrid_defaults = True
+
+
+def plan_engram_cache(settings, num_embeddings, head_dim):
+    """Split the host cache budget evenly, capped by FP8 table and scale bytes."""
+    sizes = [rows * (head_dim + head_dim // 32) for rows in num_embeddings]
+    total = sum(sizes)
+    requested = settings.get("engram_cache_gib", 1)
+    remaining = total if requested >= total / GiB else int(requested * GiB)
+    result = [0] * len(sizes)
+    for rank, index in enumerate(sorted(range(len(sizes)), key=sizes.__getitem__)):
+        result[index] = min(sizes[index], remaining // (len(sizes) - rank))
+        remaining -= result[index]
+    return tuple(result)
 
 
 def plan_expert_cache(capacities, num_layers=20, bank_size=384, local_device=None):
