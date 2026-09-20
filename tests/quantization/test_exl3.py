@@ -882,10 +882,14 @@ def test_int8_prefill_uses_tensor_device(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("rows", [9, 12, 16, 32, 96, 128])
+@pytest.mark.parametrize(
+    "rows,hidden,intermediate,topk",
+    [(rows, 256, 512, 2) for rows in (9, 12, 16, 32, 96, 128)]
+    + [(32, 4096, 2048, 2), (96, 4096, 2048, 2), (12, 4096, 2048, 3)],
+)
 @pytest.mark.parametrize("residual", [False, True])
 def test_batched_decode_preserves_sparse_hot_experts_and_replay(
-    rows, residual, monkeypatch
+    rows, hidden, intermediate, topk, residual, monkeypatch
 ):
     """Mixed expert paths preserve rotations, sparse routing and scratch reuse."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
@@ -924,13 +928,14 @@ def test_batched_decode_preserves_sparse_hot_experts_and_replay(
     _check_moe_routing(
         rows,
         256,
-        256,
+        hidden,
         monkeypatch,
         relative_limit=0.02,
         dtype=torch.bfloat16,
         m_tile=32,
         decode="residual" if residual else "plain",
-        intermediate_dim=512,
+        intermediate_dim=intermediate,
+        topk=topk,
         num_experts=rows + 1,
         cold_routes=True,
         check_graph=True,

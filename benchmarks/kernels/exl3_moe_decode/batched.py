@@ -60,6 +60,16 @@ def m32_triton_routes(x, weights, ids, ptrs, workspace, locks):
     return result.to(x.dtype)
 
 
+def k32_control(fn):
+    """Capture the same wrapper with the original hot-expert pipeline."""
+    original = torch.ops._exl3_C.moe_m32_decode
+    torch.ops._exl3_C.moe_m32_decode = torch.ops._exl3_C.moe_m32
+    try:
+        return fn()
+    finally:
+        torch.ops._exl3_C.moe_m32_decode = original
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -67,6 +77,8 @@ def main():
     parser.add_argument("--route-sample", type=Path, required=True)
     parser.add_argument("--library", type=Path)
     parser.add_argument("--production", action="store_true")
+    parser.add_argument("--k32-control", action="store_true")
+    parser.add_argument("--uncompacted-control", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--grouped-library", type=Path)
     parser.add_argument("--cold-library", type=Path)
@@ -81,6 +93,8 @@ def main():
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--replays", type=int, default=15)
     args = parser.parse_args()
+    if (args.k32_control or args.uncompacted_control) and not args.production:
+        parser.error("Pipeline controls require --production")
     sample = torch.load(args.route_sample, weights_only=True, map_location="cuda")
     layer, method = load_layer(args.checkpoint, sample["prefix"])
     candidates = {
@@ -202,6 +216,15 @@ def main():
                         10.0,
                         residual,
                     )
+                    if args.k32_control:
+                        calls[name + "_k32"] = partial(k32_control, calls[name])
+                    if args.uncompacted_control and not residual:
+                        control = partial(calls[name], compact=False)
+                        calls[name + "_uncompacted"] = control
+                        if args.k32_control:
+                            calls[name + "_uncompacted_k32"] = partial(
+                                k32_control, control
+                            )
             times = {name: [] for name in calls}
             errors = {}
             for name, fn in calls.items():

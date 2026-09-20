@@ -23,27 +23,45 @@
   #define EXL3_GEMM_H_ACC 0
 #endif
 
-template <EXL3_GEMM_T_ARGS, bool shmem_out_had, bool PREDICATE_ROWS>
+template <EXL3_GEMM_T_ARGS, bool shmem_out_had, bool PREDICATE_ROWS,
+          int FETCH_K_FACTOR = 1>
 inline __device__ void exl3_gemm_nobar_inner(
     const half* __restrict__ A, const uint16_t* __restrict__ B,
     void* __restrict__ C, const int size_m, const int size_k, const int size_n,
     int* __restrict__ locks, const half* post_scale) {
+  static_assert(FETCH_K_FACTOR == 1 || FETCH_K_FACTOR == 2);
+  static_assert(FETCH_K_FACTOR == 1 ||
+                (TILESIZE_K == 32 && SH_STAGES == 3 && FRAG_STAGES == 2 &&
+                 bits == 4 && cb == 2 && !c_fp32 && !shmem_out_had &&
+                 EXL3_GEMM_H_ACC == 0));
+  constexpr int FETCH_K = TILESIZE_K * FETCH_K_FACTOR;
+  if constexpr (FETCH_K_FACTOR == 2) {
+    // Host dispatch must give each CTA complete K columns. A partial K slice
+    // could end between the two K32 steps and change the reduction/rounding.
+    if (size_k % FETCH_K != 0 || size_n % TILESIZE_N != 0 ||
+        (size_n / TILESIZE_N) % gridDim.x != 0) {
+      asm volatile("trap;");
+      return;
+    }
+  }
+
   const int TILEBLOCKS_M = TILESIZE_M / 16;
   const int TILEBLOCKS_K = TILESIZE_K / 16;
   const int TILEBLOCKS_N = TILESIZE_N / 16;
+  const int FETCH_BLOCKS_K = TILEBLOCKS_K * FETCH_K_FACTOR;
   // const int FRAGS_M = TILEBLOCKS_M;
   const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
 
-  const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;  // in half elements
+  const int sh_a_stage_size = TILESIZE_M * FETCH_K;  // in half elements
   const int sh_b_stage_size =
-      TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;  // in uint16s
-  const int sh_c_size = MAX                           // in floats
+      FETCH_BLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;  // in uint16s
+  const int sh_c_size = MAX                             // in floats
       (4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP * TILEBLOCKS_M,
        shmem_out_had ? TILESIZE_N * TILESIZE_M : 0);
 
   // XOR-swizzle constants for bank-conflict-free A fragment loads
   // col_swizzled = col ^ ((row >> SHIFT) & MASK)
-  const int A_COLS = TILESIZE_K / 8;  // int4 columns per row
+  const int A_COLS = FETCH_K / 8;  // int4 columns per row
   const int A_SWIZZLE_MASK = A_COLS - 1;
   const int A_SWIZZLE_SHIFT = (A_COLS <= 2) ? 2 : 1;
 
@@ -72,6 +90,7 @@ inline __device__ void exl3_gemm_nobar_inner(
   // Dimensions
   // int tiles_m = CEIL_DIVIDE(size_m, TILESIZE_M);
   int tiles_k = size_k / TILESIZE_K;
+  const int fetch_tiles_k = size_k / FETCH_K;
   int tiles_n = size_n / TILESIZE_N;
   // int blocks_m = 1;
   // int blocks_k = tiles_k * TILEBLOCKS_K;
@@ -94,13 +113,13 @@ inline __device__ void exl3_gemm_nobar_inner(
   const int slice_m = 0;
 
   // Pipe 0, global A, B tile and shared A, B tile
-  int slice0_k = index_k(slice_beg);
+  int slice0_k = index_k(slice_beg) / FETCH_K_FACTOR;
   int slice0_n = index_n(slice_beg);
-  int slice0_iters = slice_len;
+  int slice0_iters = slice_len / FETCH_K_FACTOR;
 
   int gl_a_stride_m = TILESIZE_M * size_k;
-  const int gl_a_stride_k = TILESIZE_K;
-  const int sh0_a_stride_m = TILESIZE_M * TILESIZE_K;
+  const int gl_a_stride_k = FETCH_K;
+  const int sh0_a_stride_m = TILESIZE_M * FETCH_K;
   const half* gl_a_ptr = A + slice_m * gl_a_stride_m + slice0_k * gl_a_stride_k;
   half* sh0_a_ptr = sh_a + (slice0_iters % SH_STAGES) * sh_a_stage_size;
 
@@ -117,9 +136,9 @@ inline __device__ void exl3_gemm_nobar_inner(
     pred_a_gl[i] = m < size_m;
   }
 
-  int gl_b_stride_k = blocks_n * TILEBLOCKS_K * 256 / 16 * bits;
+  int gl_b_stride_k = blocks_n * FETCH_BLOCKS_K * 256 / 16 * bits;
   const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
-  const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
+  const int sh0_b_stride_k = FETCH_BLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
   const uint16_t* gl_b_ptr =
       B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
   uint16_t* sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
@@ -143,7 +162,7 @@ inline __device__ void exl3_gemm_nobar_inner(
     sh0_a_ptr = sh_a + stage * sh_a_stage_size;
     sh0_b_ptr = sh_b + stage * sh_b_stage_size;
 
-    if (slice0_k >= tiles_k) {
+    if (slice0_k >= fetch_tiles_k) {
       slice0_k = 0;
       slice0_n++;
       gl_a_ptr = A + slice_m * gl_a_stride_m + slice0_k * gl_a_stride_k;
@@ -155,18 +174,22 @@ inline __device__ void exl3_gemm_nobar_inner(
   };
 
   // Pipe 1, shared A, B tile and registers
-  int slice1_k = slice0_k;
+  int slice1_k = index_k(slice_beg);
   int slice1_n = slice0_n;
-  int slice1_iters = slice0_iters;
+  int slice1_iters = slice_len;
 
-  half* sh1_a_ptr = sh_a + (slice1_iters % SH_STAGES) * sh_a_stage_size;
-  uint16_t* sh1_b_ptr = sh_b + (slice1_iters % SH_STAGES) * sh_b_stage_size;
+  half* sh1_a_ptr =
+      sh_a +
+      (CEIL_DIVIDE(slice1_iters, FETCH_K_FACTOR) % SH_STAGES) * sh_a_stage_size;
+  uint16_t* sh1_b_ptr =
+      sh_b +
+      (CEIL_DIVIDE(slice1_iters, FETCH_K_FACTOR) % SH_STAGES) * sh_b_stage_size;
 
   auto advance1 = [&]() {
     slice1_k++;
     slice1_iters--;
 
-    int stage = slice1_iters % SH_STAGES;
+    int stage = CEIL_DIVIDE(slice1_iters, FETCH_K_FACTOR) % SH_STAGES;
     sh1_a_ptr = sh_a + stage * sh_a_stage_size;
     sh1_b_ptr = sh_b + stage * sh_b_stage_size;
 
@@ -177,10 +200,10 @@ inline __device__ void exl3_gemm_nobar_inner(
   };
 
   // Pipe 2
-  int slice2_k = slice0_k;
-  int slice2_k0 = slice0_k;
+  int slice2_k = index_k(slice_beg);
+  int slice2_k0 = slice2_k;
   int slice2_n = slice0_n;
-  int slice2_iters = slice0_iters;
+  int slice2_iters = slice_len;
 
   int gl_c_stride_n = TILESIZE_N;
   int gl_c_stride_m = TILESIZE_M * size_n;
@@ -256,11 +279,12 @@ inline __device__ void exl3_gemm_nobar_inner(
   // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
   auto load_frags = [&](int buf) {
     if (!slice1_iters) return;
+    int fetch_sub_k = sub_k + TILEBLOCKS_K * (slice1_k % FETCH_K_FACTOR);
 
     // A fragments (XOR-swizzled shared memory layout)
     {
       int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
-      int base_c = lane_id / 16 + sub_k * 2;
+      int base_c = lane_id / 16 + fetch_sub_k * 2;
 #pragma unroll
       for (int m = 0; m < TILEBLOCKS_M; ++m) {
         if constexpr (PREDICATE_ROWS) {
@@ -277,8 +301,8 @@ inline __device__ void exl3_gemm_nobar_inner(
     for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2) {
       int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
       const uint32_t* shb =
-          (const uint32_t*)(sh1_b_ptr +
-                            (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
+          (const uint32_t*)(sh1_b_ptr + (fetch_sub_k * TILEBLOCKS_N + sub_n2) *
+                                            256 / 16 * bits);
 
       dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2],
                             frag_b[buf][n2 + 1]);
@@ -556,6 +580,37 @@ inline __device__ void exl3_gemm_nobar_inner(
 #pragma unroll
   for (int i = 0; i < SH_STAGES - 1; ++i) async_load_gl();
   wait_stage();
+
+  if constexpr (FETCH_K_FACTOR == 2) {
+    // One K64 fetch feeds two K32 steps, still on 512 threads. Both halves are
+    // read before wait_stage's CTA barrier retires their shared slot; only the
+    // following iteration can reuse it. Each sub_k accumulates K16 blocks in
+    // the original order, and full-K slices reduce only after the second step.
+    // C is zeroed here and after every reduction. Valid A/B and register
+    // entries are written before use; padding rows cannot affect stored MMA
+    // rows. Tail iterations commit empty groups: the final wait leaves no real
+    // copy pending, so subsequent GEMMs/replays can reuse shared memory
+    // uninitialized.
+    clear_frag_c();
+    load_frags(0);
+    load_frags(1);
+    while (true) {
+      async_load_gl();
+      wait_stage();
+      matmul(0);
+      advance2();
+      load_frags(0);
+      matmul(1);
+      if (slice2_k == tiles_k - 1 || slice2_iters == 1) {
+        reduce();
+        slice2_k0 = slice2_k + 1;
+      }
+      advance2();
+      if (!slice2_iters) break;
+      load_frags(1);
+    }
+    return;
+  }
 
   // Start shared to register pipeline.
   clear_frag_c();

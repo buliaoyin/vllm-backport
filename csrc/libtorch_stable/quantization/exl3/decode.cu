@@ -5,10 +5,12 @@
 #include <torch/headeronly/core/ScalarType.h>
 #include "libtorch_stable/torch_utils.h"
 #include "decode_kernel.cuh"
+#include "decode_compact.cuh"
 
 #include <algorithm>
 #include <mutex>
 #include <set>
+#include <type_traits>
 
 namespace {
 using torch::headeronly::ScalarType;
@@ -62,12 +64,56 @@ void launch(const Tensor& input, const Tensor& trellis, const Tensor& su,
           threshold);
 }
 
-template <bool filtered>
+template <bool fp32, bool small>
+void launch_compact(const Tensor& input, const Tensor& trellis,
+                    const Tensor& su, const Tensor& sv, const Tensor& ids,
+                    const Tensor& output, const Tensor& scratch,
+                    const Tensor& tasks, const Tensor& task_count,
+                    int input_group, int sm_count, cudaStream_t stream) {
+  static std::mutex mutex;
+  static std::set<int> configured;
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const int device = input.get_device_index();
+    if (!configured.count(device)) {
+      check_cuda(cudaFuncSetAttribute(
+          exl3_expert_gemv_compact<fp32, small>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize, 90 * 1024));
+      check_cuda(cudaFuncSetAttribute(
+          exl3_expert_gemv_compact<fp32, small>,
+          cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      configured.insert(device);
+    }
+  }
+  constexpr int per = fp32 || small ? 128 : 256;
+  constexpr int units = fp32 || small ? 16 : 8;
+  constexpr int shared = per * 96 + 1024;
+  const int grid = std::min<int64_t>(ids.numel() * units, 32 * sm_count);
+  const int group_shift = input_group == 8   ? 3
+                          : input_group == 4 ? 2
+                          : input_group == 2 ? 1
+                                             : 0;
+  exl3_expert_gemv_compact<fp32, small><<<grid, 256, shared, stream>>>(
+      static_cast<const half*>(input.data_ptr()),
+      reinterpret_cast<const uint16_t* const*>(trellis.data_ptr()),
+      output.data_ptr(), reinterpret_cast<const half* const*>(su.data_ptr()),
+      reinterpret_cast<const half* const*>(sv.data_ptr()),
+      static_cast<const int64_t*>(ids.data_ptr()),
+      static_cast<int*>(scratch.data_ptr()),
+      static_cast<const int*>(tasks.data_ptr()),
+      static_cast<const int*>(task_count.data_ptr()), group_shift,
+      scratch.size(1));
+}
+
+template <bool filtered, bool compact = false>
 void expert_gemv_impl(const Tensor& input, const Tensor& trellis,
                       const Tensor& su, const Tensor& sv, const Tensor& ids,
                       const Tensor& output, const Tensor& scratch, int64_t rows,
                       int64_t input_group, bool residual,
-                      const Tensor* counts = nullptr, int threshold = 0) {
+                      const Tensor* counts = nullptr, int threshold = 0,
+                      const Tensor* tasks = nullptr,
+                      const Tensor* task_count = nullptr) {
+  static_assert(!compact || filtered);
   STD_TORCH_CHECK(input.is_cuda(), "EXL3 expert decode requires CUDA");
   const auto device = input.get_device_index();
   const torch::stable::accelerator::DeviceGuard guard(device);
@@ -96,7 +142,7 @@ void expert_gemv_impl(const Tensor& input, const Tensor& trellis,
                         t->numel() >= ids.numel() / rows,
                     "EXL3 expert pointer table size mismatch");
   }
-  if constexpr (filtered) {
+  if constexpr (filtered && !compact) {
     STD_TORCH_CHECK(
         sm80 && counts && threshold >= 1 && threshold <= 128,
         "EXL3 filtered expert decode requires SM80 and a valid threshold");
@@ -107,6 +153,22 @@ void expert_gemv_impl(const Tensor& input, const Tensor& trellis,
   const int k = input.size(1), n = output.size(1);
   check_dimension(k);
   check_dimension(n);
+  if constexpr (compact) {
+    const int top_k = ids.numel() / rows;
+    const bool fp32 = output.scalar_type() == ScalarType::Float;
+    STD_TORCH_CHECK(sm80 && !residual && rows >= 9 &&
+                        (top_k & (top_k - 1)) == 0 && tasks && task_count,
+                    "EXL3 compact decode requires plain SM80, 9..128 rows "
+                    "and power-of-two top-k");
+    STD_TORCH_CHECK(fp32 ? (k == 2048 && n == 4096 && input_group == 1)
+                         : (k == 4096 && n == 2048),
+                    "EXL3 compact decode requires GLM projection dimensions");
+    check_tensor(*tasks, device, ScalarType::Int);
+    check_tensor(*task_count, device, ScalarType::Int);
+    STD_TORCH_CHECK(tasks->dim() == 1 && tasks->numel() == ids.numel() &&
+                        task_count->dim() == 1 && task_count->numel() == 1,
+                    "EXL3 compact decode task shape mismatch");
+  }
   const int grid = sm80 ? (rows <= 4               ? 32
                            : filtered && rows > 64 ? 8
                                                    : 16)
@@ -125,6 +187,26 @@ void expert_gemv_impl(const Tensor& input, const Tensor& trellis,
       "EXL3 expert decode scratch is too small");
   const int shared = per * (32 + 64 * (residual ? 2 : 1)) + 1024;
   const auto stream = get_current_cuda_stream(device);
+  if constexpr (compact) {
+    auto dispatch = [&](auto fp32, auto small) {
+      launch_compact<decltype(fp32)::value, decltype(small)::value>(
+          input, trellis, su, sv, ids, output, scratch, *tasks, *task_count,
+          input_group, props->multiProcessorCount, stream);
+    };
+    if (output.scalar_type() == ScalarType::Float) {
+      if (rows <= 64)
+        dispatch(std::true_type{}, std::true_type{});
+      else
+        dispatch(std::true_type{}, std::false_type{});
+    } else {
+      if (rows <= 64)
+        dispatch(std::false_type{}, std::true_type{});
+      else
+        dispatch(std::false_type{}, std::false_type{});
+    }
+    check_cuda(cudaGetLastError());
+    return;
+  }
   if (output.scalar_type() == ScalarType::Float) {
     if (residual)
       launch<true, true, filtered>(input, trellis, su, sv, ids, output, scratch,
@@ -164,6 +246,16 @@ void expert_gemv_cold(const Tensor& input, const Tensor& trellis,
                          input_group, residual, &counts, threshold);
 }
 
+void expert_gemv_compact(const Tensor& input, const Tensor& trellis,
+                         const Tensor& su, const Tensor& sv, const Tensor& ids,
+                         const Tensor& output, const Tensor& scratch,
+                         const Tensor& tasks, const Tensor& task_count,
+                         int64_t rows, int64_t input_group, bool residual) {
+  expert_gemv_impl<true, true>(input, trellis, su, sv, ids, output, scratch,
+                               rows, input_group, residual, nullptr, 0, &tasks,
+                               &task_count);
+}
+
 void expert_combine(const Tensor& input, const Tensor& routing,
                     const Tensor& output) {
   STD_TORCH_CHECK(output.is_cuda(), "EXL3 expert reduction requires CUDA");
@@ -201,10 +293,16 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
       "expert_gemv_cold(Tensor input, Tensor trellis, Tensor su, Tensor sv, "
       "Tensor ids, Tensor! output, Tensor! scratch, Tensor counts, int rows, "
       "int input_group, int threshold, bool residual=False) -> ()");
+  m.def(
+      "expert_gemv_compact(Tensor input, Tensor trellis, Tensor su, Tensor sv, "
+      "Tensor ids, Tensor! output, Tensor! scratch, Tensor tasks, "
+      "Tensor task_count, int rows, int input_group, bool residual=False) -> "
+      "()");
   m.def("expert_combine(Tensor input, Tensor routing, Tensor! output) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("expert_gemv", TORCH_BOX(&expert_gemv));
   m.impl("expert_gemv_cold", TORCH_BOX(&expert_gemv_cold));
+  m.impl("expert_gemv_compact", TORCH_BOX(&expert_gemv_compact));
   m.impl("expert_combine", TORCH_BOX(&expert_combine));
 }

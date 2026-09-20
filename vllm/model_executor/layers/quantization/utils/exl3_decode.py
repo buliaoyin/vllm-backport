@@ -24,6 +24,9 @@ def _hot_routes(
     Threshold: tl.constexpr,
     Block: tl.constexpr,
     EBlock: tl.constexpr,
+    ColdTasks=None,
+    ColdCount=None,
+    Compact: tl.constexpr = False,
 ):
     expert = tl.program_id(0)
     count = tl.load(Counts + expert)
@@ -40,6 +43,14 @@ def _hot_routes(
         weights = tl.load(Weights + i, i < Slots, 0)
         tl.store(Tokens + positions, i // TopK, selected)
         tl.store(SortedWeights + positions, weights, selected)
+
+    if Compact and expert == Experts:
+        i = tl.arange(0, Block)
+        ids = tl.load(Ids + i, i < Slots, 0)
+        cold = (i < Slots) & (tl.load(Counts + ids) < Threshold)
+        positions = tl.cumsum(cold.to(tl.int32), 0) - 1
+        tl.store(ColdTasks + positions, i, cold)
+        tl.store(ColdCount, tl.sum(cold.to(tl.int32), 0))
 
 
 @triton.jit
@@ -97,17 +108,26 @@ def is_decode_batch() -> bool:
 
 
 def moe_batched_decode(
-    x, weights, ids, ptrs, workspace, locks, scratch, limit, residual=False
+    x,
+    weights,
+    ids,
+    ptrs,
+    workspace,
+    locks,
+    scratch,
+    limit,
+    residual=False,
+    compact=True,
 ):
     """Use caller-owned scratch on the input device and its current stream."""
     with torch.accelerator.device_index(x.device.index):
         return _moe_batched_decode(
-            x, weights, ids, ptrs, workspace, locks, scratch, limit, residual
+            x, weights, ids, ptrs, workspace, locks, scratch, limit, residual, compact
         )
 
 
 def _moe_batched_decode(
-    x, weights, ids, ptrs, workspace, locks, scratch, limit, residual
+    x, weights, ids, ptrs, workspace, locks, scratch, limit, residual, compact
 ):
     from vllm.model_executor.layers.quantization.exl3 import _extension
 
@@ -120,6 +140,18 @@ def _moe_batched_decode(
     experts = ptrs[0].numel()
     intermediate = workspace[2].shape[-1]
     threshold = 3
+    compact = (
+        compact
+        and not residual
+        and 9 <= rows <= 128
+        and hidden == 4096
+        and intermediate == 2048
+        and topk in (1, 2, 4, 8)
+    )
+    cold_tasks = (
+        torch.empty(slots, dtype=torch.int32, device=x.device) if compact else None
+    )
+    cold_count = torch.empty(1, dtype=torch.int32, device=x.device) if compact else None
     hidden_x = x.to(torch.float16).contiguous()
     indices = ids.to(torch.int64).contiguous().flatten()
     routing = weights.to(torch.float16).contiguous().flatten()
@@ -141,9 +173,12 @@ def _moe_batched_decode(
         threshold,
         triton.next_power_of_2(slots),
         triton.next_power_of_2(experts),
+        cold_tasks,
+        cold_count,
+        compact,
     )
     hot_result = torch.zeros((rows, hidden), dtype=torch.float32, device=x.device)
-    torch.ops._exl3_C.moe_m32(
+    torch.ops._exl3_C.moe_m32_decode(
         hidden_x,
         hot_result,
         hot_counts,
@@ -156,33 +191,39 @@ def _moe_batched_decode(
     )
     gate = torch.empty((slots, intermediate), dtype=torch.float16, device=x.device)
     up, activated = torch.empty_like(gate), torch.empty_like(gate)
-    for i, output in enumerate((gate, up)):
-        torch.ops._exl3_C.expert_gemv_cold(
-            hidden_x,
-            *ptrs[3 * i : 3 * i + 3],
-            indices,
-            output,
-            scratch,
-            counts,
-            rows,
-            topk,
-            threshold,
-            residual,
-        )
+
+    def project(input, pointers, output, input_group):
+        if compact:
+            torch.ops._exl3_C.expert_gemv_compact(
+                input,
+                *pointers,
+                indices,
+                output,
+                scratch,
+                cold_tasks,
+                cold_count,
+                rows,
+                input_group,
+            )
+        else:
+            torch.ops._exl3_C.expert_gemv_cold(
+                input,
+                *pointers,
+                indices,
+                output,
+                scratch,
+                counts,
+                rows,
+                input_group,
+                threshold,
+                residual,
+            )
+
+    project(hidden_x, ptrs[:3], gate, topk)
+    project(hidden_x, ptrs[3:6], up, topk)
     _extension().silu_mul(gate, up, activated, limit)
     down = torch.empty((slots, hidden), dtype=torch.float32, device=x.device)
-    torch.ops._exl3_C.expert_gemv_cold(
-        activated,
-        *ptrs[6:9],
-        indices,
-        down,
-        scratch,
-        counts,
-        rows,
-        1,
-        threshold,
-        residual,
-    )
+    project(activated, ptrs[6:9], down, 1)
     output = torch.empty((rows, hidden), device=x.device, dtype=x.dtype)
     _combine[(rows, triton.cdiv(hidden, 256))](
         down,

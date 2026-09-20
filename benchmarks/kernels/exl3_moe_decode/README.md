@@ -168,3 +168,16 @@ Each variant also exports the ordinary DP4A factories and returns `decode.so`;
 pass the corresponding libraries as `--library`, `--grouped-library` or
 `--cold-library`. Use separate build directories. The sweep reverses candidate
 order in the second timing round and records every sample and relative L2 error.
+
+For a paired comparison of the hot-expert fetch pipeline, add
+`--production --k32-control` to `batched.py`. The `production_*_k32` variants
+keep the same cold DP4A path and use the original K32 fetch for hot experts.
+The regular production variants use K64 fetch for SM80 decode with
+hidden/intermediate dimensions 4096/2048. Compare the complete wrapper;
+the Tensor Core computation and FP32 accumulation order are unchanged.
+
+Add `--uncompacted-control` to retain the original cold-expert scheduling.
+Together with `--k32-control`, `production_plain_uncompacted_k32` compares
+against the complete original batched-decode path using the same inputs,
+precision, stream and workspace. The two controls also separate cold scheduling
+from hot-expert pipeline changes.

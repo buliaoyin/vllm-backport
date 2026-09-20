@@ -18,10 +18,12 @@
 #include "upstream/ptx.cuh"
 
 template <int t_bits, int MOE_TILESIZE_N, int cb, int ROW_FRAG_STAGES,
-          int ROW_TILE_M, int ROW_TILE_K, bool PREDICATE_ROWS>
+          int ROW_TILE_M, int ROW_TILE_K, bool PREDICATE_ROWS,
+          int FETCH_K_FACTOR = 1>
 __global__ __launch_bounds__(
     EXL3_GEMM_BASE_THREADS* ROW_TILE_K /
     16) void exl3_moe_nobar_kernel(EXL3_MOE_KERNEL_ARGS) {
+  static_assert(FETCH_K_FACTOR == 1 || ROW_TILE_M == 32);
   const int group_idx = blockIdx.z;
   const int block_idx = blockIdx.x;
   const int group_size = gridDim.x;  // SMs per expert, set at launch
@@ -34,6 +36,11 @@ __global__ __launch_bounds__(
   const int warps_per_block = block_threads / 32;
   const int warp_idx0 = block_idx * warps_per_block + warp_id;
 
+  // The caller zeroes locks once and the output accumulator for each replay.
+  // Temp buffers need no zeroing: each live row is overwritten before its
+  // consumer. GEMM locks and group counters reset; barrier sense may persist.
+  // Tickets are overwritten before use, and the last retiring group resets
+  // scheduler counters below. Serialized launches can reuse the same workspace.
   // Buffers for group
   temp_state_g += group_idx * max_tokens_per_expert * hidden_dim;
   temp_state_u += group_idx * max_tokens_per_expert * hidden_dim;
@@ -129,7 +136,7 @@ __global__ __launch_bounds__(
         else
           exl3_gemm_nobar_inner<t_bits, false, cb, ROW_TILE_M, ROW_TILE_K,
                                 MOE_TILESIZE_N, MOE_SH_STAGES, ROW_FRAG_STAGES,
-                                false, PREDICATE_ROWS>(
+                                false, PREDICATE_ROWS, FETCH_K_FACTOR>(
               in_addr + offset * hidden_dim, trellis,
               out_addr + offset * intermediate_dim, rows, hidden_dim,
               intermediate_dim, locks, nullptr);
@@ -177,7 +184,7 @@ __global__ __launch_bounds__(
         else
           exl3_gemm_nobar_inner<t_bits, false, cb, ROW_TILE_M, ROW_TILE_K,
                                 MOE_TILESIZE_N, MOE_SH_STAGES, ROW_FRAG_STAGES,
-                                false, PREDICATE_ROWS>(
+                                false, PREDICATE_ROWS, FETCH_K_FACTOR>(
               in_addr + offset * intermediate_dim, trellis,
               out_addr + offset * hidden_dim, rows, intermediate_dim,
               hidden_dim, locks, nullptr);

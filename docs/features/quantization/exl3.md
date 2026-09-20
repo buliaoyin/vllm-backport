@@ -143,6 +143,16 @@ the same BF16/4-bit mul1/top-k restrictions. It requires M32 and respects the
 allocated expert workspace capacity. The default `hybrid` policy uses plain INT8
 on SM80 for both small and batched decode; `residual` explicitly enables
 activation residual compensation. The SM120 policy remains compensated INT8.
+For hidden/intermediate dimensions 4096/2048, the batched hot-expert kernel
+fetches 64 K elements per shared-memory stage and processes two K32 steps.
+This reduces synchronization while preserving FP32 accumulation order and the
+existing workspace size. Native prefill and other dimensions retain K32 fetch.
+Plain INT8 batched decode also compacts cold assignments into persistent tasks
+for these dimensions and top-k values 1, 2, 4 and 8. The kernels specialize
+projection geometry while retaining the original activation quantization and
+K splits. Task indices are produced by the existing routing kernel; there is no
+additional weight cache. Other dimensions and residual INT8 retain the original
+cold-expert path.
 Mixed/prefill batches and PIECEWISE CUDA Graphs retain the existing paths.
 Set `VLLM_EXL3_MOE_BATCHED_DECODE=0` before startup to restore the original
 larger-batch path and its smaller scratch pool. Restart after changing the flag;
