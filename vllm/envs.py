@@ -188,8 +188,10 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_MAX_TOKENS: int = 2048
     VLLM_EXL3_MOE_M_TILE: int = 32
     VLLM_EXL3_MOE_DECODE: str = "hybrid"
+    VLLM_EXL3_MOE_BATCHED_DECODE: bool = True
     VLLM_EXL3_MOE_PREFILL: str = "native"
     VLLM_EXL3_MOE_INT8_MIN_TOKENS: int = 4096
+    VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP: int = 64
     VLLM_EXL3_MOE_PRIORITY: bool = True
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MHC_AR_INT8: bool = False
@@ -1569,14 +1571,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_M_TILE": lambda: int(os.getenv("VLLM_EXL3_MOE_M_TILE", "32")),
     # Native FP16 expert decode, or INT8 with automatic/per-device residual policy.
     "VLLM_EXL3_MOE_DECODE": lambda: os.getenv("VLLM_EXL3_MOE_DECODE", "hybrid"),
+    # Route sparse experts to INT8 and reuse M32 for batched SM80 decode.
+    "VLLM_EXL3_MOE_BATCHED_DECODE": lambda: (
+        os.getenv("VLLM_EXL3_MOE_BATCHED_DECODE", "1") == "1"
+    ),
     # Opt-in adaptive SM80 INT8 prefill; native avoids added quantization error.
     "VLLM_EXL3_MOE_PREFILL": lambda: os.getenv("VLLM_EXL3_MOE_PREFILL", "native"),
     # Minimum effective batch rows for grouped INT8; lower for numerical evals.
     "VLLM_EXL3_MOE_INT8_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_EXL3_MOE_INT8_MIN_TOKENS", "4096")
     ),
+    # Bound temporary INT8 expert weights; 0 reconstructs all experts at once.
+    "VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP": lambda: int(
+        os.getenv("VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP", "64")
+    ),
     # Schedule larger EXL3 experts first to reduce the final wave of work.
-    "VLLM_EXL3_MOE_PRIORITY": lambda: (os.getenv("VLLM_EXL3_MOE_PRIORITY", "1") == "1"),
+    "VLLM_EXL3_MOE_PRIORITY": lambda: os.getenv("VLLM_EXL3_MOE_PRIORITY", "1") == "1",
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"

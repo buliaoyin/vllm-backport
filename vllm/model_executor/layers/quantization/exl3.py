@@ -159,6 +159,10 @@ class Exl3Config(QuantizationConfig):
         if index.exists():
             file_names = set(json.loads(index.read_text())["weight_map"].values())
             files = [root / name for name in sorted(file_names)]
+            # ExLlama exports MTP separately, outside the target's shard index.
+            mtp_file = root / "mtp.safetensors"
+            if mtp_file.is_file() and mtp_file not in files:
+                files.append(mtp_file)
         for file in files:
             with file.open("rb") as stream:
                 size = struct.unpack("<Q", stream.read(8))[0]
@@ -343,7 +347,11 @@ class Exl3LinearMethod(LinearMethodBase):
                 y = torch.nn.functional.linear(x, weights["weight"].to(x.dtype))
             outputs.append(y)
         result = torch.cat(outputs, dim=-1) if len(outputs) > 1 else outputs[0]
-        return result if bias is None else result + bias
+        if bias is None:
+            return result
+        if result.dtype == bias.dtype:
+            return result.add_(bias)
+        return result + bias
 
 
 def _exl3_linear(
@@ -400,6 +408,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.m32_locks = None
         self.moe_m_tile = 16
         self.decode_mode = 0
+        self.batched_decode_mode = 0
         self.decode_workspace = None
         self.prefill_workspace = []
         self.prefill_min_rows = envs.VLLM_EXL3_MOE_INT8_MIN_TOKENS
@@ -601,13 +610,29 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 policy == "hybrid" and capability == (12, 0)
             )
             self.decode_mode = 2 if residual else 1
-            stride = _decode_workspace_stride(
-                self.hidden_size, self.intermediate_size, residual
+            batched_decode = (
+                envs.VLLM_EXL3_MOE_BATCHED_DECODE
+                and capability == (8, 0)
+                and self.m32_locks is not None
+                and self.workspace[0].shape[1] >= 9
+                and self.moe.experts_per_token <= 8
+                and 32 <= self.num_experts <= 1024
+                and self.hidden_size * self.intermediate_size >= 4096 * 2048
             )
-            decode_key = (device, stride)
+            if batched_decode:
+                self.batched_decode_mode = self.decode_mode
+            stride = _decode_workspace_stride(
+                self.hidden_size,
+                self.intermediate_size,
+                residual or self.batched_decode_mode == 2,
+            )
+            slots = 1024 if batched_decode else 64
+            if batched_decode and not hasattr(torch.ops._exl3_C, "expert_gemv_cold"):
+                raise ImportError("Rebuild vllm._exl3_C for batched EXL3 decode.")
+            decode_key = (device, stride, slots)
             if decode_key not in self.config.decode_workspaces:
                 self.config.decode_workspaces[decode_key] = torch.zeros(
-                    (64, stride), device=device, dtype=torch.int32
+                    (slots, stride), device=device, dtype=torch.int32
                 )
             self.decode_workspace = self.config.decode_workspaces[decode_key]
             logger.info_once(
@@ -638,7 +663,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 if (
                     prefill == "auto"
                     and vllm_config.model_config is not None
-                    and vllm_config.model_config.max_model_len < 32768
+                    and vllm_config.model_config.max_model_len < 10240
                 ):
                     int8_capacity = 0
             if (
@@ -659,6 +684,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     self.intermediate_size,
                     int8_capacity,
                     topk,
+                    envs.VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP,
                 )
                 if prefill_key not in self.config.prefill_workspaces:
                     try:
@@ -676,10 +702,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         self.config.prefill_workspaces[prefill_key] = buffers
                         logger.info_once(
                             "EXL3 INT8 prefill on SM80: rows >= %d, capacity %d, "
-                            "%.3f GiB shared workspace (native capacity %d).",
+                            "%.3f GiB shared workspace, %d experts per group "
+                            "(native capacity %d).",
                             self.prefill_min_rows,
                             int8_capacity,
                             sum(t.numel() * t.element_size() for t in buffers) / 2**30,
+                            buffers[0].numel()
+                            // (self.hidden_size * self.intermediate_size),
                             capacity,
                         )
                 self.prefill_workspace = self.config.prefill_workspaces.get(
@@ -714,6 +743,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.decode_workspace,
             self.decode_mode,
             self.prefill_min_rows,
+            self.batched_decode_mode,
         )
 
 
@@ -919,6 +949,7 @@ def _exl3_moe(
     decode_workspace: torch.Tensor | None = None,
     decode_mode: int = 0,
     prefill_min_rows: int = 4096,
+    batched_decode_mode: int = 0,
 ) -> torch.Tensor:
     if (
         decode_workspace is not None
@@ -937,6 +968,32 @@ def _exl3_moe(
             decode_workspace,
             decode_mode,
         )
+    if (
+        batched_decode_mode != 0
+        and decode_workspace is not None
+        and decode_workspace.shape[0] > 64
+        and m32_locks is not None
+        and x.dtype == torch.bfloat16
+        and 9 <= x.shape[0] <= min(128, workspace[0].shape[1])
+        and 1 <= topk_ids.shape[1] <= 8
+    ):
+        from vllm.model_executor.layers.quantization.utils.exl3_decode import (
+            is_decode_batch,
+            moe_batched_decode,
+        )
+
+        if is_decode_batch():
+            return moe_batched_decode(
+                x,
+                topk_weights,
+                topk_ids,
+                ptrs,
+                workspace,
+                m32_locks,
+                decode_workspace,
+                limit,
+                batched_decode_mode == 2,
+            )
     use_int8_prefill = bool(prefill_workspace) and x.shape[0] >= prefill_min_rows
     if use_int8_prefill:
         from vllm.config import CUDAGraphMode
@@ -1006,6 +1063,7 @@ def _exl3_moe_fake(
     decode_workspace=None,
     decode_mode=0,
     prefill_min_rows=4096,
+    batched_decode_mode=0,
 ):
     return torch.empty_like(x)
 

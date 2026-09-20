@@ -2812,7 +2812,7 @@ class EngineArgs:
                         envs.VLLM_EXL3_MOE_PREFILL == "int8"
                         or (
                             envs.VLLM_EXL3_MOE_PREFILL == "auto"
-                            and model_config.max_model_len >= 32768
+                            and model_config.max_model_len >= 10240
                         )
                     )
                     and current_platform.get_device_capability() == (8, 0)

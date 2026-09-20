@@ -68,6 +68,9 @@ class DefaultModelLoader(BaseModelLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
+        extra_safetensors_files: tuple[str, ...] = ()
+        """Optional local files to include even when absent from the shard index."""
+
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
@@ -253,6 +256,11 @@ class DefaultModelLoader(BaseModelLoader):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        if use_safetensors:
+            for filename in source.extra_safetensors_files:
+                path = os.path.join(hf_folder, filename)
+                if os.path.isfile(path) and path not in hf_weights_files:
+                    hf_weights_files.append(path)
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -329,6 +337,7 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            extra_safetensors_files=getattr(model, "extra_safetensors_files", ()),
         )
         weights = self._get_weights_iterator(primary_weights)
         if model_config.quantization == "exl3":

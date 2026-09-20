@@ -30,25 +30,25 @@ void check_dimension(int64_t width) {
       "EXL3 expert decode dimensions must be multiples of 256 in [256, 8192]");
 }
 
-template <bool fp32, bool residual>
+template <bool fp32, bool residual, bool filtered>
 void launch(const Tensor& input, const Tensor& trellis, const Tensor& su,
             const Tensor& sv, const Tensor& ids, const Tensor& output,
             const Tensor& scratch, int input_group, int grid, int shared_bytes,
-            cudaStream_t stream) {
+            cudaStream_t stream, const Tensor* counts, int threshold) {
   static std::mutex mutex;
   static std::set<int> configured;
   {
     const std::lock_guard<std::mutex> lock(mutex);
     if (configured.insert(input.get_device_index()).second) {
       check_cuda(cudaFuncSetAttribute(
-          exl3_expert_gemv<fp32, residual>,
+          exl3_expert_gemv<fp32, residual, filtered>,
           cudaFuncAttributeMaxDynamicSharedMemorySize, 90 * 1024));
       check_cuda(cudaFuncSetAttribute(
-          exl3_expert_gemv<fp32, residual>,
+          exl3_expert_gemv<fp32, residual, filtered>,
           cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     }
   }
-  exl3_expert_gemv<fp32, residual>
+  exl3_expert_gemv<fp32, residual, filtered>
       <<<dim3(grid, 1, ids.numel()), 256, shared_bytes, stream>>>(
           static_cast<const half*>(input.data_ptr()),
           reinterpret_cast<const uint16_t* const*>(trellis.data_ptr()),
@@ -57,13 +57,17 @@ void launch(const Tensor& input, const Tensor& trellis, const Tensor& su,
           reinterpret_cast<const half* const*>(sv.data_ptr()),
           static_cast<const int64_t*>(ids.data_ptr()),
           static_cast<int*>(scratch.data_ptr()), input.size(1), output.size(1),
-          8, input_group, scratch.size(1));
+          8, input_group, scratch.size(1),
+          counts ? static_cast<const int64_t*>(counts->data_ptr()) : nullptr,
+          threshold);
 }
 
-void expert_gemv(const Tensor& input, const Tensor& trellis, const Tensor& su,
-                 const Tensor& sv, const Tensor& ids, const Tensor& output,
-                 const Tensor& scratch, int64_t rows, int64_t input_group,
-                 bool residual) {
+template <bool filtered>
+void expert_gemv_impl(const Tensor& input, const Tensor& trellis,
+                      const Tensor& su, const Tensor& sv, const Tensor& ids,
+                      const Tensor& output, const Tensor& scratch, int64_t rows,
+                      int64_t input_group, bool residual,
+                      const Tensor* counts = nullptr, int threshold = 0) {
   STD_TORCH_CHECK(input.is_cuda(), "EXL3 expert decode requires CUDA");
   const auto device = input.get_device_index();
   const torch::stable::accelerator::DeviceGuard guard(device);
@@ -79,9 +83,9 @@ void expert_gemv(const Tensor& input, const Tensor& trellis, const Tensor& su,
                   "EXL3 expert decode output must be FP16 or FP32");
   check_tensor(output, device, output.scalar_type());
   STD_TORCH_CHECK(input.dim() == 2 && output.dim() == 2 && ids.dim() == 1 &&
-                      scratch.dim() == 2 && rows >= 1 && rows <= 8 &&
-                      ids.numel() % rows == 0 && ids.numel() / rows >= 1 &&
-                      ids.numel() / rows <= 8 &&
+                      scratch.dim() == 2 && rows >= 1 &&
+                      rows <= (filtered ? 128 : 8) && ids.numel() % rows == 0 &&
+                      ids.numel() / rows >= 1 && ids.numel() / rows <= 8 &&
                       output.size(0) == ids.numel() &&
                       (input_group == 1 || input_group == ids.numel() / rows) &&
                       input.size(0) * input_group == ids.numel(),
@@ -92,10 +96,20 @@ void expert_gemv(const Tensor& input, const Tensor& trellis, const Tensor& su,
                         t->numel() >= ids.numel() / rows,
                     "EXL3 expert pointer table size mismatch");
   }
+  if constexpr (filtered) {
+    STD_TORCH_CHECK(
+        sm80 && counts && threshold >= 1 && threshold <= 128,
+        "EXL3 filtered expert decode requires SM80 and a valid threshold");
+    check_tensor(*counts, device, ScalarType::Long);
+    STD_TORCH_CHECK(counts->dim() == 1 && counts->numel() >= trellis.numel(),
+                    "EXL3 filtered expert counts are too small");
+  }
   const int k = input.size(1), n = output.size(1);
   check_dimension(k);
   check_dimension(n);
-  const int grid = sm80 ? (rows <= 4 ? 32 : 16)
+  const int grid = sm80 ? (rows <= 4               ? 32
+                           : filtered && rows > 64 ? 8
+                                                   : 16)
                         : (rows == 1 || rows > 4 ? 64
                            : rows == 2           ? 32
                                                  : 16);
@@ -113,20 +127,41 @@ void expert_gemv(const Tensor& input, const Tensor& trellis, const Tensor& su,
   const auto stream = get_current_cuda_stream(device);
   if (output.scalar_type() == ScalarType::Float) {
     if (residual)
-      launch<true, true>(input, trellis, su, sv, ids, output, scratch,
-                         input_group, grid, shared, stream);
+      launch<true, true, filtered>(input, trellis, su, sv, ids, output, scratch,
+                                   input_group, grid, shared, stream, counts,
+                                   threshold);
     else
-      launch<true, false>(input, trellis, su, sv, ids, output, scratch,
-                          input_group, grid, shared, stream);
+      launch<true, false, filtered>(input, trellis, su, sv, ids, output,
+                                    scratch, input_group, grid, shared, stream,
+                                    counts, threshold);
   } else {
     if (residual)
-      launch<false, true>(input, trellis, su, sv, ids, output, scratch,
-                          input_group, grid, shared, stream);
+      launch<false, true, filtered>(input, trellis, su, sv, ids, output,
+                                    scratch, input_group, grid, shared, stream,
+                                    counts, threshold);
     else
-      launch<false, false>(input, trellis, su, sv, ids, output, scratch,
-                           input_group, grid, shared, stream);
+      launch<false, false, filtered>(input, trellis, su, sv, ids, output,
+                                     scratch, input_group, grid, shared, stream,
+                                     counts, threshold);
   }
   check_cuda(cudaGetLastError());
+}
+
+void expert_gemv(const Tensor& input, const Tensor& trellis, const Tensor& su,
+                 const Tensor& sv, const Tensor& ids, const Tensor& output,
+                 const Tensor& scratch, int64_t rows, int64_t input_group,
+                 bool residual) {
+  expert_gemv_impl<false>(input, trellis, su, sv, ids, output, scratch, rows,
+                          input_group, residual);
+}
+
+void expert_gemv_cold(const Tensor& input, const Tensor& trellis,
+                      const Tensor& su, const Tensor& sv, const Tensor& ids,
+                      const Tensor& output, const Tensor& scratch,
+                      const Tensor& counts, int64_t rows, int64_t input_group,
+                      int64_t threshold, bool residual) {
+  expert_gemv_impl<true>(input, trellis, su, sv, ids, output, scratch, rows,
+                         input_group, residual, &counts, threshold);
 }
 
 void expert_combine(const Tensor& input, const Tensor& routing,
@@ -162,9 +197,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
       "ids, "
       "Tensor! output, Tensor! scratch, int rows, int input_group, bool "
       "residual) -> ()");
+  m.def(
+      "expert_gemv_cold(Tensor input, Tensor trellis, Tensor su, Tensor sv, "
+      "Tensor ids, Tensor! output, Tensor! scratch, Tensor counts, int rows, "
+      "int input_group, int threshold, bool residual=False) -> ()");
   m.def("expert_combine(Tensor input, Tensor routing, Tensor! output) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("expert_gemv", TORCH_BOX(&expert_gemv));
+  m.impl("expert_gemv_cold", TORCH_BOX(&expert_gemv_cold));
   m.impl("expert_combine", TORCH_BOX(&expert_combine));
 }

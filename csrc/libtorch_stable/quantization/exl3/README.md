@@ -21,6 +21,22 @@ format and dimension bounds as M32. Gate/up produce FP16 intermediates; down
 produces FP32 intermediates before routing-weight reduction into BF16 output.
 Unsupported configurations fall back to upstream decode.
 
+`expert_gemv_cold` adds a filtered SM80 launch for up to 128 rows. The caller
+provides GPU expert counts; assignments whose count reaches the threshold are
+skipped before reading weights. An optional second DP4A pass compensates the
+activation quantization residual. The Python `exl3_decode.py` wrapper sends those
+experts through M32 and combines both outputs in FP32. The validated threshold
+is three rows per expert; grid X is 16 through 64 input rows and 8 above that.
+The original 1–8-row operation keeps its arithmetic and dispatch.
+
+Batched decode requires a 1024-slot shared scratch (128 rows × top-8), versus
+64 slots for the original path; the stride also covers residual partial sums
+when compensation is selected. Each projection resets its used counters before
+reuse, including when an assignment changes between hot and cold on later calls.
+The wrapper selects the input device and uses its current stream. Pure-decode
+metadata is required; PIECEWISE graphs retain the existing path because their
+captured operations can later serve prefill or mixed batches.
+
 The caller owns a shared INT32 scratch tensor with a fixed slot stride large
 enough for both projection shapes and all supported batch sizes. Keeping that
 stride fixed prevents partial sums from overlapping counters when reusing the

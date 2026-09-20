@@ -40,6 +40,52 @@ vllm serve /path/to/exl3-model \
     --dtype bfloat16 --tensor-parallel-size 1 --pipeline-parallel-size 4
 ```
 
+GLM5Next MTP can load quantized draft weights from `mtp.safetensors` alongside
+an EXL3 checkpoint, including when the main shard index omits that file. The
+checkpoint directory does not need modification. MTP runs on the final pipeline
+rank and shares the target output head; under PP it loads an additional embedding
+on that rank.
+
+For the three-CMP-170HX GLM checkpoint used in validation, start with one draft
+token and an explicit KV budget:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 NCCL_P2P_DISABLE=1 \
+VLLM_PP_LAYER_PARTITION=16,15,14 VLLM_EXL3_MOE_PREFILL=native \
+vllm serve /path/to/glm5next-exl3 \
+    --dtype bfloat16 --tensor-parallel-size 1 --pipeline-parallel-size 3 \
+    --max-model-len 66560 --max-num-seqs 4 --max-num-batched-tokens 2048 \
+    --kv-cache-memory-bytes 2147483648 --no-enable-prefix-caching \
+    --limit-mm-per-prompt '{"image": 0, "video": 0}' \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'
+```
+
+MTP remains opt-in. Draft acceptance and the size of the target verification
+batch both affect throughput; increasing the number of draft tokens can reduce
+performance.
+
+GLM5Next image input is supported with EXL3 vision weights. For the validated
+checkpoint, replace the text-only modality limit with the following serving
+options:
+
+```bash
+--limit-mm-per-prompt '{"image": 2, "video": 0}' \
+--mm-processor-kwargs '{"max_image_tokens": 1024}'
+```
+
+The original EXL3 checkpoint template replaces OpenAI-style media content with
+a text-only reminder. Replace its `chat_template.jinja` with the corresponding
+GLM-5.3-Flash AWQ or original model template to preserve image placeholders with
+the default `auto` content format. The local checkpoint used here now contains
+the AWQ template. With the original EXL3 template, use
+`--chat-template-content-format string` instead; for `LLM.chat`, set
+`chat_template_content_format="string"`. The loader preserves separate EXL3
+Q/K/V rotations and ignores the original fused FP16 QKV when both copies are
+present.
+The three-CMP-170HX capacity run uses PP `17/15/13`, a 5.5 GiB KV budget per
+rank, and the native 1,048,576-token context limit. It completes 1,048,448-token
+input with MTP1 enabled.
+
 The safetensors headers determine individual tensor shapes and bit widths.
 The average `bits` value in `quantization_config` is not a storage-layout setting.
 Full-precision projections remain full precision. Converted calibration
@@ -64,8 +110,10 @@ The initial model validation covers Qwen3.5 dense and GLM5Next MoE text inferenc
 extends the two tested checkpoints to 65536 input tokens with one or four
 submitted requests. The report records hardware, cache capacity, timing and
 basic retrieval checks; this does not establish a general context limit.
-Multimodal generation, speculative decoding, LoRA, CPU offload, sleep mode,
-expert load balancing, and distributed tensor/expert sharding are not validated.
+Multimodal generation outside the validated GLM5Next image path (including
+video), speculative decoding outside GLM5Next MTP, LoRA, CPU offload, sleep mode,
+expert load balancing, and distributed
+tensor/expert sharding are not validated.
 Shared experts run serially because upstream GEMMs share a device-wide lock
 workspace. Dual batch overlap is explicitly rejected.
 Do not infer support for those features from model architecture support alone.
@@ -85,7 +133,24 @@ Up to eight decode tokens use the expert decode path without sorting routes.
 For BF16 activations, uniform 4-bit mul1 weights, dimensions divisible by 256 in
 [256, 8192], and up to eight selected experts per token, the default is INT8
 DP4A on SM80 and INT8 DP4A with activation residual compensation on SM120.
-Other configurations use upstream batched expert GEMMs.
+Other configurations follow the native expert GEMM policy described below.
+
+`VLLM_EXL3_MOE_BATCHED_DECODE=1` (the default) enables expert reuse for larger
+pure decode batches on SM80. Experts receiving one or two rows use DP4A; experts receiving
+at least three rows use M32 FP16 Tensor Cores. This path supports 9–128 rows,
+32–1024 experts, hidden × intermediate size of at least 4096 × 2048, and
+the same BF16/4-bit mul1/top-k restrictions. It requires M32 and respects the
+allocated expert workspace capacity. The default `hybrid` policy uses plain INT8
+on SM80 for both small and batched decode; `residual` explicitly enables
+activation residual compensation. The SM120 policy remains compensated INT8.
+Mixed/prefill batches and PIECEWISE CUDA Graphs retain the existing paths.
+Set `VLLM_EXL3_MOE_BATCHED_DECODE=0` before startup to restore the original
+larger-batch path and its smaller scratch pool. Restart after changing the flag;
+FULL decode graphs capture the selected policy.
+In the tested B16/MTP1 64-question GSM8K subset, the original path scored 64/64;
+both plain and compensated batched INT8 scored 63/64, with different wrong answers.
+Compensation reduces kernel error but has not established accuracy neutrality.
+Plain INT8 provided higher throughput in the tested SM80 concurrent workload.
 
 The default `VLLM_EXL3_MOE_PREFILL=native` keeps native prefill and a 2048-token
 scheduler budget. A concurrent 64-question GSM8K comparison scored 64/64 with
@@ -93,13 +158,15 @@ native prefill and 61/64 with forced INT8 prefill, so the added quantization
 remains opt-in despite its long-input speedup.
 
 Set `VLLM_EXL3_MOE_PREFILL=auto` to enable adaptive prefill. On SM80 MoE models
-with a context limit of at least 32K, the implicit scheduler capacity is 6144.
-After prefix-cache lookup, a request with at least 32768 uncomputed prompt tokens
+with a context limit of at least 10240 tokens, the implicit scheduler capacity is 6144.
+After prefix-cache lookup, a request with at least 10240 uncomputed prompt tokens
 selects chunks of up to 6144; that plan remains active until the small tail.
 Short prompts and steps with active decode requests use at most 2048 tokens.
 Several short prompts do not become a long prompt by being submitted together.
 Other EXL3 models keep the 2048 default. Explicit token budgets and existing
-scheduler alignment limits remain upper bounds.
+scheduler alignment limits remain upper bounds. When a hybrid cache block is
+larger than the adaptive short-prompt budget, prefill advances in smaller chunks
+and stops at each cache boundary.
 
 `VLLM_EXL3_MOE_PREFILL=native` disables INT8 prefill and its workspace.
 Set `int8` to use the configured scheduler budget without the adaptive latency
@@ -107,14 +174,15 @@ limits. This can improve bulk throughput but increase short-request TTFT or
 interrupt ongoing output. The worker requires at least 4096 GEMM rows by default;
 smaller batches and tails use native kernels. INT8 prefill supports at most eight
 selected experts per token and 65535 total experts. Unsupported devices and formats
-also use native kernels. FULL CUDA Graphs retain native arithmetic, independently
-of their padding. `VLLM_EXL3_MOE_INT8_MIN_TOKENS` overrides the row threshold
+also use native kernels. FULL CUDA Graphs never select the INT8 prefill kernel,
+independently of their padding; the expert decode policy remains separate. `VLLM_EXL3_MOE_INT8_MIN_TOKENS` overrides the row threshold
 (range 9–6144); lowering it is useful for numerical evaluations, not a default
 performance recommendation.
 
-The automatic threshold comes from the tested GLM checkpoint and PP layouts.
-See the [concurrent validation](../../validation/exl3-adaptive-prefill-20260912.md)
-for TTFT, aggregate throughput, output gaps and accuracy, and the
+The auto threshold is 10240 tokens, inclusive. This threshold is a policy
+setting, not a universal performance crossover. See the
+[concurrent validation](../../validation/exl3-adaptive-prefill-20260912.md)
+for the original 32768-token policy's TTFT, throughput, output gaps and accuracy, and the
 [design](../../design/exl3-adaptive-prefill.md) for cache and lifecycle behavior.
 
 SM80 uses the bundled M=32, FP32-accumulating expert kernel for uniform 4-bit
@@ -149,13 +217,24 @@ For hidden size 4096 and intermediate size 2048, the default 2048-row workspace
 uses 384 MiB on the tested CMP 170HX and 1104 MiB on the tested RTX PRO 6000
 Blackwell. M32 additionally shares a roughly 4 MiB lock buffer per device.
 For these dimensions, hybrid decode adds a shared 5.25 MiB scratch on SM80
-and 9.25 MiB on SM120.
-INT8 prefill additionally reserves about 3.188 GiB per supported rank for the
-GLM shape (288 experts, top-8, 6144 rows). The bounded pool is allocated before KV
-cache profiling; switching input lengths does not create additional pools. Auto
+and 9.25 MiB on SM120. Enabling batched expert decode increases the SM80 scratch
+to 84 MiB with the default `hybrid` or explicit `plain` policy, or 148 MiB with
+`residual`, shared across matching layers and allocated before KV profiling.
+Relative to the original SM80 path, the increments are 78.75 and 142.75 MiB
+per rank, respectively.
+INT8 prefill reconstructs at most 64 experts at a time, reusing a single weight
+buffer across groups and projections. For the GLM shape (288 experts, top-8,
+6144 rows), the additional pool is about 1.438 GiB per rank, down from 3.188 GiB
+with all experts resident. `VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP=32` reduces it to
+1.188 GiB; `0` restores full expansion. Set this variable before process startup.
+Grouping preserves the token chunk and
+INT8 arithmetic. Activations are quantized once per projection, and GPU routing
+bounds keep each GEMM within its expert group, including hot groups and tails.
+The bounded pool is allocated before KV cache profiling; switching input lengths
+does not create additional pools. Auto
 falls back to native if that allocation fails, while explicit `int8` reports the
 allocation failure. Model and KV budgets must still fit the device. An auto
-engine configured for a context shorter than 32K does not reserve this pool.
+engine configured for a context shorter than 10240 tokens does not reserve this pool.
 
 Setting the scheduler token budget to 1024 also caps expert workspace capacity
 at 1024, halving the main workspace. Workspace memory grows
@@ -188,9 +267,17 @@ EXL3_INT8_GEMV=0 .venv/bin/python benchmarks/kernels/benchmark_exl3.py \
 
 `benchmarks/benchmark_exl3.py` measures both complete engines from a shared JSON
 of tokenized inputs, records cache hits and actual output lengths, and optionally
-runs GSM8K questions. Run its `exllamav3` backend in the original engine's own
-environment. Distinguish GPU kernel time from complete-engine throughput and
-record the actual device placement for multi-GPU comparisons.
+runs GSM8K questions. Its vLLM backend accepts `--mtp N` and records draft and
+accepted-token counters for each measured case. Run its `exllamav3` backend in
+the original engine's own environment. Distinguish GPU kernel time from
+complete-engine throughput and record the actual device placement for multi-GPU
+comparisons.
+
+For a fixed-batch comparison with the multiprocessing vLLM engine, add
+`--synchronize-inputs` to queue the entire batch before resuming the scheduler.
+Without it, requests may start before the remaining inputs arrive and produce
+different effective batch sizes. Record which admission mode was used; this
+benchmark option does not change normal serving or staggered-arrival cases.
 
 `benchmarks/prepare_exl3_long_inputs.py` builds deterministic retrieval inputs
 at 8K, 16K, 32K and 64K, including exact token counts and expected answers.
@@ -198,8 +285,10 @@ The benchmark accepts gzip JSON inputs and configurable context/cache sizes.
 For fixed-length generation, retrieval checks decode only the response before
 the first configured stop token; full generated tokens remain in the results.
 
-For the validated three-CMP-170HX GLM deployment, use PP `16/15/14`,
-`max_num_seqs=4` and an explicit 2 GiB KV cache budget per rank. For the mixed
+For the earlier three-CMP-170HX GLM throughput comparisons through 64K, use
+PP `16/15/14`, `max_num_seqs=4` and an explicit 2 GiB KV cache budget per rank.
+The vision and 1M-context capacity configuration above uses a different partition
+and budget. For the mixed
 four-GPU comparison use PP `11/11/11/12`. These are deployment measurements,
 not hard-coded layer assignments. Adaptive inference requires no benchmark
 worker; the optional profile worker only collects diagnostic intervals.

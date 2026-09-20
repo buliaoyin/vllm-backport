@@ -21,11 +21,14 @@ from vllm.model_executor.layers.quantization.exl3 import Exl3Config, Exl3MoEMeth
 def load_layer(checkpoint, prefix):
     config = Exl3Config({})
     config.maybe_update_config(str(checkpoint))
+    if prefix.startswith("language_model.model."):
+        prefix = prefix.replace("language_model.model.", "model.language_model.", 1)
     k, n = config.matrices[prefix + ".0.gate_proj"].dimensions
     moe = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(tp_size=1, ep_size=1),
         activation="silu",
         swiglu_limit=10.0,
+        experts_per_token=8,
     )
     layer = torch.nn.Module()
     method = Exl3MoEMethod(config, moe, prefix)

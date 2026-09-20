@@ -907,7 +907,7 @@ class TestDpDeviceIdSharding:
             )
 
 
-@pytest.mark.parametrize("context_limit", [16384, 24576, 65536])
+@pytest.mark.parametrize("context_limit", [10239, 10240, 16384, 24576, 65536])
 @pytest.mark.parametrize(
     "is_moe,prefill,capability",
     [
@@ -951,7 +951,7 @@ def test_exl3_chunk_default_preserves_explicit_and_other_backends(
         quantization == "exl3"
         and explicit is None
         and is_moe
-        and (prefill == "int8" or (prefill == "auto" and context_limit >= 32768))
+        and (prefill == "int8" or (prefill == "auto" and context_limit >= 10240))
         and capability == (8, 0)
     ):
         expected = 6144

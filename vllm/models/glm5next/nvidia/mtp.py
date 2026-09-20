@@ -12,6 +12,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -49,7 +50,19 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        if quant_config is not None and quant_config.get_name() == "exl3":
+            self.eh_proj = ReplicatedLinear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.eh_proj",
+                return_bias=False,
+            )
+        else:
+            self.eh_proj = nn.Linear(
+                config.hidden_size * 2, config.hidden_size, bias=False
+            )
 
         # Reserve room for the incomplete pool tail and align the sparse MLA
         # buffer width to BLOCK_N=128.
@@ -223,6 +236,11 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        self.extra_safetensors_files = (
+            ("mtp.safetensors",)
+            if self.quant_config is not None and self.quant_config.get_name() == "exl3"
+            else ()
+        )
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )

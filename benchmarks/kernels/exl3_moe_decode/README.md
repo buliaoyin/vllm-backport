@@ -10,7 +10,8 @@ It preserves the mul1 codebook and supports ordinary INT8 activation rounding
 (`plain`) or a second DP4A pass for the activation residual (`residual`). It is
 separate from the experimental INT8 Tensor Core prefill kernel.
 
-The launcher requires ExLlamaV3 1.4.8, SM80 or SM120, BF16 activations, 1–8 rows,
+The experiment launcher requires ExLlamaV3 1.4.8, SM80 or SM120, BF16 activations,
+1–128 rows (the original production path uses 1–8),
 1–8 selected experts per row, uniform 4-bit mul1 weights, and dimensions divisible
 by 256 in [256, 8192]. Routes must contain valid expert IDs. The input tensor's
 CUDA device must be current. One stream owns each launcher's workspace, matching
@@ -133,3 +134,37 @@ separate configuration experiment in that report. Later validation made chunk
 See the [full validation report](../../../docs/validation/exl3-moe-20260911.md)
 for all positive and negative results, quality checks, numerical limits, and
 matched-layer AWQ/NVFP4 comparisons.
+
+## Batched decode and expert reuse
+
+`batched.py` compares native M32, ordinary DP4A, small-row grouped DP4A,
+and the production sparse-INT8/hot-FP16 wrapper. Use actual decode captures:
+`benchmark_exl3.py --capture-routing-max-rows 128 --profile-case b16
+--profile-tokens 24 --capture-routing-dir /tmp/exl3-decode-routes`.
+The capture temporarily disables target-model CUDA Graph replay after performance
+measurements and saves up to four batches with their original row counts.
+Concatenated captures are a shape probe; they are not a single scheduler batch.
+
+After building the production component, no experimental library is needed:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.exl3_moe_decode.batched \
+  --checkpoint /home/bul/dev/models1/zai/turboderp/GLM-5.3-Flash-exl3/4.05bpw \
+  --route-sample /tmp/exl3-decode-routes/layer-22.pt \
+  --production --rows 12 16 32 64 128 \
+  --output /tmp/exl3-batched-decode.json
+```
+
+The microbenchmark invokes the production wrapper directly so it can compare
+identical saved routes without a scheduler. Model runs additionally validate
+pure-decode dispatch, graph reuse and end-to-end throughput. Timings exclude
+allocation and compilation, but include all GPU routing and reduction operations.
+The cache-eviction protocol is the same as above; CUPTI is unsupported on CMP 170HX.
+
+For rejected alternatives, `build.py --variant grouped` compiles M2/M4 weight
+reuse, and `--variant cold` compiles a tunable sparse/hot threshold prototype.
+Each variant also exports the ordinary DP4A factories and returns `decode.so`;
+pass the corresponding libraries as `--library`, `--grouped-library` or
+`--cold-library`. Use separate build directories. The sweep reverses candidate
+order in the second timing round and records every sample and relative L2 error.

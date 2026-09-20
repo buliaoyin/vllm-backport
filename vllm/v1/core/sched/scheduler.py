@@ -133,7 +133,7 @@ class Scheduler(SchedulerInterface):
         )
         if self.exl3_prefill_auto:
             logger.info(
-                "EXL3 auto prefill: select large chunks at 32768 uncached prompt "
+                "EXL3 auto prefill: select large chunks at 10240 uncached prompt "
                 "tokens; retain up to 6144 tokens per step until the tail. "
                 "Short prompts and active decode use at most 2048 tokens per step."
             )
@@ -449,6 +449,9 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end and not use_internal_checkpoint:
             max_prefill_tokens = self.max_num_scheduled_tokens
+            if self.exl3_prefill_auto:
+                # Short prompts and active decodes reduce the budget to 2048.
+                max_prefill_tokens = min(max_prefill_tokens, 2048)
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
@@ -524,7 +527,7 @@ class Scheduler(SchedulerInterface):
         remaining = request.num_prompt_tokens - num_computed_tokens
         if remaining < 4096 or available_tokens < 4096:
             return 2048
-        if remaining >= 32768 or request.request_id in self.exl3_int8_prefill_requests:
+        if remaining >= 10240 or request.request_id in self.exl3_int8_prefill_requests:
             self.exl3_int8_prefill_requests.add(request.request_id)
             return 6144
         return 2048

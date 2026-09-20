@@ -6187,15 +6187,16 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
     "length,count,max_seqs,cap,expected",
     [
         (8192, 1, 4, 6144, 2048),
-        (16384, 1, 4, 6144, 2048),
-        (16385, 1, 4, 6144, 2048),
-        (24576, 1, 4, 6144, 2048),
-        (32767, 1, 4, 6144, 2048),
+        (10239, 1, 4, 6144, 2048),
+        (10240, 1, 4, 6144, 6144),
+        (10241, 1, 4, 6144, 6144),
+        (16384, 1, 4, 6144, 6144),
+        (24576, 1, 4, 6144, 6144),
         (32768, 1, 4, 6144, 6144),
         (8192, 2, 4, 6144, 2048),
         (8192, 4, 4, 6144, 2048),
         (8192, 4, 1, 6144, 2048),
-        (32768, 1, 4, 1024, 1024),
+        (10240, 1, 4, 1024, 1024),
     ],
 )
 def test_exl3_adaptive_budget_preserves_short_requests(
@@ -6214,6 +6215,55 @@ def test_exl3_adaptive_budget_preserves_short_requests(
         scheduler.add_request(request)
     result = scheduler.schedule()
     assert sum(result.num_scheduled_tokens.values()) == expected
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "length,active_decode",
+    [
+        (8192, False),
+        (10239, False),
+        (10240, False),
+        (10240, True),
+        (32768, False),
+        (32768, True),
+    ],
+)
+def test_exl3_adaptive_budget_makes_progress_with_mamba_alignment(
+    async_scheduling, length, active_decode, monkeypatch
+):
+    """Adaptive chunks smaller than an MTP cache block must finish prefill."""
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    block_size = 4480
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=6144,
+        max_model_len=65536,
+        block_size=block_size,
+        enable_prefix_caching=True,
+        async_scheduling=async_scheduling,
+    )
+    scheduler.exl3_prefill_auto = True
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler.use_eagle = True
+    if active_decode:
+        short = create_requests(1, num_tokens=32, req_ids=["short"])[0]
+        scheduler.add_request(short)
+        scheduler.schedule()
+        short.append_output_token_ids(10)
+    request = create_requests(
+        1, num_tokens=length, block_size=block_size, req_ids=["prefill"]
+    )[0]
+    scheduler.add_request(request)
+    while request.num_computed_tokens < length:
+        start = request.num_computed_tokens
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens.get(request.request_id, 0) > 0
+        end = request.num_computed_tokens
+        if length < 10240 or active_decode:
+            assert output.total_num_scheduled_tokens <= 2048
+        if start % block_size:
+            assert end <= (start // block_size + 1) * block_size
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
@@ -6239,7 +6289,12 @@ def test_exl3_adaptive_budget_protects_decode(async_scheduling, monkeypatch):
     assert result.num_scheduled_tokens.get("long", 0) > 0
 
 
-def test_exl3_adaptive_budget_retains_plan_until_small_tail(monkeypatch):
+@pytest.mark.parametrize(
+    "length,expected", [(10240, [6144, 4096]), (32768, [6144] * 5 + [2048])]
+)
+def test_exl3_adaptive_budget_retains_plan_until_small_tail(
+    length, expected, monkeypatch
+):
     """A long prompt must not oscillate between native and INT8 mid-prefill."""
     monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
     scheduler = create_scheduler(
@@ -6248,13 +6303,13 @@ def test_exl3_adaptive_budget_retains_plan_until_small_tail(monkeypatch):
         max_model_len=65536,
     )
     scheduler.exl3_prefill_auto = True
-    request = create_requests(1, num_tokens=32768)[0]
+    request = create_requests(1, num_tokens=length)[0]
     scheduler.add_request(request)
     scheduled = []
     while request.num_computed_tokens < request.num_prompt_tokens:
         output = scheduler.schedule()
         scheduled.append(output.num_scheduled_tokens[request.request_id])
-    assert scheduled == [6144] * 5 + [2048]
+    assert scheduled == expected
 
 
 def test_exl3_adaptive_budget_uses_uncached_prompt_work(monkeypatch):

@@ -428,3 +428,36 @@ def test_processor_from_pretrained_resolves_hf_repo_config(
     )
     assert processor.components["tokenizer"] is tokenizer
     assert processor.components["video_processor"].max_image_tokens == 30000
+
+
+@pytest.mark.parametrize("max_tokens", [8000, 1024, 7999])
+def test_profile_image_covers_non_square_canvases(max_tokens, monkeypatch):
+    """The image-only encoder budget must admit any supported aspect ratio."""
+    from vllm.models.glm5next.nvidia.multimodal import Glm5NextProcessingInfo
+
+    processor = Glm5NextImageProcessor(max_image_tokens=max_tokens)
+    ctx = Mock()
+    ctx.get_merged_mm_kwargs.return_value = {}
+    info = Glm5NextProcessingInfo(ctx)
+    monkeypatch.setattr(
+        info, "get_hf_processor", Mock(return_value=Mock(image_processor=processor))
+    )
+    monkeypatch.setattr(
+        info,
+        "get_hf_config",
+        Mock(
+            return_value=Mock(
+                vision_config=Mock(
+                    patch_size=PATCH_SIZE,
+                    spatial_merge_size=MERGE_SIZE,
+                    temporal_patch_size=2,
+                )
+            )
+        ),
+    )
+    budget = info.get_max_image_tokens()
+    assert budget == max_tokens
+    for width, height in [(3082, 2048), (2048, 3082), (3840, 2160), (11200, 112)]:
+        assert (
+            info.get_num_image_tokens(image_width=width, image_height=height) <= budget
+        )

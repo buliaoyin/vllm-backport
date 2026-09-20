@@ -182,19 +182,28 @@ class Exl3ProfileWorkerExtension:
             ),
         }
 
-    def start_exl3_route_capture(self, directory):
+    def start_exl3_route_capture(self, directory, max_rows=None):
         """Capture four real prefill chunks at representative depths, outside timing."""
         from pathlib import Path
 
         from vllm.model_executor.layers.quantization.exl3 import Exl3MoEMethod
 
         state = {"original": Exl3MoEMethod.apply, "layers": {}, "directory": directory}
+        if max_rows is not None:
+            manager = self.model_runner.cudagraph_manager
+            state["graph_manager"] = manager
+            state["graphs_captured"] = manager._graphs_captured
+            manager._graphs_captured = False
         self._exl3_route_capture = state
         Path(directory).mkdir(parents=True, exist_ok=True)
 
         def capture(method, layer, x, topk_weights, topk_ids, *args, **kwargs):
             layer_id = int(method.prefix.split(".layers.")[1].split(".")[0])
-            if layer_id in (3, 22, 44) and x.shape[0] > 8:
+            if (
+                layer_id in (3, 22, 44)
+                and x.shape[0] > 8
+                and (max_rows is None or x.shape[0] <= max_rows)
+            ):
                 samples = state["layers"].setdefault(method.prefix, [])
                 if len(samples) < 4:
                     samples.append(
@@ -213,6 +222,8 @@ class Exl3ProfileWorkerExtension:
 
         state = self._exl3_route_capture
         Exl3MoEMethod.apply = state["original"]
+        if "graph_manager" in state:
+            state["graph_manager"]._graphs_captured = state["graphs_captured"]
         paths = []
         for prefix, samples in state["layers"].items():
             layer_id = int(prefix.split(".layers.")[1].split(".")[0])
@@ -223,6 +234,7 @@ class Exl3ProfileWorkerExtension:
             torch.save(
                 {
                     "prefix": prefix,
+                    "batch_rows": [sample[0].shape[0] for sample in samples],
                     "x": values[0],
                     "weights": values[1],
                     "ids": values[2],
@@ -441,6 +453,7 @@ class Exl3ProfileWorkerExtension:
         decoder_layers = []
         buffers = {}
         prefill_buffers = {}
+        decode_buffers = {}
         for name, module in self.get_model().named_modules():
             match = re.search(r"(?:^|\.)layers\.(\d+)$", name)
             if match and not isinstance(module, PPMissingLayer):
@@ -467,8 +480,21 @@ class Exl3ProfileWorkerExtension:
                     "int8_prefill_min_rows": method.prefill_min_rows,
                     "m_tile": method.moe_m_tile,
                     "decode_mode": ("native", "plain", "residual")[method.decode_mode],
+                    "batched_decode_mode": ("off", "plain", "residual")[
+                        method.batched_decode_mode
+                    ],
+                    "decode_slots": (
+                        method.decode_workspace.shape[0]
+                        if method.decode_workspace is not None
+                        else 0
+                    ),
                 }
             )
+            if method.decode_workspace is not None:
+                tensor = method.decode_workspace
+                decode_buffers[tensor.data_ptr()] = (
+                    tensor.numel() * tensor.element_size()
+                )
             for tensor in method.prefill_workspace:
                 prefill_buffers[tensor.data_ptr()] = (
                     tensor.numel() * tensor.element_size()
@@ -482,6 +508,7 @@ class Exl3ProfileWorkerExtension:
             "priority": envs.VLLM_EXL3_MOE_PRIORITY,
             "workspace_bytes": sum(buffers.values()),
             "int8_prefill_workspace_bytes": sum(prefill_buffers.values()),
+            "decode_workspace_bytes": sum(decode_buffers.values()),
             "cuda_allocated_bytes": torch.accelerator.memory_allocated(),
             "cuda_peak_allocated_bytes": torch.accelerator.max_memory_allocated(),
             "layers": layers,

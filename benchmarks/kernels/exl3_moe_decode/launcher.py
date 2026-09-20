@@ -117,8 +117,8 @@ class Decode:
             raise ValueError("Routes and weights must be on the input device")
         rows, k = x.shape
         n = workspace[2].shape[-1]
-        if x.dtype != torch.bfloat16 or not 1 <= rows <= 8:
-            raise ValueError("INT8 decode requires 1 to 8 BF16 rows")
+        if x.dtype != torch.bfloat16 or not 1 <= rows <= 128:
+            raise ValueError("INT8 decode requires 1 to 128 BF16 rows")
         if any(d % 256 or not 256 <= d <= 8192 for d in (k, n)):
             raise ValueError(
                 "Dimensions must be multiples of 256, between 256 and 8192"

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -741,3 +742,50 @@ def test_mamba_prefix_hit_leaves_a_block_for_speculative_replay(
     assert len(blocks) == (expected + block_size - 1) // block_size
     if expected:
         assert blocks[-1] is pool.blocks[expected // alignment]
+
+
+@pytest.mark.parametrize("concurrent_batches", [1, 2, 4])
+@pytest.mark.parametrize("speculative_blocks", [0, 5])
+@pytest.mark.parametrize("checkpoint_blocks", [0, 1])
+def test_mamba_align_memory_bound_covers_in_flight_states(
+    concurrent_batches, speculative_blocks, checkpoint_blocks
+):
+    """Auto capacity must reserve states kept until pipeline batches complete."""
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((16,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=speculative_blocks,
+        num_prefill_checkpoint_blocks=checkpoint_blocks,
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        max_concurrent_batches=concurrent_batches,
+    )
+    reserved = spec.max_memory_usage_bytes(config) // spec.page_size_bytes
+    pool = BlockPool(reserved + 1, enable_caching=True, hash_block_size=16)
+    manager = MambaManager(
+        spec, pool, enable_caching=True, kv_cache_group_id=0, scheduler_block_size=16
+    )
+    # A partial chunk after an aligned boundary may also retain a checkpoint.
+    lengths = (
+        [step * 48 + tail for step in range(10) for tail in (0, 40)][1:]
+        if checkpoint_blocks
+        else [step * 16 for step in range(1, 20)]
+    )
+    for step, tokens in enumerate(lengths):
+        completed = max(0, step - concurrent_batches + 1)
+        processed = lengths[completed - 1] if completed else 0
+        protected = [
+            manager.req_to_blocks["request"][(tokens - 1) // spec.block_size]
+            for tokens in lengths[max(0, completed - 1) : step]
+        ]
+        manager.remove_skipped_blocks("request", processed)
+        assert all(not block.is_null and block.ref_cnt > 0 for block in protected)
+        previous = lengths[step - 1] if step else 0
+        needed = manager.get_num_blocks_to_allocate(
+            "request", tokens, [], previous, 0, tokens
+        )
+        assert needed <= pool.get_num_free_blocks()
+        manager.allocate_new_blocks("request", tokens, tokens)

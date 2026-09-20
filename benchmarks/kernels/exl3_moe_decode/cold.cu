@@ -2,19 +2,17 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Adapted from ExLlamaV3 SQ GEMV; see LICENSE.
 #include "upstream/quant/exl3_gemv_int8_kernel.cuh"
-template <bool c_fp32, bool residual, bool filtered = false>
-__global__ __launch_bounds__(NUM_THREADS) void exl3_expert_gemv(
+template <bool c_fp32, bool residual>
+__global__ __launch_bounds__(NUM_THREADS) void exl3_cold_gemv(
     const half* inputs, const uint16_t* const* trellis, void* outputs,
     const half* const* input_scales, const half* const* output_scales,
-    const int64_t* ids, int* workspace, int size_k, int size_n, int top_k,
-    int input_group, int workspace_stride, const int64_t* expert_counts,
+    const int64_t* ids, int* workspace, const int64_t* counts, int size_k,
+    int size_n, int top_k, int input_group, int workspace_stride,
     int threshold) {
   constexpr int bits = 4, M = 1;
   const int slot = blockIdx.z;
   const int expert = ids[slot];
-  if constexpr (filtered) {
-    if (expert_counts[expert] >= threshold) return;
-  }
+  if (counts[expert] >= threshold) return;
   const half* A = inputs + (slot / input_group) * size_k;
   const uint16_t* B = trellis[expert];
   const half* suh = input_scales[expert];
@@ -101,15 +99,9 @@ __global__ __launch_bounds__(NUM_THREADS) void exl3_expert_gemv(
   }
 }
 
-__global__ void exl3_expert_combine(const float* input, const half* weights,
-                                    __nv_bfloat16* output, int rows, int top_k,
-                                    int hidden) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= rows * hidden) return;
-  int row = i / hidden, col = i % hidden;
-  float value = 0.f;
-  for (int j = 0; j < top_k; ++j)
-    value += input[(row * top_k + j) * hidden + col] *
-             __half2float(weights[row * top_k + j]);
-  output[i] = __float2bfloat16_rn(value);
+extern "C" void* exl3_cold_plain_half() {
+  return (void*)exl3_cold_gemv<false, false>;
+}
+extern "C" void* exl3_cold_plain_float() {
+  return (void*)exl3_cold_gemv<true, false>;
 }

@@ -2,27 +2,24 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Adapted from ExLlamaV3 SQ GEMV; see LICENSE.
 #include "upstream/quant/exl3_gemv_int8_kernel.cuh"
-template <bool c_fp32, bool residual, bool filtered = false>
-__global__ __launch_bounds__(NUM_THREADS) void exl3_expert_gemv(
+template <bool c_fp32, bool residual, int M>
+__global__ __launch_bounds__(NUM_THREADS) void exl3_grouped_gemv(
     const half* inputs, const uint16_t* const* trellis, void* outputs,
     const half* const* input_scales, const half* const* output_scales,
-    const int64_t* ids, int* workspace, int size_k, int size_n, int top_k,
-    int input_group, int workspace_stride, const int64_t* expert_counts,
-    int threshold) {
-  constexpr int bits = 4, M = 1;
+    const int64_t* ids, int* workspace, const int* group_sizes, int size_k,
+    int size_n, int workspace_stride) {
+  constexpr int bits = 4;
   const int slot = blockIdx.z;
+  const int size_m = group_sizes[slot];
+  if (size_m == 0) return;
   const int expert = ids[slot];
-  if constexpr (filtered) {
-    if (expert_counts[expert] >= threshold) return;
-  }
-  const half* A = inputs + (slot / input_group) * size_k;
+  const half* A = inputs + slot * M * size_k;
   const uint16_t* B = trellis[expert];
   const half* suh = input_scales[expert];
   const half* svh = output_scales[expert];
-  void* C = c_fp32 ? (void*)((float*)outputs + slot * size_n)
-                   : (void*)((half*)outputs + slot * size_n);
+  void* C = c_fp32 ? (void*)((float*)outputs + slot * M * size_n)
+                   : (void*)((half*)outputs + slot * M * size_n);
   int* locks = workspace + slot * workspace_stride;
-  const int size_m = 1;
   extern __shared__ uint32_t shmem[];
 
   // Work decomposition: rows_per multiple of 8 (whole 128-spans for the local
@@ -101,15 +98,15 @@ __global__ __launch_bounds__(NUM_THREADS) void exl3_expert_gemv(
   }
 }
 
-__global__ void exl3_expert_combine(const float* input, const half* weights,
-                                    __nv_bfloat16* output, int rows, int top_k,
-                                    int hidden) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= rows * hidden) return;
-  int row = i / hidden, col = i % hidden;
-  float value = 0.f;
-  for (int j = 0; j < top_k; ++j)
-    value += input[(row * top_k + j) * hidden + col] *
-             __half2float(weights[row * top_k + j]);
-  output[i] = __float2bfloat16_rn(value);
+extern "C" void* exl3_grouped_plain_half_m2() {
+  return (void*)exl3_grouped_gemv<false, false, 2>;
+}
+extern "C" void* exl3_grouped_plain_float_m2() {
+  return (void*)exl3_grouped_gemv<true, false, 2>;
+}
+extern "C" void* exl3_grouped_plain_half_m4() {
+  return (void*)exl3_grouped_gemv<false, false, 4>;
+}
+extern "C" void* exl3_grouped_plain_float_m4() {
+  return (void*)exl3_grouped_gemv<true, false, 4>;
 }

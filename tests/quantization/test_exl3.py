@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EXL3 loading preserves independently rotated matrices and expert identities."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
+from vllm.config import CUDAGraphMode
 from vllm.model_executor.layers.quantization.exl3 import (
     Exl3Config,
     Exl3LinearMethod,
@@ -70,6 +72,98 @@ def test_header_metadata_preserves_per_projection_bits(tmp_path):
                 getattr(layer, key)[offset : offset + size].view(shape), tensor
             )
     assert layer.trellis.numel() == a["trellis"].numel() + b["trellis"].numel()
+
+
+@pytest.mark.parametrize("indexed_mtp", [False, True])
+@pytest.mark.parametrize("load_mtp", [False, True])
+def test_mtp_sidecar_loads_once_without_loading_unindexed_files(
+    tmp_path, indexed_mtp, load_mtp
+):
+    """MTP metadata and weights survive a target-only index; other files do not."""
+    from vllm.config.load import LoadConfig
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    target = {f"model.layers.0.proj.{k}": v for k, v in _weights().items()}
+    mtp = {f"model.layers.1.eh_proj.{k}": v for k, v in _weights().items()}
+    save_file(target, tmp_path / "model.safetensors")
+    save_file(mtp, tmp_path / "mtp.safetensors")
+    save_file({"unused.weight": torch.ones(4, 4)}, tmp_path / "unused.safetensors")
+    index = dict.fromkeys(target, "model.safetensors")
+    if indexed_mtp:
+        index.update(dict.fromkeys(mtp, "mtp.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": index})
+    )
+
+    config = Exl3Config({})
+    config.maybe_update_config(str(tmp_path))
+    assert set(config.matrices) == {"model.layers.0.proj", "model.layers.1.eh_proj"}
+    assert config.resolve("model.layers.1.eh_proj")[0].quantized
+
+    model = nn.Module()
+    if load_mtp:
+        model.extra_safetensors_files = ("mtp.safetensors",)
+    model_config = SimpleNamespace(
+        model=str(tmp_path), revision=None, quantization="exl3"
+    )
+    loader = DefaultModelLoader(LoadConfig(use_tqdm_on_load=False))
+    weights = list(loader.get_all_weights(model_config, model))
+    expected = target | mtp if indexed_mtp or load_mtp else target
+    assert len(weights) == len(expected)
+    assert {name for name, _ in weights} == set(expected)
+    for name, value in weights:
+        torch.testing.assert_close(value, expected[name])
+
+
+@pytest.mark.parametrize("layout", ["separate", "separate_with_fallback", "fused"])
+def test_glm5next_vision_loads_exl3_qkv_with_bias(layout):
+    """Visual QKV keeps each rotation and bias, including with obsolete weights."""
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+    from vllm.models.glm5next.nvidia.multimodal import Glm5NextVisionTransformer
+
+    projections = (
+        {"qkv": _weights(n=384, bits=4)}
+        if layout == "fused"
+        else {p: _weights(n=128, bits=b) for p, b in zip("qkv", (3, 4, 6))}
+    )
+    config = Exl3Config({})
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    for proj, weights in projections.items():
+        name = f"visual.blocks.0.attn.{proj}_proj"
+        config.matrices[name] = _spec(name, weights)
+    qkv = QKVParallelLinear(
+        128,
+        64,
+        2,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="visual.blocks.0.attn.qkv_proj",
+        disable_tp=True,
+    )
+    model = Glm5NextVisionTransformer.__new__(Glm5NextVisionTransformer)
+    nn.Module.__init__(model)
+    model.blocks = nn.ModuleList([nn.Module()])
+    model.blocks[0].attn = nn.Module()
+    model.blocks[0].attn.qkv = qkv
+    tensors = {}
+    biases = []
+    for i, (proj, weights) in enumerate(projections.items()):
+        prefix = "blocks.0.attn.qkv" if proj == "qkv" else f"blocks.0.attn.{proj}_proj"
+        tensors.update({f"{prefix}.{k}": v for k, v in weights.items()})
+        bias = torch.full((384 if proj == "qkv" else 128,), i + 1, dtype=torch.bfloat16)
+        tensors[f"{prefix}.bias"] = bias
+        biases.append(bias)
+    if layout == "separate_with_fallback":
+        tensors["blocks.0.attn.qkv.weight"] = torch.zeros(384, 128)
+        tensors["blocks.0.attn.qkv.bias"] = torch.zeros(384)
+    loaded = model.load_weights(tensors.items())
+    assert loaded == set(dict(model.named_parameters()))
+    torch.testing.assert_close(qkv.bias, torch.cat(biases))
+    for i, weights in enumerate(projections.values()):
+        for key, tensor in weights.items():
+            offset, size, shape = qkv.quant_method.views[i, key]
+            actual = getattr(qkv, key)[offset : offset + size].view(shape)
+            torch.testing.assert_close(actual, tensor)
 
 
 def test_fused_qkv_and_dense_gates_keep_tuple_shard(tmp_path, monkeypatch):
@@ -169,6 +263,14 @@ def test_linear_decode_and_prefill_match_rotated_reference(
     # Plain INT8 GEMV intentionally rounds activations; retain the FP16 bound.
     assert relative < (0.015 if int8_mode == 2 else 0.006)
 
+    method = Exl3LinearMethod([_spec("proj", weights)])
+    method.weights = [weights]
+    for bias_dtype in (torch.float16, torch.float32):
+        bias = torch.randn(actual.shape[-1], device=x.device, dtype=bias_dtype)
+        original_bias = bias.clone()
+        torch.testing.assert_close(method.apply(None, x, bias), actual + bias)
+        torch.testing.assert_close(bias, original_bias)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
@@ -191,6 +293,9 @@ def _check_moe_routing(
     decode="native",
     intermediate_dim=None,
     topk=2,
+    num_experts=None,
+    cold_routes=False,
+    check_graph=False,
 ):
     if capacity is None:
         monkeypatch.delenv("VLLM_EXL3_MOE_MAX_TOKENS", raising=False)
@@ -209,7 +314,8 @@ def _check_moe_routing(
     torch.manual_seed(3)
     config = Exl3Config({})
     weights = {}
-    num_experts = 32 if rows == 513 else max(3, topk)
+    if num_experts is None:
+        num_experts = 32 if rows == 513 else max(3, topk)
     for expert in range(num_experts):
         for kind in ("gate_proj", "up_proj", "down_proj"):
             k, n = (
@@ -243,7 +349,7 @@ def _check_moe_routing(
     ids = torch.stack(
         (
             torch.full((rows,), num_experts - 1, device="cuda", dtype=torch.long),
-            torch.arange(rows, device="cuda") % 2,
+            torch.arange(rows, device="cuda") % (num_experts - 1 if cold_routes else 2),
         ),
         -1,
     )
@@ -271,7 +377,7 @@ def _check_moe_routing(
         )
     relative = (actual.float() - expected).norm() / expected.norm()
     assert relative < relative_limit
-    if rows in (3, 513, 4097):
+    if check_graph or rows in (3, 513, 4097):
         for _ in range(3):
             method.apply(layer, x, routing, ids)
         torch.accelerator.synchronize()
@@ -626,6 +732,47 @@ def test_batched_int8_prefill_routing_and_capacity(rows, hidden, monkeypatch):
     assert len(method.config.prefill_workspaces) == 1
 
 
+@pytest.mark.parametrize("group_size", [1, 4, 16])
+def test_int8_prefill_grouped_weights_preserve_routes_and_replay(
+    group_size, monkeypatch
+):
+    """Bound scratch without changing hot/empty experts, tail groups or replay."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("INT8 prefill targets SM80")
+    from vllm.model_executor.layers.quantization.utils import exl3_prefill
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", "int8")
+    monkeypatch.setenv("VLLM_EXL3_MOE_INT8_MIN_TOKENS", "9")
+    monkeypatch.setenv("VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP", str(group_size))
+    original = exl3_prefill.moe_int8
+    compared = False
+
+    def compare_once(x, routing, ids, ptrs, workspace, limit):
+        nonlocal compared
+        actual = original(x, routing, ids, ptrs, workspace, limit)
+        if not compared:
+            full = exl3_prefill.allocate_workspace(x.device, 7, 256, 512, 513, 2)
+            expected = original(x, routing, ids, ptrs, full, limit)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            compared = True
+        return actual
+
+    monkeypatch.setattr(exl3_prefill, "moe_int8", compare_once)
+    method = _check_moe_routing(
+        513,
+        2048,
+        256,
+        monkeypatch,
+        m_tile=32,
+        intermediate_dim=512,
+        num_experts=7,
+        dtype=torch.bfloat16,
+        relative_limit=0.02,
+    )
+    assert compared
+    assert method.prefill_workspace[0].numel() == min(group_size, 7) * 256 * 512
+
+
 def test_int8_prefill_large_topk_uses_native(monkeypatch):
     """Unsupported expert fan-out must fall back before allocating an INT8 pool."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
@@ -733,3 +880,124 @@ def test_int8_prefill_uses_tensor_device(monkeypatch):
             dtype=torch.bfloat16,
             relative_limit=0.02,
         )
+
+
+@pytest.mark.parametrize("rows", [9, 12, 16, 32, 96, 128])
+@pytest.mark.parametrize("residual", [False, True])
+def test_batched_decode_preserves_sparse_hot_experts_and_replay(
+    rows, residual, monkeypatch
+):
+    """Mixed expert paths preserve rotations, sparse routing and scratch reuse."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("Batched expert decode requires SM80")
+    from vllm.model_executor.layers.quantization.utils.exl3_decode import (
+        moe_batched_decode,
+    )
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_BATCHED_DECODE", "0")
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", "native")
+
+    def apply(method, layer, x, weights, ids):
+        if method.decode_workspace.shape[0] == 64:
+            method.decode_workspace = torch.zeros(
+                (1024, method.decode_workspace.shape[1]),
+                dtype=torch.int32,
+                device=x.device,
+            )
+        if rows == 12:
+            x = x.t().contiguous().t()
+        current_device = 1 if torch.accelerator.device_count() > 1 else 0
+        with torch.accelerator.device_index(current_device):
+            return moe_batched_decode(
+                x,
+                weights,
+                ids,
+                method.ptrs,
+                method.workspace,
+                method.m32_locks,
+                method.decode_workspace,
+                10.0,
+                residual,
+            )
+
+    monkeypatch.setattr(Exl3MoEMethod, "apply", apply)
+    _check_moe_routing(
+        rows,
+        256,
+        256,
+        monkeypatch,
+        relative_limit=0.02,
+        dtype=torch.bfloat16,
+        m_tile=32,
+        decode="residual" if residual else "plain",
+        intermediate_dim=512,
+        num_experts=rows + 1,
+        cold_routes=True,
+        check_graph=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata,mode,capacity,batched",
+    [
+        (SimpleNamespace(num_prefills=0, num_decodes=16), CUDAGraphMode.NONE, 16, True),
+        (SimpleNamespace(num_prefills=0, num_decodes=16), CUDAGraphMode.NONE, 8, False),
+        (SimpleNamespace(num_prefills=0, num_decodes=16), CUDAGraphMode.FULL, 16, True),
+        (
+            SimpleNamespace(num_prefills=0, num_decodes=16),
+            CUDAGraphMode.PIECEWISE,
+            16,
+            False,
+        ),
+        (
+            SimpleNamespace(num_prefills=0, num_decodes=0, num_spec_decodes=8),
+            CUDAGraphMode.FULL,
+            16,
+            True,
+        ),
+        (
+            SimpleNamespace(num_prefills=1, num_decodes=15),
+            CUDAGraphMode.NONE,
+            16,
+            False,
+        ),
+        (SimpleNamespace(num_prefills=1, num_decodes=0), CUDAGraphMode.NONE, 16, False),
+        (None, CUDAGraphMode.NONE, 16, False),
+    ],
+)
+def test_batched_decode_does_not_quantize_native_prefill(
+    metadata, mode, capacity, batched, monkeypatch
+):
+    """Short or mixed prefill cannot inherit the new decode arithmetic."""
+    from vllm import forward_context
+    from vllm.model_executor.layers.quantization import exl3
+    from vllm.model_executor.layers.quantization.utils import exl3_decode
+
+    monkeypatch.setattr(
+        forward_context,
+        "_forward_context",
+        SimpleNamespace(
+            attn_metadata={"attention": metadata}, cudagraph_runtime_mode=mode
+        ),
+    )
+    x = torch.zeros((16, 256), dtype=torch.bfloat16)
+    expected = torch.ones_like(x)
+    native = torch.full_like(x, 2)
+    monkeypatch.setattr(exl3_decode, "moe_batched_decode", lambda *args: expected)
+    monkeypatch.setattr(exl3, "_exl3_moe_fused", lambda *args: native)
+    result = exl3._exl3_moe(
+        x,
+        torch.ones((16, 2)),
+        torch.zeros((16, 2), dtype=torch.long),
+        [],
+        [torch.empty((1, capacity, 256))],
+        [],
+        [4, 4, 4],
+        [False, True] * 3,
+        10.0,
+        m32_locks=torch.zeros(1, dtype=torch.int32),
+        decode_workspace=torch.zeros((1024, 1), dtype=torch.int32),
+        decode_mode=1,
+        batched_decode_mode=1,
+    )
+    torch.testing.assert_close(result, expected if batched else native)

@@ -929,8 +929,13 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
+            # States from queued pipeline batches cannot be recycled until
+            # those batches complete; each can also retain an internal checkpoint.
             return self.page_size_bytes * (
-                2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+                1
+                + vllm_config.max_concurrent_batches
+                * (1 + self.num_prefill_checkpoint_blocks)
+                + self.num_speculative_blocks
             )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)

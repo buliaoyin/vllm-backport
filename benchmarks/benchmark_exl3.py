@@ -45,12 +45,21 @@ class VllmBackend:
             pipeline_parallel_size=args.pp,
             max_num_batched_tokens=args.chunk_size,
             enforce_eager=args.eager,
+            speculative_config=(
+                {"method": "mtp", "num_speculative_tokens": args.mtp}
+                if args.mtp
+                else None
+            ),
             gpu_memory_utilization=0.88,
             kv_cache_memory_bytes=int(args.kv_cache_gib * 1024**3),
             enable_prefix_caching=False,
             disable_log_stats=False,
             limit_mm_per_prompt={"image": 0, "video": 0},
-            compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8]},
+            compilation_config=(
+                {"cudagraph_capture_sizes": args.cudagraph_capture_sizes}
+                if args.cudagraph_capture_sizes
+                else {}
+            ),
             worker_extension_cls=(
                 args.worker_extension_cls
                 or (
@@ -72,6 +81,17 @@ class VllmBackend:
             ),
         )
         self.eos_ids = data["eos_ids"]
+        self.synchronize_inputs = args.synchronize_inputs
+
+    def speculative_counters(self):
+        from vllm.v1.metrics.reader import Counter
+
+        return {
+            metric.name: metric.value
+            for metric in self.llm.get_metrics()
+            if isinstance(metric, Counter)
+            and metric.name.startswith("vllm:spec_decode_")
+        }
 
     def generate(self, inputs, max_tokens, fixed):
         from vllm import SamplingParams
@@ -83,9 +103,17 @@ class VllmBackend:
             stop_token_ids=[] if fixed else self.eos_ids,
         )
         start = time.perf_counter()
-        outputs = self.llm.generate(
-            [{"prompt_token_ids": ids} for ids in inputs], params, use_tqdm=False
-        )
+        prompts = [{"prompt_token_ids": ids} for ids in inputs]
+        if self.synchronize_inputs and len(inputs) > 1:
+            core = self.llm.llm_engine.engine_core
+            core.call_utility("pause_scheduler", "keep", False)
+            try:
+                self.llm.enqueue(prompts, params, use_tqdm=False)
+            finally:
+                core.call_utility("resume_scheduler")
+            outputs = self.llm.wait_for_completion(use_tqdm=False)
+        else:
+            outputs = self.llm.generate(prompts, params, use_tqdm=False)
         elapsed = time.perf_counter() - start
         return elapsed, [self.output_row(output) for output in outputs]
 
@@ -263,6 +291,7 @@ def main():
     parser.add_argument("--kv-cache-gib", type=float, default=2)
     parser.add_argument("--exl-cache-tokens", type=int, default=16384)
     parser.add_argument("--warmups", type=int, default=2)
+    parser.add_argument("--warmup-tokens", type=int, help="Defaults to --tokens")
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=3)
@@ -272,6 +301,21 @@ def main():
     parser.add_argument("--skip-perf", action="store_true")
     parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument("--mtp", type=int, default=0, help="vLLM MTP draft tokens")
+    parser.add_argument(
+        "--synchronize-inputs",
+        action="store_true",
+        help="Queue each input batch before resuming the vLLM scheduler",
+    )
+    parser.add_argument(
+        "--cudagraph-capture-sizes",
+        type=int,
+        nargs="+",
+        help="Override serving graph sizes; omitted uses normal engine defaults",
+    )
+    parser.add_argument(
+        "--profile-case", help="Case name to profile; defaults to first"
+    )
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--event-profile", action="store_true")
     parser.add_argument("--profile-tokens", type=int, default=1)
@@ -279,7 +323,12 @@ def main():
     parser.add_argument("--moe-variants", type=Path)
     parser.add_argument("--worker-extension-cls", default="")
     parser.add_argument("--capture-routing-dir", type=Path)
+    parser.add_argument("--capture-routing-max-rows", type=int)
     args = parser.parse_args()
+    if args.synchronize_inputs and args.backend != "vllm":
+        parser.error("--synchronize-inputs requires the vllm backend")
+    if args.mtp < 0 or (args.mtp and args.backend != "vllm"):
+        parser.error("--mtp requires a nonnegative count and the vllm backend")
     if args.eval_batch_size is None:
         args.eval_batch_size = args.batch_size
     if not 1 <= args.eval_batch_size <= args.batch_size:
@@ -304,6 +353,13 @@ def main():
             parser.error("Input batch exceeds --batch-size")
         if any(len(ids) + args.tokens > args.max_model_len for ids in case["inputs"]):
             parser.error("Input plus output exceeds --max-model-len")
+    profile_case = data["cases"][0] if data["cases"] else None
+    if args.profile_case:
+        profile_case = next(
+            (case for case in data["cases"] if case["name"] == args.profile_case), None
+        )
+        if profile_case is None:
+            parser.error("Unknown --profile-case")
     check_tokenizer = None
     if any("expected_strings" in case for case in data["cases"]):
         from tokenizers import Tokenizer
@@ -311,9 +367,13 @@ def main():
         check_tokenizer = Tokenizer.from_file(
             str(Path(data["model"]) / "tokenizer.json")
         )
+    if (args.profile_dir or args.event_profile or args.capture_routing_dir) and (
+        profile_case is None
+    ):
+        parser.error("Profiling and routing capture require at least one case")
     result = {
         "answer_check_scope": "before_first_stop_token",
-        "warmup_new_tokens": args.tokens,
+        "warmup_new_tokens": args.warmup_tokens or args.tokens,
         "args": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
@@ -336,7 +396,9 @@ def main():
                 "VLLM_EXL3_MOE_MAX_TOKENS",
                 "VLLM_EXL3_MOE_PRIORITY",
                 "VLLM_EXL3_MOE_DECODE",
+                "VLLM_EXL3_MOE_BATCHED_DECODE",
                 "VLLM_EXL3_MOE_PREFILL",
+                "VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP",
                 "VLLM_EXL3_MOE_M_TILE",
                 "OMP_NUM_THREADS",
                 "VLLM_PP_LAYER_PARTITION",
@@ -351,6 +413,12 @@ def main():
     }
 
     def save():
+        if args.mtp:
+            result["speculative_metrics"] = [
+                vars(metric)
+                for metric in backend.llm.get_metrics()
+                if metric.name.startswith("vllm:spec_decode_")
+            ]
         temporary = args.output.with_suffix(args.output.suffix + ".tmp")
         temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2))
         temporary.replace(args.output)
@@ -370,6 +438,9 @@ def main():
     else:
         result["resolved_chunk_size"] = (
             backend.llm.llm_engine.vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        result["resolved_cudagraph_capture_sizes"] = (
+            backend.llm.llm_engine.vllm_config.compilation_config.cudagraph_capture_sizes
         )
         result["exllamav3_version"] = importlib.metadata.version("exllamav3")
         if (
@@ -437,9 +508,10 @@ def main():
                 return backend.generate(case["inputs"], tokens, True)
 
             for _ in range(args.warmups):
-                generate_case(args.tokens)
+                generate_case(args.warmup_tokens or args.tokens)
             for repeat in range(args.repeats):
                 print("MEASURE", case["name"], repeat, flush=True)
+                previous_spec = backend.speculative_counters() if args.mtp else {}
                 elapsed, rows = generate_case(args.tokens)
                 assert all(row["new_tokens"] == args.tokens for row in rows)
                 record = {
@@ -451,6 +523,11 @@ def main():
                     "throughput": sum(r["new_tokens"] for r in rows) / elapsed,
                     "rows": rows,
                 }
+                if args.mtp:
+                    record["speculative_counters"] = {
+                        key: value - previous_spec.get(key, 0)
+                        for key, value in backend.speculative_counters().items()
+                    }
                 if "expected_strings" in case:
                     assert check_tokenizer is not None
                     record["checks"] = []
@@ -474,18 +551,24 @@ def main():
                 save()
     if args.capture_routing_dir:
         backend.llm.collective_rpc(
-            "start_exl3_route_capture", args=(str(args.capture_routing_dir.resolve()),)
+            "start_exl3_route_capture",
+            args=(
+                str(args.capture_routing_dir.resolve()),
+                args.capture_routing_max_rows,
+            ),
         )
-        backend.generate(data["cases"][0]["inputs"], 1, True)
-        result["routing_samples"] = backend.llm.collective_rpc(
-            "finish_exl3_route_capture"
-        )
+        try:
+            backend.generate(profile_case["inputs"], args.profile_tokens, True)
+        finally:
+            result["routing_samples"] = backend.llm.collective_rpc(
+                "finish_exl3_route_capture"
+            )
         save()
     if args.profile_dir:
         backend.llm.start_profile()
         try:
             elapsed, rows = backend.generate(
-                data["cases"][0]["inputs"], args.profile_tokens, True
+                profile_case["inputs"], args.profile_tokens, True
             )
             result["profile"] = {"seconds": elapsed, "rows": rows}
         finally:
@@ -497,7 +580,7 @@ def main():
         )
         try:
             elapsed, rows = backend.generate(
-                data["cases"][0]["inputs"], args.profile_tokens, True
+                profile_case["inputs"], args.profile_tokens, True
             )
             result["event_profile"] = {"seconds": elapsed, "rows": rows}
         finally:

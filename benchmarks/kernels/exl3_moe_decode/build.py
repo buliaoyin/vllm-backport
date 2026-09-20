@@ -19,6 +19,9 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--nvcc", default="nvcc")
+    parser.add_argument(
+        "--variant", choices=("plain", "grouped", "cold"), default="plain"
+    )
     args = parser.parse_args()
     source = args.source.resolve()
     revision = subprocess.check_output(
@@ -52,7 +55,15 @@ def main():
         shutil.copyfile(path, target)
         hashes[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
     here = Path(__file__).resolve().parent
-    shutil.copyfile(here / "decode.cu", out / "decode.cu")
+    experiment_sources = [here / "decode.cu"]
+    if args.variant != "plain":
+        experiment_sources.append(here / f"{args.variant}.cu")
+    for path in experiment_sources:
+        shutil.copyfile(path, out / path.name)
+    translation_unit = out / "all.cu"
+    translation_unit.write_text(
+        "".join(f'#include "{path.name}"\n' for path in experiment_sources)
+    )
     shutil.copyfile(here / "LICENSE-exllamav3", out / "LICENSE")
     include = Path(torch.__file__).parent / "include"
     command = [
@@ -74,7 +85,7 @@ def main():
         "-I" + str(include),
         "-I" + str(include / "torch/csrc/api/include"),
         "-I" + str(out),
-        str(out / "decode.cu"),
+        str(translation_unit),
         "-o",
         str(out / "decode.so"),
     ]
@@ -86,7 +97,7 @@ def main():
         "command": command,
         "experiment_sha256": {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in (here / "decode.cu", Path(__file__).resolve())
+            for path in (*experiment_sources, Path(__file__).resolve())
         },
     }
     (out / "build.json").write_text(json.dumps(metadata, indent=2))

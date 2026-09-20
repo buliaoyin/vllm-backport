@@ -156,4 +156,13 @@ and [concurrent validation](../../../docs/validation/exl3-adaptive-prefill-20260
 For historical worker experiments, explicitly set `VLLM_EXL3_MOE_PREFILL=native`
 so the production dispatcher and adaptive scheduler do not supersede the
 experimental worker. Keep the original source/library hashes in experiment
-records. Direct kernel benchmarks in this directory still exercise the prototype.
+records. The original `benchmark.py` still exercises the prototype;
+`grouped_workspace.py` below exercises the production path.
+
+## Bounded production workspace
+
+`grouped_workspace.py` compares the production INT8 wrapper with all experts
+resident (`--groups 0`), 64 experts per group, and 32 per group. It loads captured
+routes and original checkpoint weights; no experimental library is required.
+`--hot-routes` also checks a skewed route with all tokens assigned to the final
+eight experts. The full wrapper, including routing and reconstruction, is timed.

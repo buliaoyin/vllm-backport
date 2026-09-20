@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash vision tower and multimodal processor."""
 
+import math
 from collections.abc import Mapping
 from functools import cached_property, partial
 
@@ -340,6 +341,9 @@ class Glm5NextVisionTransformer(nn.Module):
             ".attn.q.": (".attn.qkv.", "q"),
             ".attn.k.": (".attn.qkv.", "k"),
             ".attn.v.": (".attn.qkv.", "v"),
+            ".attn.q_proj.": (".attn.qkv.", "q"),
+            ".attn.k_proj.": (".attn.qkv.", "k"),
+            ".attn.v_proj.": (".attn.qkv.", "v"),
             ".gate_proj": (".gate_up_proj", 0),
             ".up_proj": (".gate_up_proj", 1),
         }
@@ -607,6 +611,18 @@ class Glm5NextVisionTransformer(nn.Module):
         return x
 
     def load_weights(self, weights) -> set[str]:
+        from vllm.model_executor.layers.quantization.exl3 import Exl3LinearMethod
+
+        # EXL3 exports can retain the original fused FP16 QKV alongside the
+        # independently quantized projections. Load the latter, including bias.
+        ignored = {
+            f"blocks.{i}.attn.qkv.{component}"
+            for i, block in enumerate(self.blocks)
+            if isinstance(block.attn.qkv.quant_method, Exl3LinearMethod)
+            and len(block.attn.qkv.quant_method.parts) == 3
+            for component in ("weight", "bias")
+        }
+        weights = ((name, value) for name, value in weights if name not in ignored)
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
@@ -649,6 +665,18 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
         return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        proc = self.get_hf_processor().image_processor
+        factor = proc.patch_size * proc.merge_size * proc.patch_expand_factor
+        cells = max(
+            self._get_image_max_pixels() // (proc.temporal_patch_size * factor**2), 1
+        )
+        # A square can leave unused tokens and underestimate rectangular inputs.
+        height = math.isqrt(cells)
+        while cells % height:
+            height -= 1
+        return ImageSize(width=cells // height * factor, height=height * factor)
 
     def _get_video_max_pixels(self) -> int:
         mm_kwargs = self.ctx.get_merged_mm_kwargs({})
