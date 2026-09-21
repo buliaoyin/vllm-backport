@@ -78,7 +78,7 @@ ranks it selects this backend for at least 4096 input rows. Smaller inputs use
 the original expert path; SM120 retains the original dispatch.
 
 Use chunk 6144 with the ordinary projection FP16 cache disabled. The
-[cache ablation](../../../docs/validation/exl3-linear-cache-20260911.md) measures
+cache ablation (local archive: `docs/validation/exl3-linear-cache-20260911.md`) measures
 its small throughput contribution against 10.09 GiB of resident weight copies
 across the three SM80 ranks. The original 4700-target confirmation used a
 4 GiB cache budget per SM80; its recorded results retain that configuration.
@@ -86,6 +86,10 @@ across the three SM80 ranks. The original 4700-target confirmation used a
 The archived inputs refer to the local GLM checkpoint; change only the model
 path when reproducing on another machine. Run from the repository root in a
 shell without other EXL3 experiment overrides:
+
+The command below uses inputs from the local validation archive, which is
+not included in the repository. Set `--inputs` to your own input file when
+running from a fresh checkout.
 
 ```bash
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -125,8 +129,7 @@ the `VLLM_EXL3_BATCHED_INT8_*` and cache variables, set both chunk and
 For GLM on three CMP 170HX GPUs, the tested long-input configuration uses
 `CUDA_VISIBLE_DEVICES=0,1,2`, PP `16,15,14`, chunk 6144, and 2 GiB KV cache per
 rank with `PYTORCH_ALLOC_CONF=expandable_segments:True`. Keep the ordinary
-projection cache disabled. The [three-GPU validation
-report](../../../docs/validation/exl3-3x170hx-20260911.md) includes the full
+projection cache disabled. The three-GPU validation report (local archive: `docs/validation/exl3-3x170hx-20260911.md`) includes the full
 command, partition/chunk search, startup memory limits, and 8K–64K throughput.
 The three-GPU B1 measurements favor native M32 / chunk 2048 at 8K–16K and
 INT8 / chunk 6144 at 32K–64K. This deployment choice does not change production
@@ -139,7 +142,7 @@ This forces short prompts through the new arithmetic. It is a quality check
 configuration, not the measured serving policy. Inspect actual backend calls
 and restore the 4096 threshold for performance measurements.
 
-The [validation report](../../../docs/validation/exl3-target4700-20260911.md)
+The validation report (local archive: `docs/validation/exl3-target4700-20260911.md`)
 includes all samples, shorter-input regressions, quality limits, memory costs,
 source hashes and the exact measurement script (`benchmark_model.py.gz`). The
 public benchmark supports the same explicit batching and runtime inspection;
@@ -151,7 +154,7 @@ The validated arithmetic now lives in `_exl3_C` and
 `vllm/model_executor/layers/quantization/utils/exl3_prefill.py`. Normal inference
 uses `VLLM_EXL3_MOE_PREFILL=auto|native|int8` (default `native`) and does not use this worker or
 `helpers.so`. See [the production guide](../../../docs/features/quantization/exl3.md)
-and [concurrent validation](../../../docs/validation/exl3-adaptive-prefill-20260912.md).
+and concurrent validation (local archive: `docs/validation/exl3-adaptive-prefill-20260912.md`).
 
 For historical worker experiments, explicitly set `VLLM_EXL3_MOE_PREFILL=native`
 so the production dispatcher and adaptive scheduler do not supersede the

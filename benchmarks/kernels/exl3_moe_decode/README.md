@@ -19,7 +19,7 @@ the integration's existing single-stream restriction. Other formats and shapes
 are rejected by the experiment launcher. The validated hybrid policy is now
 bundled in production `_exl3_C` and defaults to `VLLM_EXL3_MOE_DECODE=hybrid`;
 production falls back for unsupported configurations. See the
-[default validation](../../../docs/validation/exl3-hybrid-default-20260911.md).
+default validation (local archive: `docs/validation/exl3-hybrid-default-20260911.md`).
 
 ## Build and verify
 
@@ -131,7 +131,7 @@ but reduces its 8K throughput by 5.9% and doubles the expert workspace. It is a
 separate configuration experiment in that report. Later validation made chunk
 2048, safe M32 on SM80, and hybrid expert decode the production defaults.
 
-See the [full validation report](../../../docs/validation/exl3-moe-20260911.md)
+See the full validation report (local archive: `docs/validation/exl3-moe-20260911.md`)
 for all positive and negative results, quality checks, numerical limits, and
 matched-layer AWQ/NVFP4 comparisons.
 

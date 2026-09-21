@@ -1,7 +1,0 @@
-{
-  "/home/bul/dev/vllm-backport/benchmarks/benchmark_exl3.py": "5a158e15cab9d1314b2e270d0e8f460dbd3fe3f2cedfd28c907e6d11c60dd334",
-  "/home/bul/dev/vllm-backport/benchmarks/exl3_profile_worker.py": "a5169226a9f3b18e7658799203f776553161cf89ee9ccaa4a246b94f84fb6045",
-  "/home/bul/dev/vllm-backport/benchmarks/kernels/benchmark_exl3_moe.py": "93fbab5f984eb8712b2d47d69954690055126236bf062cc305d51390ac21e8f0",
-  "/home/bul/dev/vllm-backport/vllm/model_executor/layers/quantization/exl3.py": "cb7325d7d2cef4f82e90c88f32e4cef0347ffea9581706d47f773fe5ae3c04f3",
-  "/home/bul/dev/vllm-backport/.venv/lib/python3.12/site-packages/exllamav3_ext.cpython-312-x86_64-linux-gnu.so": "5b0fd28b757ee9b7f01dee0b1966a87027ca0c2d99fb432242ed677da1a4def9"
-}

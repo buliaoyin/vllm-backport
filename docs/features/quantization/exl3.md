@@ -106,7 +106,7 @@ Full-precision projections remain full precision. Converted calibration
   expert selections during CUDA Graph replay.
 
 The initial model validation covers Qwen3.5 dense and GLM5Next MoE text inference.
-[Long-context validation](../../validation/exl3-long-context-20260910.md)
+Long-context validation (local archive: `docs/validation/exl3-long-context-20260910.md`)
 extends the two tested checkpoints to 65536 input tokens with one or four
 submitted requests. The report records hardware, cache capacity, timing and
 basic retrieval checks; this does not establish a general context limit.
@@ -191,7 +191,7 @@ performance recommendation.
 
 The auto threshold is 10240 tokens, inclusive. This threshold is a policy
 setting, not a universal performance crossover. See the
-[concurrent validation](../../validation/exl3-adaptive-prefill-20260912.md)
+concurrent validation (local archive: `docs/validation/exl3-adaptive-prefill-20260912.md`)
 for the original 32768-token policy's TTFT, throughput, output gaps and accuracy, and the
 [design](../../design/exl3-adaptive-prefill.md) for cache and lifecycle behavior.
 
@@ -264,7 +264,7 @@ not reserve the INT8 pool; native-only configurations retain their native scratc
 Setting the scheduler token budget to 1024 also caps expert workspace capacity
 at 1024, halving the main workspace. Workspace memory grows
 linearly with capacity and with the extension's number of concurrent expert
-groups. See the [optimization experiments](../../validation/exl3-optimization-20260910.md)
+groups. See the optimization experiments (local archive: `docs/validation/exl3-optimization-20260910.md`)
 for kernel ablations and complete-model measurements.
 
 ExLlamaV3 controls its optional INT8 GEMV path through `EXL3_INT8_GEMV`. Use
@@ -275,9 +275,9 @@ Set these variables before starting the process. Mode 2 is
 the upstream default and uses approximate INT8 activations; its numerical error
 is evaluated separately from the stricter FP16 path. It affects eligible ordinary
 GEMVs, not the routed-expert decode policy or M32 prefill. See the
-[combined INT8 measurements](../../validation/exl3-int8-combination-20260911.md)
+combined INT8 measurements (local archive: `docs/validation/exl3-int8-combination-20260911.md`)
 for ordinary GEMV comparisons and the
-[default expert decode validation](../../validation/exl3-hybrid-default-20260911.md)
+default expert decode validation (local archive: `docs/validation/exl3-hybrid-default-20260911.md`)
 for the separate expert policy comparison, accuracy limits and runtime defaults.
 
 ## Reproducing checks

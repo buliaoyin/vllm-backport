@@ -4,7 +4,7 @@ This opt-in prototype uses `mma.m16n8k32.s32.s8.s8` for 32 expert rows,
 reusing decoded weights across both M=16 fragments. It is a benchmark experiment,
 not a serving default. Kernel gains are small and must be checked against model
 quality and request latency; see
-[the validation report](../../../docs/validation/exl3-int8-20260911.md).
+the validation report (local archive: `docs/validation/exl3-int8-20260911.md`).
 
 Input rotations, gate/up activation, output rotations, expert scheduling and
 routing remain in the fused expert kernel. Activations are quantized once per
