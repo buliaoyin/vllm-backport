@@ -20,22 +20,51 @@ BETA = 1534 * ALPHA + struct.unpack("<e", bytes.fromhex("31c9"))[0]
 def allocate_workspace(
     device, experts, hidden, intermediate, capacity, topk, experts_per_group=0
 ):
-    """Allocate once per device/shape before KV cache memory profiling."""
+    """Return INT8 views followed by their arena, also reusable by native MoE."""
+    if experts_per_group is None:
+        # The measured GLM shape fits 48 experts in its FP16 gather buffer.
+        shape = (experts, hidden, intermediate, capacity, topk)
+        experts_per_group = 48 if shape == (288, 4096, 2048, 6144, 8) else 64
     if experts_per_group < 0:
         raise ValueError("EXL3 experts per group must be nonnegative (0 means all)")
     group_size = min(experts_per_group or experts, experts)
     slots = capacity * topk
-    return [
-        torch.empty(
-            group_size * hidden * intermediate, device=device, dtype=torch.int8
-        ),
-        torch.empty((slots, hidden), device=device, dtype=torch.float16),
-        torch.empty((slots, intermediate), device=device, dtype=torch.float16),
-        torch.empty((slots, intermediate), device=device, dtype=torch.float16),
-        torch.empty(slots * max(hidden, intermediate), device=device, dtype=torch.int8),
-        torch.empty(slots, device=device, dtype=torch.float32),
-        torch.empty(slots, device=device, dtype=torch.float32),
-    ]
+    weight_bytes = group_size * hidden * intermediate
+    input_bytes = 2 * slots * hidden
+    gate_bytes = 2 * slots * intermediate
+    phase_bytes = max(weight_bytes, input_bytes) + max(input_bytes, 2 * gate_bytes)
+    up_bytes = weight_bytes + max(input_bytes, gate_bytes) + gate_bytes
+    reuse_phases = phase_bytes <= up_bytes
+    scratch_bytes = min(phase_bytes, up_bytes)
+    quantized_bytes = slots * max(hidden, intermediate)
+    scales_offset = (scratch_bytes + quantized_bytes + 3) // 4 * 4
+    arena = torch.empty(scales_offset + 8 * slots, device=device, dtype=torch.int8)
+
+    def half_view(offset, width):
+        return (
+            arena[offset : offset + 2 * slots * width]
+            .view(torch.float16)
+            .view(slots, width)
+        )
+
+    weight = arena[:weight_bytes]
+    if reuse_phases:
+        # Quantization consumes gather before reconstruction overwrites it.
+        gather = half_view(0, hidden)
+        output_offset = max(weight_bytes, input_bytes)
+        gate = half_view(output_offset, intermediate)
+        up = half_view(output_offset + gate_bytes, intermediate)
+        stage = half_view(output_offset, hidden)
+    else:
+        # Wide hidden states can make stage/up reuse smaller than phase reuse.
+        stage = half_view(weight_bytes, hidden)
+        up = half_view(weight_bytes, intermediate)
+        gate = half_view(weight_bytes + max(input_bytes, gate_bytes), intermediate)
+        gather = stage
+    quantized = arena[scratch_bytes : scratch_bytes + quantized_bytes]
+    scales = arena[scales_offset : scales_offset + 4 * slots].view(torch.float32)
+    sums = arena[scales_offset + 4 * slots :].view(torch.float32)
+    return [weight, stage, gate, up, quantized, scales, sums, gather, arena]
 
 
 def moe_int8(x, topk_weights, topk_ids, ptrs, workspace, limit):
@@ -49,7 +78,7 @@ def moe_int8(x, topk_weights, topk_ids, ptrs, workspace, limit):
 
 
 def _moe_int8(x, topk_weights, topk_ids, ptrs, workspace, limit):
-    weight, stage, gate, up, quantized, scales, sums = workspace
+    weight, stage, gate, up, quantized, scales, sums, gather, _ = workspace
     rows, hidden = x.shape
     experts, topk = ptrs[0].numel(), topk_ids.shape[1]
     slots = rows * topk
@@ -58,6 +87,7 @@ def _moe_int8(x, topk_weights, topk_ids, ptrs, workspace, limit):
     if slots > stage.shape[0]:
         raise ValueError("EXL3 INT8 prefill workspace capacity exceeded")
     stage, gate, up = stage[:slots], gate[:slots], up[:slots]
+    gather = gather[:slots]
     inp = x.to(torch.float16).contiguous()
     ids = topk_ids.to(torch.int64).contiguous().flatten()
     routing = topk_weights.to(torch.float16).contiguous().flatten()
@@ -124,8 +154,8 @@ def _moe_int8(x, topk_weights, topk_ids, ptrs, workspace, limit):
             )
 
     for i, destination in ((0, gate), (1, up)):
-        ops.prefill_gather(inp, ids, ptrs[i * 3 + 1], stage, topk)
-        gemm(stage, ptrs[i * 3], destination)
+        ops.prefill_gather(inp, ids, ptrs[i * 3 + 1], gather, topk)
+        gemm(gather, ptrs[i * 3], destination)
     ops.prefill_activate(gate, up, ids, ptrs[2], ptrs[5], ptrs[7], limit)
     gemm(gate, ptrs[6], stage)
     ops.prefill_scatter(stage, ids, routing, ptrs[8], output, topk)

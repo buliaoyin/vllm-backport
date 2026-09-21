@@ -232,19 +232,34 @@ to 84 MiB with the default `hybrid` or explicit `plain` policy, or 148 MiB with
 `residual`, shared across matching layers and allocated before KV profiling.
 Relative to the original SM80 path, the increments are 78.75 and 142.75 MiB
 per rank, respectively.
-INT8 prefill reconstructs at most 64 experts at a time, reusing a single weight
-buffer across groups and projections. For the GLM shape (288 experts, top-8,
-6144 rows), the additional pool is about 1.438 GiB per rank, down from 3.188 GiB
-with all experts resident. `VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP=32` reduces it to
-1.188 GiB; `0` restores full expansion. Set this variable before process startup.
-Grouping preserves the token chunk and
-INT8 arithmetic. Activations are quantized once per projection, and GPU routing
-bounds keep each GEMM within its expert group, including hot groups and tails.
-The bounded pool is allocated before KV cache profiling; switching input lengths
-does not create additional pools. Auto
-falls back to native if that allocation fails, while explicit `int8` reports the
-allocation failure. Model and KV budgets must still fit the device. An auto
-engine configured for a context shorter than 10240 tokens does not reserve this pool.
+INT8 prefill reconstructs one expert group at a time. When
+`VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP` is unset, the tested GLM shape (288 experts,
+hidden size 4096, intermediate size 2048, top-8, 6144-row INT8 capacity) uses
+48 experts per group; other shapes use 64. Set a positive integer to override
+the group size, or `0` to reconstruct all experts at once. Set this variable
+before process startup. Grouping preserves the token chunk and INT8 arithmetic.
+Activations are quantized once per projection, and GPU routing bounds keep each
+GEMM within its expert group, including hot groups and tails.
+
+INT8 temporaries share one arena, reusing storage after each projection consumes
+its inputs. The allocator compares phase reuse with stage/up reuse and selects
+the smaller layout. Native MoE also uses views into this arena when its scratch
+fits; otherwise its separate allocation is reserved before the optional INT8
+pool, preserving native fallback under memory pressure. The paths run serially
+on the caller's stream. Decode scratch and synchronization locks remain independent.
+For the GLM shape above on CMP 170HX, native and INT8 together use about
+0.938 GiB per rank with the default 48-expert groups, saving 896 MiB per rank
+compared with separate native and INT8 allocations. The 384 MiB native scratch
+is already included in this total. Explicit groups of 64, 32 and 0 use about
+1.063, 0.938 and 2.813 GiB, respectively. Count unique backing storage when
+measuring these pools; summing overlapping tensor views overstates allocation.
+
+The arena is allocated before KV cache profiling and CUDA Graph capture;
+switching input lengths does not create additional pools or change their
+addresses. Auto falls back to native if that allocation fails, while explicit
+`int8` reports the allocation failure. Model and KV budgets must still fit the
+device. An auto engine configured for a context shorter than 10240 tokens does
+not reserve the INT8 pool; native-only configurations retain their native scratch.
 
 Setting the scheduler token budget to 1024 also caps expert workspace capacity
 at 1024, halving the main workspace. Workspace memory grows

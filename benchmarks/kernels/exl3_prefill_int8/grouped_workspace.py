@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--routes", type=Path, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows", type=int, nargs="+", default=[4096, 4480, 6144])
-    parser.add_argument("--groups", type=int, nargs="+", default=[0, 64, 32])
+    parser.add_argument("--groups", type=int, nargs="+", default=[0, 64, 48, 32])
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=15)
     parser.add_argument("--hot-routes", action="store_true")
@@ -125,7 +125,8 @@ def main():
                             "graph_relative_l2": graph_error,
                             "max_abs": delta.abs().max().item(),
                             "identical_fraction": (delta == 0).float().mean().item(),
-                            "workspace_bytes": [
+                            "workspace_bytes": workspaces[group][-1].numel(),
+                            "workspace_view_bytes": [
                                 t.numel() * t.element_size() for t in workspaces[group]
                             ],
                             "active_experts": (counts > 0).sum().item(),

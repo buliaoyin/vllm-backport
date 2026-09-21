@@ -559,20 +559,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 capacity, vllm_config.scheduler_config.max_num_batched_tokens
             )
         key = (device, self.hidden_size, self.intermediate_size, capacity)
-        if key not in self.config.workspaces:
-            concurrency = ext.exl3_moe_max_concurrency(device.index)
-            self.config.workspaces[key] = [
+        concurrency = ext.exl3_moe_max_concurrency(device.index)
+        widths = (
+            self.hidden_size,
+            self.hidden_size,
+            self.intermediate_size,
+            self.intermediate_size,
+        )
+        sizes = [concurrency * capacity * width for width in widths]
+
+        def allocate_native_workspace():
+            return [
                 torch.empty(
                     (concurrency, capacity, width), device=device, dtype=torch.float16
                 )
-                for width in (
-                    self.hidden_size,
-                    self.hidden_size,
-                    self.intermediate_size,
-                    self.intermediate_size,
-                )
+                for width in widths
             ]
-        self.workspace = self.config.workspaces[key]
+
         capability = current_platform.get_device_capability(device.index)
         supports_native = (
             tuple(self.bits) == (4, 4, 4)
@@ -614,7 +617,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 envs.VLLM_EXL3_MOE_BATCHED_DECODE
                 and capability == (8, 0)
                 and self.m32_locks is not None
-                and self.workspace[0].shape[1] >= 9
+                and capacity >= 9
                 and self.moe.experts_per_token <= 8
                 and 32 <= self.num_experts <= 1024
                 and self.hidden_size * self.intermediate_size >= 4096 * 2048
@@ -688,6 +691,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
                 if prefill_key not in self.config.prefill_workspaces:
                     try:
+                        if key not in self.config.workspaces:
+                            planned = allocate_workspace("meta", *prefill_key[1:])
+                            if 2 * sum(sizes) > planned[-1].numel():
+                                # Reserve required native scratch before optional INT8.
+                                self.config.workspaces[key] = (
+                                    allocate_native_workspace()
+                                )
                         buffers = allocate_workspace(*prefill_key)
                     except torch.OutOfMemoryError:
                         if prefill == "int8":
@@ -706,7 +716,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                             "(native capacity %d).",
                             self.prefill_min_rows,
                             int8_capacity,
-                            sum(t.numel() * t.element_size() for t in buffers) / 2**30,
+                            buffers[-1].numel() / 2**30,
                             buffers[0].numel()
                             // (self.hidden_size * self.intermediate_size),
                             capacity,
@@ -719,6 +729,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "EXL3 INT8 prefill is unavailable for this device or expert format; "
                 "using native expert prefill."
             )
+
+        if key not in self.config.workspaces:
+            arena = self.prefill_workspace[-1] if self.prefill_workspace else None
+            if arena is not None and 2 * sum(sizes) <= arena.numel():
+                # Both paths serialize on the caller's stream; locks stay separate.
+                native = arena[: 2 * sum(sizes)].view(torch.float16)
+                self.config.workspaces[key] = [
+                    tensor.view(concurrency, capacity, width)
+                    for tensor, width in zip(native.split(sizes), widths)
+                ]
+                logger.info_once("EXL3 native MoE reuses the INT8 prefill workspace.")
+            else:
+                self.config.workspaces[key] = allocate_native_workspace()
+        self.workspace = self.config.workspaces[key]
 
     def apply(
         self,

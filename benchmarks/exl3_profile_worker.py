@@ -453,6 +453,7 @@ class Exl3ProfileWorkerExtension:
         decoder_layers = []
         buffers = {}
         prefill_buffers = {}
+        combined_buffers = {}
         decode_buffers = {}
         for name, module in self.get_model().named_modules():
             match = re.search(r"(?:^|\.)layers\.(\d+)$", name)
@@ -478,6 +479,12 @@ class Exl3ProfileWorkerExtension:
                         else 0
                     ),
                     "int8_prefill_min_rows": method.prefill_min_rows,
+                    "int8_prefill_experts_per_group": (
+                        method.prefill_workspace[0].numel()
+                        // (method.hidden_size * method.intermediate_size)
+                        if method.prefill_workspace
+                        else 0
+                    ),
                     "m_tile": method.moe_m_tile,
                     "decode_mode": ("native", "plain", "residual")[method.decode_mode],
                     "batched_decode_mode": ("off", "plain", "residual")[
@@ -496,11 +503,13 @@ class Exl3ProfileWorkerExtension:
                     tensor.numel() * tensor.element_size()
                 )
             for tensor in method.prefill_workspace:
-                prefill_buffers[tensor.data_ptr()] = (
-                    tensor.numel() * tensor.element_size()
-                )
+                storage = tensor.untyped_storage()
+                prefill_buffers[storage.data_ptr()] = storage.nbytes()
+                combined_buffers[storage.data_ptr()] = storage.nbytes()
             for tensor in method.workspace:
                 buffers[tensor.data_ptr()] = tensor.numel() * tensor.element_size()
+                storage = tensor.untyped_storage()
+                combined_buffers[storage.data_ptr()] = storage.nbytes()
         return {
             "gpu": torch.cuda.get_device_name(),
             "pp_rank": get_pp_group().rank_in_group,
@@ -508,6 +517,7 @@ class Exl3ProfileWorkerExtension:
             "priority": envs.VLLM_EXL3_MOE_PRIORITY,
             "workspace_bytes": sum(buffers.values()),
             "int8_prefill_workspace_bytes": sum(prefill_buffers.values()),
+            "combined_native_int8_workspace_bytes": sum(combined_buffers.values()),
             "decode_workspace_bytes": sum(decode_buffers.values()),
             "cuda_allocated_bytes": torch.accelerator.memory_allocated(),
             "cuda_peak_allocated_bytes": torch.accelerator.max_memory_allocated(),

@@ -191,7 +191,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_BATCHED_DECODE: bool = True
     VLLM_EXL3_MOE_PREFILL: str = "native"
     VLLM_EXL3_MOE_INT8_MIN_TOKENS: int = 4096
-    VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP: int = 64
+    VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP: int | None = None
     VLLM_EXL3_MOE_PRIORITY: bool = True
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MHC_AR_INT8: bool = False
@@ -1581,9 +1581,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_INT8_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_EXL3_MOE_INT8_MIN_TOKENS", "4096")
     ),
-    # Bound temporary INT8 expert weights; 0 reconstructs all experts at once.
-    "VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP": lambda: int(
-        os.getenv("VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP", "64")
+    # Unset selects a tuned group size; 0 reconstructs all experts at once.
+    "VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP": lambda: maybe_convert_int(
+        os.environ.get("VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP")
     ),
     # Schedule larger EXL3 experts first to reduce the final wave of work.
     "VLLM_EXL3_MOE_PRIORITY": lambda: os.getenv("VLLM_EXL3_MOE_PRIORITY", "1") == "1",

@@ -698,6 +698,151 @@ def test_experimental_batched_int8_prefill(rows, hidden, monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "group,expected_group,expected_mib",
+    [(None, 48, 960.375), (32, 32, 960.375), (64, 64, 1088.375), (0, 288, 2880.375)],
+)
+def test_int8_workspace_glm_memory_budget_and_group_override(
+    group, expected_group, expected_mib, monkeypatch
+):
+    """The tuned default fits the memory budget without ignoring overrides."""
+    from vllm import envs
+    from vllm.model_executor.layers.quantization.utils.exl3_prefill import (
+        allocate_workspace,
+    )
+
+    if group is None:
+        monkeypatch.delenv("VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP", str(group))
+    workspace = allocate_workspace(
+        "meta", 288, 4096, 2048, 6144, 8, envs.VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP
+    )
+    assert workspace[0].numel() == expected_group * 4096 * 2048
+    assert workspace[-1].numel() == int(expected_mib * 2**20)
+    # Other capacities retain the prior group width unless explicitly overridden.
+    other = allocate_workspace("meta", 288, 4096, 2048, 4096, 8, None)
+    assert other[0].numel() == 64 * 4096 * 2048
+
+
+@pytest.mark.parametrize("hidden,intermediate", [(256, 512), (512, 256), (2048, 256)])
+def test_int8_workspace_preserves_live_values_across_projection_phases(
+    hidden, intermediate
+):
+    """Aliasing must preserve live GEMM operands for both expansion directions."""
+    from vllm.model_executor.layers.quantization.utils.exl3_prefill import (
+        allocate_workspace,
+    )
+
+    weight, stage, gate, up, q, scales, sums, gather, arena = allocate_workspace(
+        "cpu", 7, hidden, intermediate, 513, 2, 1
+    )
+    old_bytes = (
+        weight.numel()
+        + 2 * 513 * 2 * (hidden + 2 * intermediate)
+        + q.numel()
+        + 8 * 513 * 2
+    )
+    assert arena.numel() <= old_bytes
+    gather.fill_(1)
+    q.fill_(2)
+    scales.fill_(3)
+    sums.fill_(4)
+    assert torch.all(gather == 1)
+    gate.fill_(5)
+    weight.fill_(6)
+    assert torch.all(q == 2)
+    gather.fill_(7)
+    assert torch.all(gate == 5)
+    q.fill_(8)
+    assert torch.all(gather == 7)
+    up.fill_(9)
+    assert torch.all(gate == 5) and torch.all(q == 8)
+    gate.fill_(10)
+    assert torch.all(up == 9)
+    q.fill_(11)
+    assert torch.all(gate == 10)
+    weight.fill_(12)
+    stage.fill_(13)
+    assert torch.all(q == 11) and torch.all(weight == 12)
+    assert torch.all(scales == 3) and torch.all(sums == 4)
+
+
+@pytest.mark.parametrize("int8_capacity,num_experts", [(128, 7), (512, 3)])
+@pytest.mark.parametrize("native_capacity", [32, 2048])
+def test_native_int8_workspace_switching_and_graph_replay(
+    int8_capacity, num_experts, native_capacity, monkeypatch
+):
+    """Shared/fallback pools survive native tails and replay after being overwritten."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("Native EXL3 INT8 prefill targets SM80")
+    from vllm.model_executor.layers.quantization import exl3
+    from vllm.model_executor.layers.quantization.utils import exl3_prefill
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", "int8")
+    monkeypatch.setenv("VLLM_EXL3_MOE_INT8_MIN_TOKENS", "64")
+    monkeypatch.delenv("VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP", raising=False)
+    monkeypatch.setattr(exl3_prefill, "INT8_MAX_ROWS", int8_capacity)
+    original = Exl3MoEMethod.apply
+    checked = False
+
+    def check(method, layer, x, routing, ids):
+        nonlocal checked
+        if not checked:
+            checked = True
+            arena = method.prefill_workspace[-1]
+            shared = all(
+                t.untyped_storage().data_ptr() == arena.data_ptr()
+                for t in method.workspace
+            )
+            assert shared == (native_capacity == 32)
+            native = [torch.empty_like(t) for t in method.workspace]
+            prefill = [torch.empty_like(t) for t in method.prefill_workspace]
+            for _ in range(3):
+                original(method, layer, x, routing, ids)
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = original(method, layer, x, routing, ids)
+            for rows in (33, int8_capacity, 1, 7):
+                original(method, layer, x[:rows], routing[:rows], ids[:rows])
+                arena.fill_(-1)
+                graph.replay()
+                expected = exl3._exl3_moe(
+                    x,
+                    routing,
+                    ids,
+                    method.ptrs,
+                    native,
+                    prefill,
+                    method.bits,
+                    method.flags,
+                    10.0,
+                    method.m32_locks,
+                    method.decode_workspace,
+                    method.decode_mode,
+                    64,
+                )
+                relative = (captured.float() - expected.float()).norm()
+                relative /= expected.float().norm()
+                assert torch.isfinite(captured).all() and relative < 2e-4
+        return original(method, layer, x, routing, ids)
+
+    monkeypatch.setattr(Exl3MoEMethod, "apply", check)
+    _check_moe_routing(
+        int8_capacity + 1,
+        native_capacity,
+        512,
+        monkeypatch,
+        m_tile=32,
+        intermediate_dim=256,
+        num_experts=num_experts,
+        dtype=torch.bfloat16,
+        relative_limit=0.02,
+    )
+    assert checked
+
+
 @pytest.mark.parametrize("rows", [4095, 4096, 4097, 6145])
 @pytest.mark.parametrize("hidden", [256, 768])
 def test_batched_int8_prefill_routing_and_capacity(rows, hidden, monkeypatch):
@@ -797,10 +942,29 @@ def test_int8_prefill_workspace_oom_fallback(policy, monkeypatch):
     from vllm.model_executor.layers.quantization.utils import exl3_prefill
 
     monkeypatch.setenv("VLLM_EXL3_MOE_PREFILL", policy)
+    allocate = exl3_prefill.allocate_workspace
+    empty = torch.empty
+    native = []
 
-    def unavailable(*args):
+    def record_empty(*args, **kwargs):
+        result = empty(*args, **kwargs)
+        if (
+            result.is_cuda
+            and result.dtype == torch.float16
+            and result.ndim == 3
+            and result.shape[1:] == (2048, 256)
+        ):
+            native.append(result)
+        return result
+
+    def unavailable(device, *args):
+        if device == "meta":
+            return allocate(device, *args)
+        # This native pool is larger than INT8's; it must be reserved first.
+        assert len(native) == 4
         raise torch.OutOfMemoryError("test workspace reservation failure")
 
+    monkeypatch.setattr(torch, "empty", record_empty)
     monkeypatch.setattr(exl3_prefill, "allocate_workspace", unavailable)
     if policy == "int8":
         with pytest.raises(torch.OutOfMemoryError, match="workspace reservation"):
