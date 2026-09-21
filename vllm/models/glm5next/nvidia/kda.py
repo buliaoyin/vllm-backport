@@ -34,13 +34,20 @@ from vllm.model_executor.utils import (
     set_weight_attrs,
 )
 from vllm.platforms import current_platform
-from vllm.third_party.flash_linear_attention.ops.kda import (
-    FusedRMSNormGated,
-    chunk_kda_with_fused_gate,
-    fused_recurrent_kda,
-)
+from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+if current_platform.is_rocm():
+    from vllm.models.glm5next.amd.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+        fused_recurrent_kda,
+    )
+else:
+    from vllm.models.glm5next.nvidia.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+        fused_recurrent_kda,
+    )
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):

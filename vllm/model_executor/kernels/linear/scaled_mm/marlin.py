@@ -111,7 +111,8 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         logged so the trade is visible in the load logs rather than assumed.
         """
         weight = layer.weight
-        scale_inv = layer.weight_scale_inv
+        scale_name = self._block_scale_name(layer)
+        scale_inv = getattr(layer, scale_name)
         block_n, block_k = layer.weight_block_size
         n, k = weight.shape
         scale_full = (
@@ -122,7 +123,7 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         weight_dq = (weight.to(torch.float32) * scale_full).to(layer.orig_dtype)
         freed = weight.nbytes + scale_inv.nbytes
         replace_parameter(layer, "weight", weight_dq)
-        del layer.weight_scale_inv
+        delattr(layer, scale_name)
         layer.marlin_fp8_dequant = True
         logger.debug(
             "fp8->%s dequant for cuBLAS: (%d, %d) freed %d B, allocated %d B",

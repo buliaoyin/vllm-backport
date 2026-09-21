@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -31,7 +32,7 @@ def load_module_from_path(module_name, path):
     return module
 
 
-ROOT_DIR = Path(__file__).parent
+ROOT_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
 
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
@@ -192,6 +193,12 @@ class CMakeExtension(Extension):
 
 
 class cmake_build_ext(build_ext):
+    def get_ext_filename(self, fullname: str) -> str:
+        # These ctypes libraries have a C ABI, independent of Python's ABI tag.
+        if fullname.rsplit(".", 1)[-1] in ("libdsv41_ik", "libdsv41_cuda"):
+            return os.path.join(*fullname.split(".")) + ".so"
+        return super().get_ext_filename(fullname)
+
     # A dict of extension directories that have been configured.
     did_config: dict[str, bool] = {}
 
@@ -461,7 +468,7 @@ class cmake_build_ext(build_ext):
                 )
 
 
-class precompiled_build_ext(build_ext):
+class precompiled_build_ext(cmake_build_ext):
     """Disables extension building when using precompiled binaries."""
 
     def run(self) -> None:
@@ -892,8 +899,7 @@ class precompiled_wheel_utils:
         1. user-specified wheel location (can be either local or remote, via
            VLLM_PRECOMPILED_WHEEL_LOCATION)
         2. user-specified variant (VLLM_PRECOMPILED_WHEEL_VARIANT) from nightly repo
-           or auto-detected CUDA variant based on system (torch, nvidia-smi)
-        3. the default variant from nightly repo
+           or CUDA variant selected from VLLM_MAIN_CUDA_VERSION, torch, or nvidia-smi
 
         If downloading from the nightly repo, the commit can be specified via
         VLLM_PRECOMPILED_WHEEL_COMMIT; otherwise, the head commit in the main branch
@@ -924,28 +930,21 @@ class precompiled_wheel_utils:
                 )
                 commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
             print(f"Using precompiled wheel commit {commit} with variant {variant}")
-            try_default = False
-            wheels, repo_url, download_filename = None, None, None
+            download_filename = None
             try:
                 wheels, repo_url = precompiled_wheel_utils.fetch_metadata_for_variant(
                     commit, variant
                 )
             except Exception as e:
-                logger.warning(
-                    "Failed to fetch precompiled wheel metadata for variant %s: %s",
-                    variant,
-                    e,
-                )
-                try_default = True  # try outside handler to keep the stacktrace simple
-            if try_default:
-                print("Trying the default variant from remote")
-                wheels, repo_url = precompiled_wheel_utils.fetch_metadata_for_variant(
-                    commit, None
-                )
-                # if this also fails, then we have nothing more to try / cache
-            assert wheels is not None and repo_url is not None, (
-                "Failed to fetch precompiled wheel metadata"
-            )
+                raise RuntimeError(
+                    "Failed to fetch precompiled wheel metadata for CUDA "
+                    f"variant {variant!r} at commit {commit}. The "
+                    "root/default variant is not used as a fallback because "
+                    "its CUDA compatibility with the selected variant cannot "
+                    "be verified. Provide a compatible wheel with "
+                    "VLLM_PRECOMPILED_WHEEL_LOCATION or disable "
+                    "VLLM_USE_PRECOMPILED to build from source."
+                ) from e
             # The metadata.json has the following format:
             # see .buildkite/scripts/generate-nightly-index.py for details
             """[{
@@ -1029,6 +1028,9 @@ class precompiled_wheel_utils:
                             "vllm/cumem_allocator.abi3.so",
                             "vllm/spinloop.abi3.so",
                             "vllm/fs_io_C.abi3.so",
+                            "vllm/libdsv41_ik.so",
+                            "vllm/libdsv41_cuda.so",
+                            "vllm/third_party/ik_llama/LICENSE",
                             # ROCm-specific libraries
                             "vllm/_rocm_C.abi3.so",
                         }
@@ -1370,6 +1372,13 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm._exl3_C"))
+    if sys.platform.startswith("linux") and platform.machine() in (
+        "x86_64",
+        "amd64",
+        "AMD64",
+    ):
+        ext_modules.append(CMakeExtension(name="vllm.libdsv41_ik"))
+        ext_modules.append(CMakeExtension(name="vllm.libdsv41_cuda"))
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     # FA3 kernels only target SM90+; skip the target entirely when
     # TORCH_CUDA_ARCH_LIST is restricted to older archs.
@@ -1414,8 +1423,6 @@ if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.tml_fa4", optional=True))
 
 if _is_cpu():
-    import platform
-
     if platform.machine() in ("x86_64", "AMD64"):
         ext_modules.append(CMakeExtension(name="vllm._C"))
         ext_modules.append(CMakeExtension(name="vllm._C_AVX512"))
@@ -1439,6 +1446,8 @@ package_data = {
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
+        # Built-in multimodal chat template fallbacks (registry.py)
+        "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
@@ -1475,6 +1484,25 @@ if USE_PRECOMPILED_RUST_FRONTEND and not is_metadata_only_build():
     )
     for pkg, files in patch.items():
         package_data.setdefault(pkg, []).extend(files)
+    if (
+        USE_PRECOMPILED_EXTENSIONS
+        and _is_cuda()
+        and any(ext.name.startswith("vllm.libdsv41_") for ext in ext_modules)
+    ):
+        missing = [
+            name
+            for name in ("libdsv41_ik.so", "libdsv41_cuda.so")
+            if name not in patch.get("vllm", [])
+        ]
+        if missing:
+            logger.warning(
+                "Precompiled wheel lacks DeepSeek hybrid libraries: %s. "
+                "Hybrid serving requires a source build (unset "
+                "VLLM_USE_PRECOMPILED), an incremental CMake build, or a "
+                "matching wheel built from this branch. Existing local "
+                "libraries have not been rebuilt.",
+                ", ".join(missing),
+            )
 
 # If the rust frontend binary is already present in the source tree (e.g.,
 # pre-built in a separate Docker build stage), ship it as-is.
@@ -1538,7 +1566,7 @@ setup(
         # only; also needs system GStreamer + libv4l (see docs).
         "deepstream": ["nvidia-deepstream-videodecode-cu13>=9.0.2"],
         "flashinfer": [],  # Kept for backwards compatibility
-        "b12x": ["b12x==1.2.6"],
+        "b12x": ["b12x==1.3.0"],
         # Optional deps for Helion kernel development
         # NOTE: When updating helion version, also update CI files:
         #   - .buildkite/test_areas/kernels.yaml

@@ -2,19 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
-import queue
-import threading
-from multiprocessing.reduction import ForkingPickler
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
-import torch.multiprocessing as torch_mp
-import zmq
 
-import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
@@ -34,7 +29,6 @@ from vllm.lora.layers import LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-from vllm.model_executor.layers.ple_offload_layer import CpuGpuSemaphore
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
@@ -50,15 +44,12 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
-from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.block_table import (
@@ -86,303 +77,6 @@ def _restore_default_dtype():
     old = torch.get_default_dtype()
     yield
     torch.set_default_dtype(old)
-
-
-def test_ple_offload_h2h_preserves_queued_input_values(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Later CPU input preparation must not overwrite a queued PLE batch."""
-    monkeypatch.setattr(torch.cuda, "Event", Mock)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_: None)
-    source_input_ids = torch.tensor([7, -1, 11, -1], dtype=torch.int32)
-    source_query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
-    source_ngram = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
-    socket = Mock()
-    connector = PleOffloadConnector.__new__(PleOffloadConnector)
-    connector.device = torch.device("cuda:0")
-    connector.tp_rank = 0
-    connector.dp_rank = 0
-    connector._input_ids_buf = torch.full((4,), -99, dtype=torch.int32)
-    connector._query_start_loc_buf = torch.full((3,), -99, dtype=torch.int32)
-    connector._ngram_context_buf = torch.full((2, 3), -99, dtype=torch.int32)
-    connector._input_ids_source = source_input_ids
-    connector._query_start_loc_source = source_query_start_loc
-    connector._ngram_context_source = source_ngram
-    connector._uses_cuda_inputs = False
-    connector._validate_input_sources()
-    connector._request_queue = queue.Queue(maxsize=1)
-
-    connector._launch(num_reqs=2, num_tokens=4)
-
-    source_input_ids.fill_(99)
-    source_query_start_loc.fill_(99)
-    source_ngram.fill_(99)
-    # Shared staging stays untouched until this batch reaches the notifier.
-    assert connector._input_ids_buf.tolist() == [-99, -99, -99, -99]
-    request = connector._request_queue.get_nowait()
-    assert request is not None
-    connector._process_request(request, socket)
-
-    assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
-    assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
-    assert connector._ngram_context_buf.tolist() == [[1, 2, 3], [4, 5, 6]]
-    assert source_input_ids.tolist() == [99, 99, 99, 99]
-    socket.send.assert_called_once()
-
-
-def test_ple_offload_request_thread_copies_mrv1_and_stops(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep MRV1 H2H and request publication off the model thread."""
-    monkeypatch.setattr(torch.cuda, "Event", Mock)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_: None)
-    connector = PleOffloadConnector.__new__(PleOffloadConnector)
-    connector.device = torch.device("cuda:0")
-    connector.tp_rank = 0
-    connector.dp_rank = 0
-    connector._input_ids_buf = torch.empty(4, dtype=torch.int32)
-    connector._query_start_loc_buf = torch.empty(3, dtype=torch.int32)
-    connector._ngram_context_buf = None
-    connector._input_ids_source = torch.tensor([7, 8, 9, 10], dtype=torch.int32)
-    connector._query_start_loc_source = torch.tensor([0, 2, 4], dtype=torch.int32)
-    connector._ngram_context_source = None
-    connector._uses_cuda_inputs = False
-    connector._pinned_input_buffers = []
-    connector._request_queue = queue.Queue(maxsize=1)
-    connector._request_thread = None
-    connector._request_thread_ready = threading.Event()
-    connector._zmq_ctx = zmq.Context()
-    connector._registration_socket = None
-
-    ipc_addr = f"inproc://ple-offload-{id(connector)}"
-    pull_socket = connector._zmq_ctx.socket(zmq.PULL)
-    pull_socket.setsockopt(zmq.RCVTIMEO, 3000)
-    pull_socket.bind(ipc_addr)
-    try:
-        connector._start_request_thread(ipc_addr)
-        connector._launch(num_reqs=2, num_tokens=4)
-
-        assert pull_socket.recv()
-        assert connector._input_ids_buf.tolist() == [7, 8, 9, 10]
-        assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
-    finally:
-        pull_socket.close(linger=0)
-        connector.close()
-        connector.close()
-
-    assert connector._request_thread is None
-    assert connector._zmq_ctx is None
-
-
-def test_ple_offload_request_thread_failure_exits_worker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Treat a request-thread failure as a fatal worker error."""
-    connector = PleOffloadConnector.__new__(PleOffloadConnector)
-    connector._zmq_ctx = None
-    connector._request_thread_ready = threading.Event()
-    exit_mock = Mock(side_effect=SystemExit(1))
-    monkeypatch.setattr(ple_offload_connector_module.os, "_exit", exit_mock)
-
-    with pytest.raises(SystemExit):
-        connector._request_loop("inproc://unused")
-
-    exit_mock.assert_called_once_with(1)
-
-
-@pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU is required")
-def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
-    """Snapshot MRV2 inputs before later PP forwards overwrite their sources."""
-    socket = Mock()
-    connector = PleOffloadConnector.__new__(PleOffloadConnector)
-    connector.device = torch.device("cuda:0")
-    connector.tp_rank = 0
-    connector.dp_rank = 0
-    original_strategy = torch_mp.get_sharing_strategy()
-    try:
-        torch_mp.set_sharing_strategy("file_descriptor")
-        connector._input_ids_buf = torch.full(
-            (4,), -99, dtype=torch.int32
-        ).share_memory_()
-        connector._query_start_loc_buf = torch.full(
-            (3,), -99, dtype=torch.int32
-        ).share_memory_()
-        connector._ngram_context_buf = torch.full(
-            (2, 3), -99, dtype=torch.int32
-        ).share_memory_()
-        input_buffers = (
-            connector._input_ids_buf,
-            connector._query_start_loc_buf,
-            connector._ngram_context_buf,
-        )
-        initial_ptrs = tuple(buffer.data_ptr() for buffer in input_buffers)
-
-        torch_mp.set_sharing_strategy("file_system")
-        ForkingPickler.dumps(input_buffers)
-    finally:
-        torch_mp.set_sharing_strategy(original_strategy)
-    final_ptrs = tuple(buffer.data_ptr() for buffer in input_buffers)
-    assert final_ptrs != initial_ptrs
-
-    connector._pinned_input_buffers = []
-    connector._request_queue = queue.Queue(maxsize=1)
-
-    with torch.accelerator.device_index(connector.device.index):
-        input_ids = torch.tensor(
-            [7, -1, 11, -1], dtype=torch.int32, device=connector.device
-        )
-        query_start_loc = torch.tensor(
-            [0, 2, 4], dtype=torch.int32, device=connector.device
-        )
-        ngram_context = torch.tensor(
-            [[1, 2, 3], [4, 5, 6]],
-            dtype=torch.int32,
-            device=connector.device,
-        )
-        connector._input_ids_source = input_ids
-        connector._query_start_loc_source = query_start_loc
-        connector._ngram_context_source = ngram_context
-        connector._uses_cuda_inputs = True
-        connector._validate_input_sources()
-        connector._pin_input_buffers()
-        assert (
-            tuple(buffer.data_ptr() for buffer in connector._pinned_input_buffers)
-            == final_ptrs
-        )
-        try:
-            connector._launch(num_reqs=2, num_tokens=4)
-
-            # D2H is already queued on the producer stream, even when the
-            # notifier has not run. Later input preparation must not race it.
-            input_ids.fill_(99)
-            query_start_loc.fill_(99)
-            ngram_context.fill_(99)
-            torch.cuda.current_stream(connector.device).synchronize()
-            assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
-            request = connector._request_queue.get_nowait()
-            assert request is not None
-            connector._process_request(request, socket)
-
-            assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
-            assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
-            assert connector._ngram_context_buf.tolist() == [
-                [1, 2, 3],
-                [4, 5, 6],
-            ]
-            socket.send.assert_called_once()
-        finally:
-            torch.accelerator.synchronize(connector.device)
-            connector._unpin_input_buffers()
-
-
-@pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU is required")
-def test_ple_offload_queued_forward_does_not_wait_for_a_later_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PP can enqueue a future forward before the notifier stages this one."""
-    device = torch.device("cuda:0")
-    monkeypatch.setattr(
-        ple_offload_connector_module,
-        "get_dp_group",
-        lambda: SimpleNamespace(rank_in_group=0),
-    )
-    monkeypatch.setattr(
-        ple_offload_connector_module,
-        "get_tp_group",
-        lambda: SimpleNamespace(rank_in_group=0),
-    )
-    monkeypatch.setattr(PleOffloadConnector, "_setup_layers", lambda *_: {})
-    monkeypatch.setattr(
-        PleOffloadConnector, "_register_with_offload_worker", lambda *_: None
-    )
-    monkeypatch.setattr(PleOffloadConnector, "_start_request_thread", lambda *_: None)
-    config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4, max_num_seqs=1),
-        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(ngram_size=1)),
-    )
-    source = torch.full((4,), 7, dtype=torch.int32, device=device)
-    starts = torch.tensor([0, 4], dtype=torch.int32, device=device)
-    gate = CpuGpuSemaphore(device)
-    control_stream = torch.cuda.Stream(device=device)
-    future_stream = torch.cuda.Stream(device=device)
-    torch.accelerator.synchronize(device)
-    gate.signal(control_stream)
-    control_stream.synchronize()
-    connector = PleOffloadConnector(
-        config,
-        Mock(),
-        device,
-        "inproc://queued-ple",
-        input_ids_source=source,
-        query_start_loc_source=starts,
-        ngram_context_source=None,
-    )
-    done = threading.Event()
-    errors = []
-    worker = None
-    try:
-        connector.prepare_forward(1, 4, False)
-        with torch.cuda.stream(future_stream):
-            gate.wait_reset(future_stream)
-            source.fill_(9)
-            connector.prepare_forward(1, 4, False)
-
-        def stage_first():
-            try:
-                connector._process_request(
-                    connector._request_queue.get_nowait(), Mock()
-                )
-            except Exception as error:
-                errors.append(error)
-            finally:
-                done.set()
-
-        worker = threading.Thread(target=stage_first)
-        worker.start()
-        assert done.wait(5), "Earlier PLE request waited on a future batch's event"
-        assert not errors
-        assert connector._input_ids_buf.tolist() == [7, 7, 7, 7]
-        gate.reset(control_stream)
-        future_stream.synchronize()
-        connector._process_request(connector._request_queue.get_nowait(), Mock())
-        assert connector._input_ids_buf.tolist() == [9, 9, 9, 9]
-    finally:
-        gate.reset(control_stream)
-        future_stream.synchronize()
-        if worker is not None:
-            worker.join(timeout=5)
-        connector.close()
-
-
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA PLE required")
-def test_ple_offload_finishes_outputs_before_runtime_kernel_loading() -> None:
-    """An uncaptured forward must not load CUDA modules with PLE work pending."""
-    device = torch.device("cuda:0")
-    semaphore = CpuGpuSemaphore(device)
-    output = torch.zeros(4, device=device)
-    copy_stream = torch.cuda.Stream(device=device)
-    copied = torch.cuda.Event()
-    connector = PleOffloadConnector.__new__(PleOffloadConnector)
-    connector.device = device
-    connector._launch = Mock()
-    connector._layers = {
-        "ple": SimpleNamespace(_sem=semaphore, _gpu_output_buffer=output)
-    }
-    torch.accelerator.synchronize(device)
-    try:
-        # Represent delayed publication by the CPU worker on another stream.
-        with torch.cuda.stream(copy_stream):
-            torch.cuda._sleep(100_000_000)
-            output.fill_(7)
-            copied.record(copy_stream)
-            semaphore.signal(copy_stream)
-
-        connector.prepare_forward(1, 4, False, synchronize=True)
-
-        assert copied.query(), "Returned with a PLE producer still pending"
-        assert output.tolist() == [7, 7, 7, 7]
-    finally:
-        copy_stream.synchronize()
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
@@ -1687,6 +1381,76 @@ def test_hybrid_attention_mamba_tensor_shapes():
             assert torch.equal(actual_ssm, expected_ssm)
 
 
+def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(reasoning_config=None)
+    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=16)
+    runner.cache_config = SimpleNamespace(use_replayssm=False)
+    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 32)
+    runner.max_model_len = 64
+    runner.max_encoder_len = 0
+    runner.max_num_reqs = 1
+    runner.max_num_tokens = 64
+    runner.num_spec_tokens = 0
+    runner.device = torch.device("cpu")
+    runner.is_pooling_model = False
+    runner._init_block_sizes = [16]
+    runner._init_kernel_block_sizes = [16]
+    runner._init_max_num_blocks = [4]
+    runner._init_slot_mapping_modes = [
+        gpu_model_runner_module.SlotMappingMode.TOKEN_TO_KV_SLOT
+    ]
+    runner.cp_kv_cache_interleave_size = 1
+    runner.input_batch = SimpleNamespace(
+        logitsprocs=None,
+        logitsprocs_need_output_token_ids=False,
+    )
+    runner.jit_warmup_registry = Mock()
+    runner.jit_warmup_registry.activate.return_value = nullcontext()
+
+    spec = SimpleNamespace(
+        block_size=16,
+        max_num_blocks_per_req=lambda *_: 4,
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+    )
+    input_batch_cls = Mock(return_value=SimpleNamespace())
+    monkeypatch.setattr(gpu_model_runner_module, "InputBatch", input_batch_cls)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_kv_cache_spec_kind",
+        lambda _: gpu_model_runner_module.KVCacheSpecKind.FULL_ATTENTION,
+    )
+
+    runner.may_reinitialize_input_batch(kv_cache_config, [16])
+
+    assert input_batch_cls.call_count == 1
+    assert input_batch_cls.call_args.kwargs["cp_kv_cache_interleave_size"] == 16
+
+
+def test_v2_runner_snapshots_late_interleave_adjustment(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as v2_model_runner_module
+
+    runner = object.__new__(v2_model_runner_module.GPUModelRunner)
+    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=16)
+    runner.cp_interleave = 1
+
+    class StopInitialization(Exception):
+        pass
+
+    monkeypatch.setattr(
+        v2_model_runner_module,
+        "deepcopy",
+        Mock(side_effect=StopInitialization),
+    )
+
+    with pytest.raises(StopInitialization):
+        runner.initialize_kv_cache(SimpleNamespace())
+
+    assert runner.cp_interleave == 16
+
+
 def test_hybrid_block_table_initialization():
     """Test hybrid block table with different kernel and kvcache_manager block
     sizes."""
@@ -1762,56 +1526,6 @@ def test_mamba_state_table_width_is_not_aligned():
     )
 
     assert block_tables[0].max_num_blocks_per_req == 1
-
-
-@pytest.mark.parametrize("wrap_uniform", [False, True])
-def test_circular_buffer_uses_custom_slot_mapping(wrap_uniform: bool):
-    circular_spec = CircularBufferSpec(
-        block_size=8,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-    )
-    spec = (
-        UniformTypeKVCacheSpecs(
-            block_size=8,
-            kv_cache_specs={"raw_key_cache": circular_spec},
-        )
-        if wrap_uniform
-        else circular_spec
-    )
-
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.max_model_len = 16
-    runner.max_encoder_len = 0
-    runner.max_num_reqs = 1
-    runner.max_num_tokens = 2
-    runner.num_spec_tokens = 0
-    runner.device = torch.device("cpu")
-    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 8)
-    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=1)
-    runner.vllm_config = SimpleNamespace(reasoning_config=None)
-    runner.cache_config = SimpleNamespace(use_replayssm=False)
-    runner.is_pooling_model = False
-    runner.input_batch = SimpleNamespace(
-        logitsprocs=None,
-        logitsprocs_need_output_token_ids=False,
-    )
-    runner._init_block_sizes = []
-    runner._init_kernel_block_sizes = []
-    runner._init_max_num_blocks = []
-    runner._init_slot_mapping_modes = []
-    kv_cache_config = KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["raw"], kv_cache_spec=spec)],
-    )
-
-    runner.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes=[8])
-
-    block_table = runner.input_batch.block_table[0]
-    assert block_table.slot_mapping_mode == SlotMappingMode.NONE
-    assert block_table.max_num_blocks_per_req == 1
 
 
 def test_input_batch_with_kernel_block_sizes():

@@ -685,7 +685,7 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
 # runtime stages (which have no nvcc) just install the wheel.
 FROM build AS lmcache-build
 ARG LMCACHE_REPO=https://github.com/wtdcode/LMCache.git
-ARG LMCACHE_REF=b857066c42613022998a76303f228be5be3834e5
+ARG LMCACHE_REF=2acb7b24bea5ac55c5dfc6a41366099236ec525c
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
 ARG torch_cuda_arch_list
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
@@ -821,6 +821,9 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
         cuda-nvcc-${CUDA_VERSION_DASH} \
         cuda-cudart-${CUDA_VERSION_DASH} \
         cuda-nvrtc-${CUDA_VERSION_DASH} \
+        # FlashInfer's runtime JIT-compiled kernels (e.g. trtllm_fmha_kernel_launcher.cu)
+        # #include <nvrtc.h>, which only the -dev package ships.
+        cuda-nvrtc-dev-${CUDA_VERSION_DASH} \
         cuda-cuobjdump-${CUDA_VERSION_DASH} \
         libcurand-dev-${CUDA_VERSION_DASH} \
         libcublas-dev-${CUDA_VERSION_DASH} \
@@ -830,10 +833,21 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
         numactl && \
     rm -rf /var/lib/apt/lists/*
 
+# Ensures nvcc/ptxas (installed above, needed at runtime for FlashInfer/
+# DeepGEMM/EP kernel JIT compilation) are reachable on PATH. Harmless no-op
+# if already set by FINAL_BASE_IMAGE.
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+
 # Apply the CUDA 13.4-only libcurand compatibility link described in the build
 # stage. CUDA 13.5 uses its native libcurand.so.11. DeepEP expects NCCL directly
 # under its configured /usr prefix, while Ubuntu installs it in a multiarch
-# subdirectory.
+# subdirectory - but that symlink is only possible when NCCL is already
+# present (e.g. nvcr.io/nvidia/cuda-dl-base bundles it; a bare-CUDA image
+# doesn't, and gets it later via the standard nvidia-nccl-cu* pip package,
+# UV_OVERRIDE below). Check reality (whether libnccl.so.2 is actually found)
+# and tolerate not finding it instead of failing the build.
 RUN if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2) \
         && if [ "${CUDA_MAJOR_MINOR}" = "13.4" ]; then \
@@ -851,10 +865,13 @@ RUN if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
             echo "Unsupported Rubin CUDA version: ${CUDA_MAJOR_MINOR}" >&2; \
             exit 1; \
         fi \
-        && NCCL_LIBRARY=$(find /usr/lib -name libnccl.so.2 -print -quit) \
-        && test -n "${NCCL_LIBRARY}" \
-        && ln -sf "${NCCL_LIBRARY}" /usr/lib/libnccl.so.2 \
-        && ln -sf libnccl.so.2 /usr/lib/libnccl.so \
+        && if NCCL_LIBRARY=$(find /usr/lib -name libnccl.so.2 -print -quit) \
+            && [ -n "${NCCL_LIBRARY}" ]; then \
+            if [ "${NCCL_LIBRARY}" != "/usr/lib/libnccl.so.2" ]; then \
+                ln -sf "${NCCL_LIBRARY}" /usr/lib/libnccl.so.2; \
+            fi \
+            && ln -sf libnccl.so.2 /usr/lib/libnccl.so; \
+        fi \
         && ldconfig; \
     fi
 
@@ -934,17 +951,12 @@ ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 ARG PYTORCH_CUDA_INDEX_BASE_URL
 COPY requirements/common.txt /tmp/common.txt
 COPY requirements/cuda.txt /tmp/requirements-cuda.txt
-# FlashInfer is installed separately from release assets below for regular
-# CUDA images. Rubin prerelease images retain their pinned requirements.
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] && \
         [ ! -f /tmp/vllm-requirements/rubin-prerelease.txt ]; then \
         echo "INSTALL_RUBIN_PRERELEASE=true requires requirements/rubin-prerelease.txt" >&2; \
         exit 1; \
-    fi && \
-    if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
-        sed -i '/^flashinfer-\(python\|cubin\)==/d' /tmp/requirements-cuda.txt; \
     fi && \
     if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' /tmp/requirements-cuda.txt; \
@@ -969,25 +981,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Install FlashInfer from release assets.
+# Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
 # https://docs.flashinfer.ai/installation.html
-ARG FLASHINFER_VERSION=0.6.18
-ARG FLASHINFER_RELEASE_TAG=v0.6.18
-ARG TARGETARCH
+# From versions.json: .flashinfer.version
+ARG FLASHINFER_VERSION=0.6.18.post1
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
-        set -eux; \
-        case "${TARGETARCH}" in \
-          amd64) FLASHINFER_WHEEL_ARCH="x86_64" ;; \
-          arm64) FLASHINFER_WHEEL_ARCH="aarch64" ;; \
-          *) echo "Unsupported FlashInfer wheel architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-        esac; \
-        FLASHINFER_CUDA_VERSION="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"; \
-        FLASHINFER_RELEASE_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}"; \
-        uv pip install --system --no-deps \
-            "${FLASHINFER_RELEASE_URL}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl" \
-            "${FLASHINFER_RELEASE_URL}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
-            "${FLASHINFER_RELEASE_URL}/flashinfer_jit_cache-${FLASHINFER_VERSION}%2B${FLASHINFER_CUDA_VERSION}-cp39-abi3-manylinux_2_28_${FLASHINFER_WHEEL_ARCH}.whl"; \
+        uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
+            --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
 # ============================================================
@@ -1001,10 +1002,13 @@ ARG GDRCOPY_CUDA_VERSION=12.8
 ARG GDRCOPY_OS_VERSION=Ubuntu24_04
 ARG TARGETPLATFORM
 COPY tools/install_gdrcopy.sh /tmp/install_gdrcopy.sh
+# Some Rubin FINAL_BASE_IMAGE choices (internal Rubin CUDA images,
+# nvcr.io/nvidia/cuda-dl-base) already provide GDRCopy; others don't, so it
+# falls through to the normal install below. Check reality (ldconfig) rather
+# than inferring from which FINAL_BASE_IMAGE flag is set.
 RUN set -eux; \
-    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
-        # The Rubin CUDA image already provides GDRCopy. \
-        ldconfig -p | grep -q 'libgdrapi\.so'; \
+    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] && ldconfig -p | grep -q 'libgdrapi\.so'; then \
+        true; \
     else \
         case "${TARGETPLATFORM}" in \
           linux/arm64) UUARCH="aarch64" ;; \
@@ -1060,14 +1064,6 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
-    fi
-
-# The vLLM wheel still pins the stable FlashInfer Python package. Restore the
-# release candidate after installing vLLM so it matches the cubin and JIT cache.
-RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
-        uv pip install --system --no-deps --reinstall \
-            "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl"; \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -1185,13 +1181,6 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
-    fi
-
-# Keep FlashInfer Python aligned with the release-candidate runtime packages.
-RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
-        uv pip install --system --no-deps --reinstall \
-            "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl"; \
     fi
 
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH

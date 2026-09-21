@@ -414,8 +414,9 @@ def postprocess_mamba_fused_kernel(
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
-    # per-request decision arrays are in req-state-slot order; the block table
-    # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
+    # per-request decision arrays AND the block tables are both in req-state-slot
+    # order, so rows are always indexed by req_idx; HAS_IDX_MAPPING only selects
+    # how a grid program (batch order) resolves its request slot.
     idx_mapping_ptr,
     # Runtime parameter (varies per batch - NOT constexpr to avoid recompilation)
     num_reqs,
@@ -499,9 +500,20 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
+    # The captured block tables are the SOURCE per-request-slot tables
+    # (persistent [max_num_reqs, max_blocks], mutated only by stream-ordered
+    # staged writes), so rows are always request-state slots -- index them by
+    # req_idx. Indexing by batch row read the CURRENT step's table at a stale
+    # batch mapping: on a non-last PP rank the deferred postprocess runs
+    # pp_size steps after its batch was gathered, so batch rows point at
+    # DIFFERENT requests and the state copy walks another request's
+    # freed/reallocated block ids. In the CSA unified layout every cache
+    # tensor aliases the same page, which is how foreign bytes landed in the
+    # PLE conv state (all-NaN logits -> constant-token loops; vllm#54173).
+    bt_row_idx = req_idx
     _copy_mamba_state_block(
         state_idx,
-        req_idx,
+        bt_row_idx,
         src_block_idx,
         dest_block_idx,
         accept_token_bias,
@@ -632,6 +644,7 @@ def precopy_mamba_align_fused_kernel(
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
+        # Source tables are req-indexed (see postprocess_mamba_fused_kernel).
         req_idx,
         src_col,
         dst_col,
@@ -733,9 +746,10 @@ def validate_mamba_state_copy_funcs(
             f"missing state copy funcs for {mamba_spec.mamba_type}"
         )
         state_copy_funcs = copy_funcs[mamba_spec.mamba_type]
-        assert len(state_copy_funcs) == len(mamba_spec.shapes), (
+        assert 0 < len(state_copy_funcs) <= len(mamba_spec.shapes), (
             f"{mamba_spec.mamba_type} declares {len(mamba_spec.shapes)} states, "
-            f"but provides {len(state_copy_funcs)} state copy funcs"
+            f"but provides {len(state_copy_funcs)} state copy funcs; expected "
+            "a non-empty copyable prefix"
         )
 
 
@@ -1008,12 +1022,13 @@ class MambaSpecDecodeGPUContext:
                 state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
                 attention = forward_context[layer_name]
                 kv_caches: list[torch.Tensor] = attention.kv_cache
-                assert len(kv_caches) == len(mamba_spec.shapes), (
-                    f"layer {layer_name} exposes {len(kv_caches)} Mamba states, "
-                    f"but its cache spec declares {len(mamba_spec.shapes)}"
-                )
-
-                for state_type_idx, state in enumerate(kv_caches):
+                if len(kv_caches) < len(state_copy_funcs):
+                    raise ValueError(
+                        f"Expected at least {len(state_copy_funcs)} Mamba state "
+                        f"tensors, got {len(kv_caches)}"
+                    )
+                for state_type_idx, copy_func in enumerate(state_copy_funcs):
+                    state = kv_caches[state_type_idx]
                     # Base address
                     self.state_base_addrs[idx] = _reinterpret_u64_as_i64(
                         state.data_ptr()
@@ -1032,7 +1047,6 @@ class MambaSpecDecodeGPUContext:
                     # Element size
                     self.state_elem_sizes[idx] = state.element_size()
 
-                    copy_func = state_copy_funcs[state_type_idx]
                     assert (
                         copy_func is get_conv_copy_spec
                         or copy_func is get_temporal_copy_spec
@@ -1378,10 +1392,6 @@ def collect_mamba_copy_meta(
             state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
-            assert len(kv_caches) == len(mamba_spec.shapes), (
-                f"layer {layer_name} exposes {len(kv_caches)} Mamba states, "
-                f"but its cache spec declares {len(mamba_spec.shapes)}"
-            )
             for state, state_copy_func in zip(kv_caches, state_copy_funcs):
                 copy_spec = state_copy_func(
                     state, block_ids, src_block_idx, accept_token_bias + 1

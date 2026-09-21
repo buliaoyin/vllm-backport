@@ -24,11 +24,21 @@ def _run_prepare(
     cp_rank: int = 0,
     cp_size: int = 1,
     cp_interleave: int = 1,
+    num_query_tokens: int | None = None,
+    num_speculative_steps: int = 3,
+    max_num_reqs: int = 4,
+    num_reqs: int = 1,
 ):
     device = torch.device("cuda")
-    max_num_reqs = 4
-    max_num_tokens = 16
-    num_speculative_steps = 3
+    target_count = len(target_positions)
+    max_num_tokens = max(
+        16,
+        num_reqs * target_count,
+        max_num_reqs * (num_query_tokens or num_speculative_steps),
+    )
+    state_indices = [
+        (min(2, max_num_reqs - 1) + i) % max_num_reqs for i in range(num_reqs)
+    ]
 
     input_buffers = SimpleNamespace(
         input_ids=torch.full((max_num_tokens,), -1, dtype=torch.int32, device=device),
@@ -39,11 +49,19 @@ def _run_prepare(
         seq_lens=torch.full((max_num_reqs,), -1, dtype=torch.int32, device=device),
     )
     input_batch = SimpleNamespace(
-        num_reqs=1,
-        num_scheduled_tokens=np.array([4], dtype=np.int32),
-        positions=torch.tensor(target_positions, dtype=torch.int64, device=device),
-        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device=device),
-        idx_mapping=torch.tensor([2], dtype=torch.int32, device=device),
+        num_reqs=num_reqs,
+        num_scheduled_tokens=np.full(num_reqs, target_count, dtype=np.int32),
+        positions=torch.tensor(
+            target_positions * num_reqs, dtype=torch.int64, device=device
+        ),
+        query_start_loc=torch.arange(
+            0,
+            target_count * num_reqs + 1,
+            target_count,
+            dtype=torch.int32,
+            device=device,
+        ),
+        idx_mapping=torch.tensor(state_indices, dtype=torch.int32, device=device),
     )
     query_slot_mapping = torch.full(
         (max_num_tokens,), -2, dtype=torch.int64, device=device
@@ -54,25 +72,35 @@ def _run_prepare(
     context_slot_mapping = torch.full(
         (max_num_tokens,), -2, dtype=torch.int64, device=device
     )
-    sample_indices = torch.full(
-        (max_num_reqs * num_speculative_steps,),
-        -1,
-        dtype=torch.int64,
-        device=device,
+    sample_count = max_num_reqs * num_speculative_steps
+    sample_storage = [
+        torch.full((sample_count + 4,), -77, dtype=dtype, device=device)
+        for dtype in (torch.int64, torch.int64, torch.int32)
+    ]
+    sample_indices, sample_pos, sample_idx_mapping = (
+        tensor[:sample_count] for tensor in sample_storage
     )
-    sample_pos = torch.full_like(sample_indices, -1)
-    sample_idx_mapping = torch.full(
-        sample_indices.shape, -1, dtype=torch.int32, device=device
-    )
+    for tensor in (sample_indices, sample_pos, sample_idx_mapping):
+        tensor.fill_(-1)
     temperature = torch.zeros(max_num_reqs, dtype=torch.float32, device=device)
     seeds = torch.zeros(max_num_reqs, dtype=torch.int64, device=device)
-    input_temperature = torch.tensor(
-        [0.0, 0.0, 1.0, 0.0], dtype=torch.float32, device=device
-    )
-    input_seeds = torch.tensor([0, 0, 17, 0], dtype=torch.int64, device=device)
-    last_sampled = torch.tensor([0, 0, 99, 0], dtype=torch.int64, device=device)
+    input_temperature = torch.zeros_like(temperature)
+    input_seeds = torch.zeros_like(seeds)
+    last_sampled = torch.zeros_like(seeds)
     next_prefill_tokens = torch.zeros_like(last_sampled)
-    block_table = torch.tensor([block_table_values], dtype=torch.int32, device=device)
+    for index, state_idx in enumerate(state_indices):
+        input_temperature[state_idx] = 1.0 + index
+        input_seeds[state_idx] = 17 + index
+        last_sampled[state_idx] = 99 + index
+        next_prefill_tokens[state_idx] = 199 + index
+    block_table = torch.tensor(
+        [
+            [value + 16 * i if value else 0 for value in block_table_values]
+            for i in range(num_reqs)
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
 
     prepare_dflash_inputs(
         input_buffers,
@@ -85,8 +113,14 @@ def _run_prepare(
         temperature,
         seeds,
         input_batch,
-        torch.tensor([1], dtype=torch.int32, device=device),
-        torch.tensor([2], dtype=torch.int32, device=device),
+        torch.tensor(
+            [int(i % 2 == 0) for i in range(num_reqs)], dtype=torch.int32, device=device
+        ),
+        torch.tensor(
+            [2 if i % 2 == 0 else 0 for i in range(num_reqs)],
+            dtype=torch.int32,
+            device=device,
+        ),
         last_sampled,
         next_prefill_tokens,
         input_temperature,
@@ -97,7 +131,7 @@ def _run_prepare(
         cp_size,
         cp_interleave,
         123,
-        num_speculative_steps,
+        num_query_tokens or num_speculative_steps,
         num_speculative_steps,
         max_num_reqs,
         max_num_tokens,
@@ -113,6 +147,7 @@ def _run_prepare(
         sample_indices=sample_indices.cpu(),
         sample_pos=sample_pos.cpu(),
         sample_idx_mapping=sample_idx_mapping.cpu(),
+        sample_guards=[tensor[sample_count:].cpu() for tensor in sample_storage],
         temperature=temperature.cpu(),
         seeds=seeds.cpu(),
     )
@@ -174,3 +209,76 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+def test_dspark_query_prefix_keeps_tail_kv_without_sampling_past_output():
+    # Five backbone queries cross a KV block boundary, but only the first
+    # three become proposals. Guard cells expose writes past the sample buffers.
+    out = _run_prepare(
+        target_positions=[10, 11, 12, 13],
+        block_table_values=[0, 0, 7, 8, 9, 10, 11, 12],
+        num_query_tokens=5,
+        max_num_reqs=1,
+    )
+    assert out.input_buffers.positions[:5].cpu().tolist() == [12, 13, 14, 15, 16]
+    assert out.input_buffers.input_ids[:5].cpu().tolist() == [99, 123, 123, 123, 123]
+    assert out.input_buffers.query_start_loc.cpu().tolist() == [0, 5]
+    assert out.input_buffers.seq_lens.cpu().tolist() == [17]
+    assert out.query_slot_mapping[:5].tolist() == [32, 33, 34, 35, 36]
+    assert out.sample_indices.tolist() == [0, 1, 2]
+    assert out.sample_pos.tolist() == [13, 14, 15]
+    assert out.sample_idx_mapping.tolist() == [0, 0, 0]
+    for guard in out.sample_guards:
+        assert guard.tolist() == [-77] * 4
+
+
+@pytest.mark.parametrize("num_reqs", [3, 16])
+@pytest.mark.parametrize("draft_tokens, query_tokens", [(3, 5), (5, 5), (7, 7)])
+def test_dspark_query_prefix_keeps_concurrent_request_slots_separate(
+    num_reqs, draft_tokens, query_tokens
+):
+    """Drafts must respect reordered requests, rejected suffixes and buffer bounds."""
+    blocks = [0, 0, 7, 8, 9, 10, 11, 12]
+    out = _run_prepare(
+        target_positions=list(range(10, 11 + draft_tokens)),
+        block_table_values=blocks,
+        num_query_tokens=query_tokens,
+        num_speculative_steps=draft_tokens,
+        max_num_reqs=16,
+        num_reqs=num_reqs,
+    )
+    for index in range(num_reqs):
+        start = 11 + draft_tokens - (2 if index % 2 == 0 else 0)
+        anchor = 99 + index if index % 2 == 0 else 199 + index
+        query = slice(query_tokens * index, query_tokens * (index + 1))
+        sample = slice(draft_tokens * index, draft_tokens * (index + 1))
+        assert out.input_buffers.positions[query].cpu().tolist() == list(
+            range(start, start + query_tokens)
+        )
+        assert out.input_buffers.input_ids[query].cpu().tolist() == [anchor] + [123] * (
+            query_tokens - 1
+        )
+        assert out.query_slot_mapping[query].tolist() == [
+            (blocks[position // 4] + 16 * index) * 4 + position % 4
+            for position in range(start, start + query_tokens)
+        ]
+        assert out.sample_indices[sample].tolist() == list(
+            range(query_tokens * index, query_tokens * index + draft_tokens)
+        )
+        assert out.sample_pos[sample].tolist() == list(
+            range(start + 1, start + draft_tokens + 1)
+        )
+        assert (
+            out.sample_idx_mapping[sample].tolist() == [(2 + index) % 16] * draft_tokens
+        )
+    assert out.input_buffers.query_start_loc.cpu().tolist() == [
+        min(index, num_reqs) * query_tokens for index in range(17)
+    ]
+    assert out.sample_idx_mapping[draft_tokens * num_reqs :].tolist() == [-1] * (
+        draft_tokens * (16 - num_reqs)
+    )
+    assert out.query_slot_mapping[query_tokens * num_reqs :].tolist() == [
+        PAD_SLOT_ID
+    ] * (len(out.query_slot_mapping) - query_tokens * num_reqs)
+    for guard in out.sample_guards:
+        assert guard.tolist() == [-77] * 4

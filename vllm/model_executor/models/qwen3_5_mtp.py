@@ -38,7 +38,6 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
-    SupportsPP,
     _require_is_multimodal,
 )
 from .utils import (
@@ -154,7 +153,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         pp_group = get_pp_group()
-        if pp_group.is_first_rank:
+        # The drafter is built with PP=1 and runs on the target's last PP rank,
+        # where get_pp_group() still describes the target pipeline. Both the
+        # first and the last rank therefore project the target hidden states
+        # through fc; only middle ranks consume intermediate tensors.
+        if pp_group.is_first_rank or pp_group.is_last_rank:
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
@@ -163,18 +166,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
             hidden_states = self.fc(hidden_states)
             residual = None
-        elif pp_group.is_last_rank:
-            # Last PP rank: apply the same fc projection as first rank,
-            # using the target model's output on this rank.
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_input_ids(input_ids)
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
-            residual = None
         else:
-            # Middle PP rank: use intermediate tensors from previous rank.
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
@@ -225,7 +217,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -266,10 +258,6 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
 
     def embed_input_ids(
         self,

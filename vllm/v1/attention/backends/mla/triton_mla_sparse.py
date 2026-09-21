@@ -18,7 +18,6 @@ from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseMetadataBuilder,
 )
 from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
-    _DIM_QK,
     KV_SPLITS_CANDIDATES,
     triton_mla_sparse_attention,
 )

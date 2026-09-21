@@ -367,10 +367,8 @@ def test_sync_load_failure_hybrid_groups(scheduler: Scheduler):
     # No invalid blocks for this request: untouched.
     request2 = create_request(num_tokens=10 * block_size)
     request2.num_computed_tokens = 8 * block_size
-    affected2, num_tokens2, to_evict2 = (
-        scheduler._update_requests_with_invalid_blocks(
-            [request2], invalid_block_ids={999}, num_scheduled_tokens={}
-        )
+    affected2, num_tokens2, to_evict2 = scheduler._update_requests_with_invalid_blocks(
+        [request2], invalid_block_ids={999}, num_scheduled_tokens={}
     )
     assert affected2 == set() and num_tokens2 == 0 and to_evict2 == set()
     assert request2.num_computed_tokens == 8 * block_size

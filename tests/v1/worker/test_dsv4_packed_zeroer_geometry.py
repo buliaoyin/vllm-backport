@@ -78,7 +78,7 @@ def test_packed_dsv4_zeroer_zeroes_only_each_layers_page():
         },
         num_blocks=NUM_BLOCKS,
     )
-    seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._meta
+    seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._group_meta[0]
 
     assert n_segs == NUM_LAYERS
     # Segments step by the full packed row per block...
@@ -99,9 +99,9 @@ def test_packed_dsv4_zeroer_zeroes_only_each_layers_page():
 
 
 def test_overlaid_zeroer_dedups_segments_with_max_span():
-    """Two groups overlay one allocation; the zeroer must emit one segment per distinct
-    byte offset, spanning the widest overlaid page, so a newly allocated block is fully
-    zeroed no matter which group owns it."""
+    """Two groups overlay one allocation; segments are collected per group (block
+    ids are group-scoped), and within a group the zeroer emits one segment per
+    distinct byte offset spanning the widest overlaid page."""
     from unittest.mock import MagicMock
 
     from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
@@ -156,16 +156,23 @@ def test_overlaid_zeroer_dedups_segments_with_max_span():
         },
         num_blocks=config.num_blocks,
     )
-    seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._meta
-
-    # g1.big and g2.huge overlay at offset 0 -> one segment with g2's wider
-    # span; g1.small keeps its own segment.
-    assert n_segs == 2
     pages = {n: s.page_size_bytes for n, s in (g1_specs | g2_specs).items()}
+    packed_block_stride = max(sum(pages[n] for n in g) for g in (g1_specs, g2_specs))
+    assert sorted(zeroer._group_meta) == [0, 1]
+
+    # Group 0: g1.big at offset 0 and g1.small right after it.
+    seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._group_meta[0]
+    assert n_segs == 2
     by_offset = {
         a - buf_ptr: p * 4 for a, p in zip(seg_addrs.tolist(), seg_page_sizes.tolist())
     }
-    assert by_offset[0] == max(pages["g1.big"], pages["g2.huge"])
+    assert by_offset[0] == pages["g1.big"]
     assert by_offset[pages["g1.big"]] == pages["g1.small"]
-    packed_block_stride = max(sum(pages[n] for n in g) for g in (g1_specs, g2_specs))
+    assert (seg_block_strides * 4 == packed_block_stride).all()
+
+    # Group 1: g2.huge overlays offset 0 with its own, wider span.
+    seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._group_meta[1]
+    assert n_segs == 1
+    assert seg_addrs.tolist() == [buf_ptr]
+    assert seg_page_sizes.tolist() == [pages["g2.huge"] // 4]
     assert (seg_block_strides * 4 == packed_block_stride).all()

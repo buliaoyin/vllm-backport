@@ -48,8 +48,7 @@ CHECK_IMPORTS = {
             "vllm/distributed/device_communicators/shm_object_storage.py",
             "vllm/distributed/weight_transfer/ipc_engine.py",
             "vllm/distributed/weight_transfer/clients.py",
-            # PLE registration reconstructs CUDA IPC and shared-memory tensors.
-            "vllm/v1/ple_offload/worker.py",
+            "vllm/model_executor/model_loader/weight_cache/protocol.py",
             "tests/distributed/test_shm_broadcast.py",
             "tests/distributed/test_weight_transfer.py",
             "vllm/utils/hashing.py",

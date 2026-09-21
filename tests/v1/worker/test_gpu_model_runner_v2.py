@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ import vllm.v1.worker.gpu.model_runner as model_runner_module
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
@@ -20,7 +22,11 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
-def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
+@pytest.mark.parametrize("spec_kind", ["circular", "kpool_tail"])
+def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch, spec_kind):
+    """Ring-buffer caches (QSA circular buffer, GLM-5.3 kpool tail) hold one
+    block per request and compute their own slot mapping; the generic
+    position-indexed mapping would index far past their 1-block table row."""
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144
     runner.is_encoder_decoder = False
@@ -28,8 +34,13 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner.dcp_rank = 0
     runner.cp_interleave = 1
     runner.cache_config = SimpleNamespace(enable_prefix_caching=True)
+    parallel_config = SimpleNamespace(
+        decode_context_parallel_size=1,
+        cp_kv_cache_interleave_size=1,
+    )
+    runner.parallel_config = parallel_config
     runner.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        parallel_config=parallel_config,
         cache_config=SimpleNamespace(mamba_cache_mode="none"),
     )
     runner.model_state = SimpleNamespace(
@@ -44,12 +55,21 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner.max_num_tokens = 2
     runner.device = torch.device("cuda")
 
-    raw_spec = CircularBufferSpec(
-        block_size=8,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-    )
+    if spec_kind == "circular":
+        raw_spec = CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+    else:
+        raw_spec = KpoolTailSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=8,
+        )
     compressed_spec = FullAttentionSpec(
         block_size=262144,
         num_kv_heads=1,
@@ -145,14 +165,19 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
             KVCacheGroupSpec(["kda"], mamba_spec),
         ],
     )
+    parallel_config = SimpleNamespace(
+        decode_context_parallel_size=dcp_size,
+        cp_kv_cache_interleave_size=1,
+    )
     vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size),
+        parallel_config=parallel_config,
         cache_config=SimpleNamespace(mamba_cache_mode=mamba_cache_mode),
     )
     runner = SimpleNamespace(
         max_model_len=max_model_len,
         is_encoder_decoder=False,
         vllm_config=vllm_config,
+        parallel_config=parallel_config,
     )
 
     class _CapturedWidths(Exception):
@@ -225,3 +250,110 @@ def test_auto_fit_updates_attention_capture_and_draft_limits(with_draft):
     if with_draft:
         assert runner.speculator.max_model_len == 466432
         assert runner.speculator.draft_max_seq_len == 466432
+
+
+def _make_capture_runner(captured: bool) -> GPUModelRunner:
+    """Minimal V2 runner for capture_model: fakes everything except the
+    cudagraph_manager's needs_capture decision."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.cudagraph_manager = SimpleNamespace(
+        needs_capture=lambda: captured,
+        capture=lambda *args, **kwargs: None,
+    )
+    runner.lora_config = None
+    runner.maybe_setup_dummy_loras = lambda _cfg: contextlib.nullcontext()
+    runner.speculator = None
+    runner.adaptive_verification = None
+    runner.model = None
+    runner.input_buffers = None
+    runner.pcp_manager = None
+    runner.intermediate_tensors = None
+    runner.block_tables = None
+    runner.attn_groups = None
+    runner.kv_cache_config = None
+    runner.use_aux_hidden_state_outputs = False
+    return runner
+
+
+def test_capture_model_locks_workspace_after_capture(monkeypatch):
+    """A workspace resize after capture frees the buffer the captured graphs
+    baked in, so capture_model must lock the workspace before returning
+    (https://github.com/vllm-project/vllm/issues/55336)."""
+    runner = _make_capture_runner(captured=True)
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
+    )
+    lock_calls = []
+    monkeypatch.setattr(
+        model_runner_module, "lock_workspace", lambda: lock_calls.append("lock")
+    )
+
+    runner.capture_model()
+
+    assert lock_calls == ["lock"]
+
+
+def test_capture_model_skips_lock_when_nothing_captured(monkeypatch):
+    """With no graphs to capture (e.g. enforce_eager) there is nothing baked
+    into the workspace, so the early return must not lock it."""
+    runner = _make_capture_runner(captured=False)
+    lock_calls = []
+    monkeypatch.setattr(
+        model_runner_module, "lock_workspace", lambda: lock_calls.append("lock")
+    )
+
+    assert runner.capture_model() == 0
+    assert lock_calls == []
+
+
+def test_capture_model_profile_only_skips_lock(monkeypatch):
+    """The memory-profiling capture pass runs before kernel warmup and the
+    real capture; locking there would stop the warmup from growing the
+    workspace to its scheduler-realistic size."""
+    runner = _make_capture_runner(captured=True)
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
+    )
+    lock_calls = []
+    monkeypatch.setattr(
+        model_runner_module, "lock_workspace", lambda: lock_calls.append("lock")
+    )
+
+    runner.capture_model(profile_only=True)
+
+    assert lock_calls == []
+
+
+@pytest.mark.parametrize("num_reqs", [1, 16])
+def test_dummy_profile_preserves_requested_batch_shape(num_reqs):
+    """Memory profiling must exercise one long query as well as many short ones."""
+    from unittest.mock import Mock
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.max_num_reqs = 16
+    runner.kv_connector = Mock()
+    runner.is_first_pp_rank = True
+    runner.lora_config = None
+    runner.maybe_dummy_run_with_lora = lambda *args, **kwargs: contextlib.nullcontext()
+    captured = []
+
+    class ForwardReached(Exception):
+        pass
+
+    def forward(batch, *args, **kwargs):
+        captured.append(batch.num_scheduled_tokens)
+        raise ForwardReached
+
+    runner.execute_model = forward
+    with pytest.raises(ForwardReached):
+        runner._dummy_run(2048, num_reqs=num_reqs, skip_eplb=True)
+    assert list(captured[0].values()) == [2048 // num_reqs] * num_reqs

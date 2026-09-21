@@ -53,8 +53,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     cu_seqlens,
     ssm_state_indices,
     num_accepted_tokens,
-    a_log,
-    g_bias,
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
@@ -82,10 +80,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
-    SIGMOID_BETA: tl.constexpr,  # beta holds raw logits; sigmoid at fp32 load
-    COMPUTE_GATE: tl.constexpr,  # g holds raw logits; KDA gate computed in-kernel
-    SAFE_GATE: tl.constexpr,  # bounded gate variant (only branch implemented)
-    LOWER_BOUND: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -120,10 +114,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_g = g + bos * HV + i_hv
     else:
         p_gk = g + (bos * HV + i_hv) * K + o_k
-
-    # Per-head gate amplitude, hoisted out of the token loop (COMPUTE_GATE).
-    if COMPUTE_GATE:
-        b_a_log = tl.exp(tl.load(a_log + i_h).to(tl.float32))
 
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
@@ -174,15 +164,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             b_h *= exp(b_g)
         else:
             b_gk = tl.load(p_gk).to(tl.float32)
-            if COMPUTE_GATE:
-                # Replicates kda_gate_fwd_kernel's SAFE_GATE branch
-                # bit-for-bit (same tl.exp, same fp32 math; the intermediate
-                # gate value this replaces was stored/reloaded as fp32,
-                # which is lossless): y = lb / (1 + exp(-exp(A)*(g+bias))).
-                b_gk += tl.load(g_bias + i_h * K + o_k, mask=mask_k, other=0.0).to(
-                    tl.float32
-                )
-                b_gk = LOWER_BOUND / (1.0 + tl.exp(-(b_a_log * b_gk)))
             b_h *= exp(b_gk[None, :])
         # [BV]
         b_v -= tl.sum(b_h * b_k[None, :], 1)
@@ -190,11 +171,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
         else:
             b_beta = tl.load(p_beta).to(tl.float32)
-        # Matches torch's `x.float().sigmoid()` pre-computation bit-for-bit
-        # on the input side (bf16->fp32 is exact); only the sigmoid impl itself
-        # can differ by <=1 ULP.
-        if SIGMOID_BETA:
-            b_beta = tl.sigmoid(b_beta)
         b_v *= b_beta
         # [BV, BK]
         b_h += b_v[:, None] * b_k[None, :]
@@ -303,12 +279,6 @@ def fused_recurrent_gated_delta_rule_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=False,
-        SIGMOID_BETA=False,
-        a_log=None,
-        g_bias=None,
-        COMPUTE_GATE=False,
-        SAFE_GATE=True,
-        LOWER_BOUND=-5.0,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -390,7 +360,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     x = a_val + dt_bias_val
     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
     g_val = -tl.exp(A_log_val) * softplus_x
-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+    beta_val = tl.sigmoid(b_val)
 
     b_h *= exp(g_val)
     b_v -= tl.sum(b_h * b_k[None, :], 1)

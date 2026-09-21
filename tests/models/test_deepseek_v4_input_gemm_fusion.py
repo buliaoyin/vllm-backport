@@ -235,7 +235,7 @@ def test_token_shard_reaches_layers_without_the_fused_trio(with_trio):
     try:
         attn_mod.get_tensor_model_parallel_world_size = lambda: tp
         attn_mod.get_tensor_model_parallel_rank = lambda: 0
-        qr_kv, *_ = DeepseekV4Attention.attn_gemm_parallel_execute(stub, x)
+        qr_kv, *_ = DeepseekV4Attention._run_parallel_input_projections(stub, x)
     finally:
         attn_mod.get_tensor_model_parallel_rank = real_rank
         attn_mod.get_tensor_model_parallel_world_size = real_world
@@ -255,7 +255,7 @@ def test_token_shard_still_declines_below_the_threshold():
     real_world = attn_mod.get_tensor_model_parallel_world_size
     try:
         attn_mod.get_tensor_model_parallel_world_size = lambda: tp
-        qr_kv, *_ = DeepseekV4Attention.attn_gemm_parallel_execute(stub, x)
+        qr_kv, *_ = DeepseekV4Attention._run_parallel_input_projections(stub, x)
     finally:
         attn_mod.get_tensor_model_parallel_world_size = real_world
 

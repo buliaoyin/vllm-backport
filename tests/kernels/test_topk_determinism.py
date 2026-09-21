@@ -62,8 +62,14 @@ def _run_persistent(logits, lengths, k, max_len):
 def _run_decode(logits, lengths, k, max_len):
     out = torch.full((logits.shape[0], k), -1, dtype=torch.int32, device="cuda")
     ops.top_k_per_row_decode(
-        logits, 1, lengths, out, logits.shape[0],
-        logits.stride(0), logits.stride(1), k,
+        logits,
+        1,
+        lengths,
+        out,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        k,
     )
     return out
 

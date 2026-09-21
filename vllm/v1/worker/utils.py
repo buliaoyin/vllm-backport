@@ -13,6 +13,8 @@ import torch
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_trackers
+from vllm.model_executor.layers.utils import warmup_rocm_skinny_gemm_workspaces
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
@@ -150,7 +152,9 @@ class KVBlockZeroer:
         # Overlaid layers (packed layouts) share a base address but may have
         # different page sizes; keep the widest span per address so newly
         # allocated blocks are fully zeroed for every overlaying layer.
-        per_group: dict[int, tuple[dict[int, int], list[int], list[int], list[int]]] = {}
+        per_group: dict[
+            int, tuple[dict[int, int], list[int], list[int], list[int]]
+        ] = {}
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -163,7 +167,6 @@ class KVBlockZeroer:
             seen_ptrs, seg_addrs, seg_block_strides, seg_page_sizes = (
                 per_group.setdefault(group.kv_cache_group_id, ({}, [], [], []))
             )
-
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
@@ -215,8 +218,9 @@ class KVBlockZeroer:
 
         self._group_meta = {
             gid: self.build_meta(seg_addrs, seg_block_strides, seg_page_sizes)
-            for gid, (_, seg_addrs, seg_block_strides, seg_page_sizes)
-            in per_group.items()
+            for gid, (_, seg_addrs, seg_block_strides, seg_page_sizes) in (
+                per_group.items()
+            )
             if seg_addrs
         }
 
@@ -434,12 +438,21 @@ def allocate_kv_cache(
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
     raw_size = sizes.pop()
-    page_size = 4096
-    buf = torch.zeros(
-        ((raw_size + page_size - 1) // page_size) * page_size,
-        dtype=torch.int8,
-        device=device,
-    )
+    # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
+    # are created lazily on the first qualifying GEMM. Force that now, before
+    # the giant backing allocation below: if one landed in this segment's
+    # rounding tail it would pin the whole segment at engine shutdown.
+    if current_platform.is_rocm():
+        warmup_rocm_skinny_gemm_workspaces(device)
+        # Pad to the page granularity MoRIIO needs to register the shared
+        # backing as a single RDMA memory region. Other platforms keep the
+        # exact-size allocation: NIXL and SimpleCPUOffload rely on
+        # storage.nbytes() matching the logical KV size (see #53974).
+        page_size = 4096
+        buf_size = ((raw_size + page_size - 1) // page_size) * page_size
+    else:
+        buf_size = raw_size
+    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
@@ -608,6 +621,7 @@ def bind_kv_cache(
     forward_context: dict[str, Attention],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
+    kv_cache_groups: Sequence[KVCacheGroupSpec] | None = None,
 ) -> None:
     """
     Bind the allocated KV cache to both ModelRunner and forward context so
@@ -633,6 +647,7 @@ def bind_kv_cache(
     for layer_name in kv_caches:
         index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
 
+    ordered_layer_names: list[str] = []
     for layer_index in sorted(index2name.keys()):
         layer_names = index2name[layer_index]
         if len(layer_names) > 1:
@@ -646,6 +661,7 @@ def bind_kv_cache(
             current_platform.check_runner_kv_caches_multi_layer()
         for layer_name in layer_names:
             runner_kv_caches.append(kv_caches[layer_name])
+            ordered_layer_names.append(layer_name)
 
     # Bind kv_caches to forward context. Each layer's bind_kv_cache unpacks
     # its raw allocation into the per-layer view(s) it needs (e.g. Mamba
@@ -653,6 +669,29 @@ def bind_kv_cache(
     # layer for the KV connector to register.
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].bind_kv_cache(kv_cache)
+
+    share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
+
+
+def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
+    """Detach the KV/state cache tensors installed by bind_kv_cache().
+
+    The model object can outlive the runner (e.g. LLMEngine's finalizer keeps
+    it reachable until engine deletion), so dropping the runner's references
+    alone does not release the KV cache memory on teardown paths.
+    """
+    for layer in layers:
+        if not hasattr(layer, "kv_cache"):
+            continue
+        kv_cache = layer.kv_cache
+        layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+        # Clean up quantized KV cache scale views
+        # (int8_per_token_head, fp8_per_token_head)
+        if hasattr(layer, "impl"):
+            if hasattr(layer.impl, "_k_scale_cache"):
+                layer.impl._k_scale_cache = None
+            if hasattr(layer.impl, "_v_scale_cache"):
+                layer.impl._v_scale_cache = None
 
 
 def copy_kv_cache_blocks_inplace(

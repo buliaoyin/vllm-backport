@@ -68,6 +68,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    get_pp_missing_layer_names,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -300,10 +301,11 @@ class Glm5NextDecoderLayer(nn.Module):
         self.num_experts = config.n_routed_experts
         self.is_mtp_layer = is_mtp_layer
         self.mhc = config.mhc
-        self.layer_kind = "kda" if config.is_kda_layer(layer_idx) else "mla"
+        is_kda_layer = not is_mtp_layer and config.is_kda_layer(layer_idx)
+        self.layer_kind = "kda" if is_kda_layer else "mla"
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        if config.is_kda_layer(layer_idx):
+        if is_kda_layer:
             self.self_attn = Glm5NextLinearAttention(
                 config=config,
                 vllm_config=vllm_config,
@@ -764,17 +766,30 @@ class Glm5NextModel(nn.Module):
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
+            # EPLB: the mapping enumerates physical experts, so it must cover
+            # the redundant replicas or their slots are never loaded.
+            num_redundant_experts = next(
+                (
+                    layer.mlp.n_redundant_experts
+                    for layer in self.layers
+                    if isinstance(layer, Glm5NextDecoderLayer)
+                    and isinstance(layer.mlp, Glm5NextMoE)
+                ),
+                0,
+            )
             expert_params_mapping = fused_moe_make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
                 num_experts=self.config.n_routed_experts,
+                num_redundant_experts=num_redundant_experts,
             )
         else:
             expert_params_mapping = []
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
 
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; pad them with zeros for the model shape.
@@ -829,6 +844,7 @@ class Glm5NextModel(nn.Module):
                 _pending_wk_fp8,
                 params_dict,
                 loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 
@@ -841,6 +857,7 @@ class Glm5NextModel(nn.Module):
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,
+                pp_missing_layer_names,
             ):
                 continue
 
@@ -880,28 +897,38 @@ class Glm5NextModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for idx, (
+                is_expert_weight = False
+                for (
                     param_name,
                     weight_name,
                     expert_id,
                     expert_shard_id,
-                ) in enumerate(expert_params_mapping):
+                ) in expert_params_mapping:
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
-                    if is_pp_missing_parameter(name, self):
+                    # A checkpoint expert may map to several physical replicas
+                    # under EPLB; keep `name` intact and try the next entry
+                    # when this physical expert is not local to the rank.
+                    is_expert_weight = True
+                    name_mapped = name.replace(weight_name, param_name)
+                    if is_pp_missing_parameter(name_mapped, self):
                         continue
-                    param = params_dict[name]
+                    param = params_dict[name_mapped]
                     weight_loader = param.weight_loader
-                    weight_loader(
+                    success = weight_loader(
                         param,
                         loaded_weight,
-                        name,
+                        name_mapped,
                         expert_id=expert_id,
                         shard_id=expert_shard_id,
+                        return_success=True,
                     )
-                    break
+                    if success:
+                        name = name_mapped
+                        break
                 else:
+                    if is_expert_weight:
+                        continue
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias")
@@ -1037,7 +1064,7 @@ class Glm5NextForCausalLM(
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid
+    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
 ):
     packed_modules_mapping = {
         **Glm4vForConditionalGeneration.packed_modules_mapping,
@@ -1122,6 +1149,8 @@ class Glm5NextForConditionalGeneration(
                 architectures=["Glm5NextForCausalLM"],
             )
 
+        self.set_moe_parameters()
+
         # PP support: the language model transports the materialized mHC
         # multi-stream state across stage boundaries (DSV4 pattern). The
         # Glm4v __init__ (which would alias this automatically) is skipped
@@ -1129,6 +1158,41 @@ class Glm5NextForConditionalGeneration(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
+
+    def set_moe_parameters(self) -> None:
+        self.moe_mlp_layers = [
+            layer.mlp
+            for layer in self.language_model.model.layers
+            if isinstance(layer, Glm5NextDecoderLayer)
+            and isinstance(layer.mlp, Glm5NextMoE)
+        ]
+        self.moe_layers = [moe.experts for moe in self.moe_mlp_layers]
+        self.num_moe_layers = len(self.moe_layers)
+        if not self.num_moe_layers:
+            return
+        example_moe = self.moe_mlp_layers[0]
+        self.num_expert_groups = self.config.text_config.n_group
+        self.num_logical_experts = example_moe.n_logical_experts
+        self.num_physical_experts = example_moe.n_physical_experts
+        self.num_local_physical_experts = example_moe.n_local_physical_experts
+        self.num_routed_experts = example_moe.n_routed_experts
+        self.num_shared_experts = example_moe.n_shared_experts
+        self.num_redundant_experts = example_moe.n_redundant_experts
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        if not self.num_moe_layers:
+            return
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for moe in self.moe_mlp_layers:
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
     def get_encoder_cudagraph_config(self):
         # This vision tower does not produce the absolute position embedding
@@ -1153,7 +1217,9 @@ def get_spec_layer_idx_from_weight_name(
     return None
 
 
-def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+def _try_load_fp8_indexer_wk(
+    name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
+):
     if "indexer.wk." not in name or "wk_weights" in name:
         return False
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
@@ -1161,6 +1227,11 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if not is_weight and not is_scale:
         return False
     layer_prefix = name.rsplit(".wk.", 1)[0]
+    if any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in pp_missing_layer_names
+    ):
+        return True
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1227,6 +1298,7 @@ def _try_load_fp8_attn_proj(
     params_dict,
     loaded_params,
     kv_a_pad_size: int,
+    pp_missing_layer_names,
 ) -> bool:
     """Dequantize FP8 q_a_proj / kv_a_proj_with_mqa / o_proj to BF16 on load.
 
@@ -1249,6 +1321,11 @@ def _try_load_fp8_attn_proj(
     is_scale = "weight_scale_inv" in name
     if not is_weight and not is_scale:
         return False
+    if any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in pp_missing_layer_names
+    ):
+        return True
 
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"

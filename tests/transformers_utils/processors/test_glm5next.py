@@ -395,6 +395,8 @@ def test_video_config_fields_land():
 def test_processor_from_pretrained_resolves_hf_repo_config(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """Serving from a HF repo id must not open processor_config.json locally."""
+
     class CapturingProcessor(Glm5NextProcessor):
         def __init__(self, **components):
             self.components = components
@@ -422,7 +424,7 @@ def test_processor_from_pretrained_resolves_hf_repo_config(
     processor = CapturingProcessor.from_pretrained(repo_id, revision="test-revision")
 
     tokenizer_loader.assert_called_once_with(repo_id, revision="test-revision")
-    image_config_loader.assert_called_once_with(repo_id)
+    image_config_loader.assert_called_once_with(repo_id, revision="test-revision")
     processor_config_loader.assert_called_once_with(
         "processor_config.json", repo_id, revision="test-revision"
     )

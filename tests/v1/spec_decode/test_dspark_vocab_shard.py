@@ -213,3 +213,35 @@ def test_sharded_draft_matches_replicated_on_8_ranks():
         timeout=900,
     )
     assert "RESULT PASS" in result.stdout, result.stdout[-4000:] + result.stderr[-4000:]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("model_type", ["deepseek_v41", "deepseek_v4", "qwen3"])
+def test_extended_dspark_query_block_is_scoped_to_v41(monkeypatch, model_type):
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    def init_base(self, config, device):
+        self.num_speculative_steps = 7
+        self.max_num_reqs = 16
+        self.max_num_tokens = 128
+        self.dtype = torch.bfloat16
+        self.speculative_config = SimpleNamespace(
+            dspark_num_query_tokens=7, enable_adaptive_verification=False
+        )
+        self.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=model_type, dspark_block_size=5),
+            get_hidden_size=lambda: 8,
+        )
+        self.draft_tokens = torch.empty((16, 7), dtype=torch.int64, device=device)
+
+    monkeypatch.setattr(DFlashSpeculator, "__init__", init_base)
+    if model_type != "deepseek_v41":
+        with pytest.raises(ValueError, match="checkpoint block size"):
+            DSparkSpeculator(None, torch.device("cpu"))
+        return
+    speculator = DSparkSpeculator(None, torch.device("cpu"))
+    assert speculator.num_query_per_req == 7
+    assert speculator._anchor_idx.tolist() == list(range(0, 112, 7))
+    assert speculator._step_cols.tolist() == list(range(7))
+    assert speculator.draft_token_confidence_probs.shape == (16, 7)

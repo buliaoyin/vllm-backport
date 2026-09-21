@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -191,7 +191,7 @@ def _canonical_block_sizes(
     return canonical_bytes_per_block
 
 
-_PIN_CHUNK_BYTES = 1 << 30
+_PIN_SPAN_BYTES = 1 << 30
 
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
@@ -223,22 +223,22 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     slot_size = region._worker_area_end - region._worker_offset
     # The driver caps the *number* of host registrations (about 2^18 across
-    # the GPUs of a node), not the bytes: one ~1 MB registration per block
+    # the GPUs of a node), not the bytes: one ~1 MB registration per chunk
     # tops out at ~250 GB. When this worker owns whole rows (a single worker
     # per row, e.g. DP/TP=1) its slots are contiguous, so register them in
     # large chunks instead. Interleaved layouts (TP>1) keep one registration
     # per slot because a page may only be registered by one process.
     # (row_stride is page-padded, so test "only one slot fits in a row".)
     contiguous = region._worker_offset == 0 and region._row_stride < 2 * slot_size
-    chunk_blocks = max(1, _PIN_CHUNK_BYTES // slot_size) if contiguous else 1
+    span_chunks = max(1, _PIN_SPAN_BYTES // slot_size) if contiguous else 1
     cudart = torch.cuda.cudart()
     registered: list[int] = []
     had_failed_attempt = False
     _t0 = time.perf_counter()
-    for block in range(0, region.num_blocks, chunk_blocks):
-        n_blocks = min(chunk_blocks, region.num_blocks - block)
-        off = block * region._row_stride + region._worker_offset
-        reg_size = slot_size if n_blocks == 1 else n_blocks * region._row_stride
+    for chunk in range(0, region.num_chunks, span_chunks):
+        n_chunks = min(span_chunks, region.num_chunks - chunk)
+        off = chunk * region._row_stride + region._worker_offset
+        reg_size = slot_size if n_chunks == 1 else n_chunks * region._row_stride
         # Transient failures happen under memory pressure (concurrent ranks
         # pinning + model weights loading); retry before giving up.
         for attempt in range(4):
@@ -254,10 +254,10 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             # loop consumes it; log the real failure here, at its origin.
             had_failed_attempt = True
             logger.warning(
-                "cudaHostRegister rank=%d block=%d attempt=%d failed with "
+                "cudaHostRegister rank=%d chunk=%d attempt=%d failed with "
                 "code=%d; retrying",
                 rank,
-                block,
+                chunk,
                 attempt,
                 result.value,
             )
@@ -280,8 +280,8 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             # dereference these host pointers and crash later with an async
             # cudaErrorInvalidValue far from this code. Fail fast instead.
             raise RuntimeError(
-                f"cudaHostRegister failed for rank={rank} at block {block}/"
-                f"{region.num_blocks} (code={result.value}) after retries. "
+                f"cudaHostRegister failed for rank={rank} at chunk {chunk}/"
+                f"{region.num_chunks} (code={result.value}) after retries. "
                 "This usually means host memory pressure or insufficient "
                 "free /dev/shm. Check for stale vllm_offload_*.mmap files "
                 "and overall RAM usage."
@@ -290,12 +290,12 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     region._pinned_slot_offsets = registered
     region.is_pinned = True
     logger.info(
-        "cudaHostRegister rank=%d pinned %d blocks in %d registrations "
+        "cudaHostRegister rank=%d pinned %d chunks in %d registrations "
         "(%.2f GB) in %.1fs",
         rank,
-        region.num_blocks,
+        region.num_chunks,
         len(registered),
-        region.num_blocks * slot_size / 1e9,
+        region.num_chunks * slot_size / 1e9,
         time.perf_counter() - _t0,
     )
 
@@ -324,9 +324,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
         probe = torch.zeros(8, device="cuda")
         probe += 1
         torch.cuda.synchronize()
-        logger.info(
-            "Device healthy after clearing stale CUDA error; continuing boot."
-        )
+        logger.info("Device healthy after clearing stale CUDA error; continuing boot.")
 
 
 def _new_descriptor_buffers(
@@ -366,7 +364,7 @@ class SingleDirectionOffloadingHandler:
             gpu_tensors: list of GPU KV cache tensors.
                 Each of shape (num_gpu_blocks, gpu_page_size_bytes) with dtype int8.
             cpu_tensors: list of CPU KV cache tensors.
-                Each of shape (num_cpu_blocks, cpu_page_size_bytes) with dtype int8.
+                Each of shape (num_cpu_chunks, cpu_page_size_bytes) with dtype int8.
                 Order should match gpu_tensors.
             layer_refs_per_group: list of CanonicalKVCacheRef per group.
             gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
@@ -636,20 +634,20 @@ class SingleDirectionOffloadingHandler:
         # 1. GPU -> CPU
         # 2. CPU -> GPU
         #
-        # transfers are also to CPU blocks, EXCEPT MAYBE for the first and last block.
-        # i.e. the first and last CPU blocks in src_blocks can match against
+        # transfers are also to CPU chunks, EXCEPT MAYBE for the first and last chunk.
+        # i.e. the first and last CPU chunks in src_blocks can match against
         # a smaller (byte-wise) set of GPU blocks in dst_blocks.
         # In such cases, we may need to skip some gpu-sized sub-blocks,
-        # and start reading/writing from the middle of the first CPU block.
+        # and start reading/writing from the middle of the first CPU chunk.
         # If we have multiple KV cache groups (when using HMA with hybrid models),
-        # we may have a partial first/last CPU block per each group.
+        # we may have a partial first/last CPU chunk per each group.
         # The group_sizes parameter encodes the size of each group of blocks
         # in the GPU dst_blocks.
         # If group_sizes is None, we assume all blocks belong to a single group.
         # The logical_offset parameter maps each group of blocks to its logical
         # offset inside the request, counting in GPU blocks.
         # This allows us to find the correct starting position
-        # in the matching first CPU block.
+        # in the matching first CPU chunk.
 
         # extract group_sizes from the GPU spec
         gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
@@ -745,8 +743,10 @@ class SingleDirectionOffloadingHandler:
 
         # Stores must wait for the model to finish writing the KV they read.
         # Loads must wait for pending writes (including zeroing) to their
-        # destination blocks; otherwise an earlier transfer can be overwritten
-        # by compute-stream work that was already queued when the load began.
+        # destination blocks: the scheduler's _skip_zero_block_ids only edits
+        # the step being scheduled and cannot retract zeroing shipped in an
+        # earlier step for a since-reallocated block; with async scheduling
+        # nothing else orders that zeroing against this copy.
         stream.wait_stream(current_platform.current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
@@ -858,7 +858,7 @@ class CPUOffloadingWorker(OffloadingWorker):
         self,
         kv_caches: CanonicalKVCaches,
         blocks_per_chunk: int,
-        num_cpu_blocks: int,
+        num_cpu_chunks: int,
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
     ):
@@ -897,16 +897,16 @@ class CPUOffloadingWorker(OffloadingWorker):
             else:
                 t0 = time.monotonic()
                 cpu_tensor = torch.zeros(
-                    (num_cpu_blocks, cpu_page_size_bytes),
+                    (num_cpu_chunks, cpu_page_size_bytes),
                     dtype=torch.int8,
                     device="cpu",
                     pin_memory=pin_memory,
                 )
                 logger.debug(
                     "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
-                    num_cpu_blocks,
+                    num_cpu_chunks,
                     cpu_page_size_bytes,
-                    num_cpu_blocks * cpu_page_size_bytes / 1e9,
+                    num_cpu_chunks * cpu_page_size_bytes / 1e9,
                     time.monotonic() - t0,
                 )
 

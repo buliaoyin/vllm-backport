@@ -46,12 +46,8 @@ def test_shared_workspace_matches_per_call_workspace(m: int) -> None:
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
     w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
 
-    w1_data = MarlinMoEWeightData.make(
-        w=w1, quant_type=b_type, group_size=128, act_order=False, input_type=dtype
-    )
-    w2_data = MarlinMoEWeightData.make(
-        w=w2, quant_type=b_type, group_size=128, act_order=False, input_type=dtype
-    )
+    w1_data = MarlinMoEWeightData.make(w=w1, quant_type=b_type, group_size=128)
+    w2_data = MarlinMoEWeightData.make(w=w2, quant_type=b_type, group_size=128)
 
     score = torch.randn((m, e), device="cuda", dtype=dtype)
     topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
@@ -71,10 +67,6 @@ def test_shared_workspace_matches_per_call_workspace(m: int) -> None:
             expert_map=None,
             global_scale1=w1_data.global_scale,
             global_scale2=w2_data.global_scale,
-            g_idx1=w1_data.g_idx,
-            g_idx2=w2_data.g_idx,
-            sort_indices1=w1_data.sort_indices,
-            sort_indices2=w2_data.sort_indices,
             w1_zeros=w1_data.zeros,
             w2_zeros=w2_data.zeros,
             quant_type_id=b_type.id,

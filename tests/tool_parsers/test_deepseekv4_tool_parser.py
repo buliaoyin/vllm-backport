@@ -88,7 +88,13 @@ def build_tool_call(func_name: str, params: dict[str, str]) -> str:
     return f'{TC_START}\n{INV_START}{func_name}">\n{param_strs}{INV_END}\n{TC_END}'
 
 
-def stream(parser: DeepSeekV4EngineToolParser, full_text: str, chunk_size: int = 7):
+def stream(
+    parser: DeepSeekV4EngineToolParser,
+    full_text: str,
+    chunk_size: int = 7,
+    request=None,
+):
+    request = request if request is not None else make_request()
     deltas = []
     previous_text = ""
     for start in range(0, len(full_text), chunk_size):
@@ -101,7 +107,7 @@ def stream(parser: DeepSeekV4EngineToolParser, full_text: str, chunk_size: int =
             previous_token_ids=[],
             current_token_ids=[],
             delta_token_ids=[1],
-            request=make_request(),
+            request=request,
         )
         previous_text = current_text
         if delta is not None:
@@ -148,10 +154,78 @@ def test_extract_tool_calls():
     }
 
 
-def test_function_calls_block_is_not_accepted():
+def _search_tool() -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "search",
+            "description": "Search",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        },
+    )
+
+
+def test_function_calls_wrapper_is_not_recognized():
+    # The V3.2 wrapper is foreign to V4: the whole block, invoke included,
+    # passes through as plain content instead of being parsed as a call.
     parser = make_parser()
     model_output = build_tool_call("search", {"query": "vllm"}).replace(
         "tool_calls", "function_calls"
+    )
+
+    result = parser.extract_tool_calls(model_output, make_request())
+
+    assert not result.tools_called
+    assert result.tool_calls == []
+    assert result.content == model_output
+
+
+def test_missing_tool_calls_wrapper_is_recovered():
+    # Regression for #48931: at long context the model omits the
+    # <｜DSML｜tool_calls> START token but still emits a complete invoke.
+    # Recovery is only attempted for names the request declared, so the
+    # request must carry the tool.
+    tools = [_search_tool()]
+    parser = make_parser(tools=tools)
+    model_output = build_tool_call("search", {"query": "vllm"}).replace(
+        TC_START + "\n", ""
+    )
+    assert TC_START not in model_output
+
+    result = parser.extract_tool_calls(model_output, make_request(tools=tools))
+
+    assert result.tools_called
+    assert result.tool_calls[0].function.name == "search"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"query": "vllm"}
+    assert result.content is None
+
+    deltas = stream(
+        make_parser(tools=tools),
+        model_output,
+        chunk_size=3,
+        request=make_request(tools=tools),
+    )
+    names = [
+        tc.function.name
+        for d in deltas
+        if d.tool_calls
+        for tc in d.tool_calls
+        if tc.function.name
+    ]
+    assert names == ["search"]
+    assert json.loads(reconstruct_args(deltas)) == {"query": "vllm"}
+    assert not any(d.content and "DSML" in d.content for d in deltas)
+
+
+def test_missing_tool_calls_wrapper_undeclared_name_stays_content():
+    # Without a declared tool of that name, an orphan invoke is not
+    # recovered: it would otherwise let free text impersonate a call.
+    parser = make_parser()
+    model_output = build_tool_call("search", {"query": "vllm"}).replace(
+        TC_START + "\n", ""
     )
 
     result = parser.extract_tool_calls(model_output, make_request())

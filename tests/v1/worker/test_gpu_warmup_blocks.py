@@ -22,6 +22,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
@@ -88,6 +89,7 @@ def _make_runner(
     """Stub model runner exposing only what the warmup entry points read."""
     return SimpleNamespace(
         num_speculative_steps=num_spec_steps,
+        adaptive_verification=None,
         decode_query_len=num_spec_steps + 1,
         is_pooling_model=False,
         is_encoder_decoder=False,
@@ -239,6 +241,16 @@ def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
         kv_cache_groups=[
             _attention_group(),
             _circular_group(),
+            KVCacheGroupSpec(
+                ["kpool_tail"],
+                KpoolTailSpec(
+                    block_size=BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=BLOCK_SIZE,
+                ),
+            ),
             _mamba_group("none"),
             _mamba_group("all"),
             _mamba_group("align"),

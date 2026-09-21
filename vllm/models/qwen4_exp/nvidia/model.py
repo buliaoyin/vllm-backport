@@ -8,9 +8,11 @@ from itertools import islice
 import torch
 from torch import nn
 
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.fused_moe.utils import (
+    is_model_fused_shared_expert_compatible,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -138,9 +140,9 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_input_scale",
 ]
 
-# The checkpoint keeps down and injection projections separate; runtime packs
-# them into adjacent logical shards of one MergedColumnParallelLinear.
-_HC_WEIGHTS_MAPPER = WeightsMapper(
+# The checkpoint stores these projections separately; runtime packs each group
+# into adjacent logical shards of a MergedColumnParallelLinear.
+_EXTRA_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_stacked={
         "hyper_connection.input_mix_weight_down.weight": (
             "hyper_connection.input_mix_weight_down_block_inject.weight",
@@ -150,6 +152,8 @@ _HC_WEIGHTS_MAPPER = WeightsMapper(
             "hyper_connection.input_mix_weight_down_block_inject.weight",
             1,
         ),
+        "ple.key_proj": ("ple.kv_proj", 0),
+        "ple.value_proj": ("ple.kv_proj", 1),
     }
 )
 
@@ -279,11 +283,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if prev_block_output is None:
+            assert prev_injection is None
         attn_hc = self.attn_hyper_connection
         if self.ple is not None:
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
-            if prev_block_output is not None and prev_injection is not None:
+            if prev_block_output is not None:
                 hidden_states = attn_hc.combine(
                     hidden_states, prev_block_output, prev_injection
                 )
@@ -299,7 +305,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
-        if prev_block_output is not None and prev_injection is not None:
+        if prev_block_output is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
             )
@@ -374,19 +380,8 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-        "query_start_loc": 0,
-        "ngram_context": 0,
-        "deepstack_input_embeds": 0,
-    }
-)
 class Qwen4ExpModel(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _HC_WEIGHTS_MAPPER
+    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -414,6 +409,11 @@ class Qwen4ExpModel(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+        )
+        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
+            self.layers,
+            Qwen4ExpSparseMoeBlock,
+            "mlp",
         )
         intermediate_size = config.hidden_size * config.hc_count
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -461,6 +461,27 @@ class Qwen4ExpModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    @staticmethod
+    def _start_layer_ple_prefetch(
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None,
+        ngram_context: torch.Tensor | None,
+    ) -> None:
+        """Start a layer's PLE prefetch when the required inputs exist."""
+        ple: Qwen4ExpPLELayer | None = getattr(layer, "ple", None)
+        if ple is None:
+            return
+        if input_ids is None or query_start_loc is None or ngram_context is None:
+            raise RuntimeError("PLE inputs were not prepared")
+        ple.start_prefetch(
+            hidden_states,
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -487,10 +508,26 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        if self.start_layer < self.end_layer:
+            self._start_layer_ple_prefetch(
+                self.layers[self.start_layer],
+                hidden_states,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
             last_layer = layer
+            if layer_idx + 1 < self.end_layer:
+                self._start_layer_ple_prefetch(
+                    self.layers[layer_idx + 1],
+                    hidden_states,
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                )
             hidden_states, block_output, injection = layer(
                 hidden_states=hidden_states,
                 prev_block_output=block_output,
@@ -558,25 +595,31 @@ class Qwen4ExpModel(nn.Module):
         )
         weights = maybe_fuse_shared_experts(
             weights,
+            enabled=self.is_fused_shared_expert_enabled,
             n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
         )
         # Non-persistent PLE state rebuilt in __init__; skip any ckpt
         # column for them.
-        skip_substrs = [
+        skip_substrs = (
             "hashstats_",
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
-        ]
-        if self.hyper_connection_mixer is None:
-            # The final mixer exists only on the last pipeline stage.
-            skip_substrs.append("hyper_connection_mixer.")
+        )
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={substr: None for substr in skip_substrs}
         )
+        # The final HC mixer only exists on the last PP rank; earlier ranks
+        # must drop its checkpoint weights instead of failing to place them.
+        ignore_prefixes = (
+            None
+            if self.hyper_connection_mixer is not None
+            else ["hyper_connection_mixer."]
+        )
         loader = AutoWeightsLoader(
             self,
+            ignore_unexpected_prefixes=ignore_prefixes,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(
@@ -598,6 +641,7 @@ class Qwen4ExpForCausalLM(
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
         "input_mix_weight_down_block_inject": [
@@ -834,11 +878,12 @@ class Qwen4ExpForConditionalGeneration(
     requires_raw_input_tokens = True
 
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
+        "kv_proj": ["key_proj", "value_proj"],
         "input_mix_weight_down_block_inject": [
             "input_mix_weight_down",
             "block_inject_weight",
             "_input_mix_padding",
-        ]
+        ],
     }
 
     @staticmethod

@@ -522,6 +522,7 @@ def test_shared_experts_serialize_device_wide_exl3_workspace(monkeypatch):
         moe,
         False,
         lambda: False,
+        is_multistream_safe=lambda: True,
         disable_overlap=not method.supports_multi_stream,
     )
     x = torch.ones(2, 128)

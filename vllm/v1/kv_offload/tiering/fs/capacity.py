@@ -3,8 +3,8 @@
 """
 LRU capacity manager for the file system KV offload tier.
 
-The fs tier has no inherent size bound: every offloaded block becomes a file
-and nothing ever deletes them. FsCapacityManager tracks the tier's block files
+The fs tier has no inherent size bound: every offloaded chunk becomes a file
+and nothing ever deletes them. FsCapacityManager tracks the tier's chunk files
 in an LRU ordering and, once total size exceeds ``capacity_bytes``, unlinks
 least-recently-used files until usage drops below
 ``capacity_bytes * watermark``.
@@ -103,7 +103,9 @@ class FsCapacityManager:
             if self._n_stores % 5000 == 0:
                 logger.info(
                     "fs tier capacity: %d stores accounted, usage %.2f/%.2f GB",
-                    self._n_stores, self.total_bytes / 1e9, self.capacity_bytes / 1e9,
+                    self._n_stores,
+                    self.total_bytes / 1e9,
+                    self.capacity_bytes / 1e9,
                 )
 
     def record_use(self, path: str) -> None:

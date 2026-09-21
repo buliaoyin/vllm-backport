@@ -116,6 +116,7 @@ def test_glm5next_pp_loads_mhc_checkpoint_names(checkpoint_prefix, parameter_pre
     nn.Module.__init__(model)
     model.config = SimpleNamespace(is_moe=False, mla_nope=False)
     model.quant_config = None
+    model.num_redundant_experts = 0
     layer = nn.Module()
     layer.register_parameter(parameter_prefix + "base", nn.Parameter(torch.zeros(2)))
     model.layers = nn.ModuleList([layer, glm5_model.PPMissingLayer()])
@@ -136,6 +137,7 @@ def test_glm5next_loads_fused_kda_convolution_and_forget_gate():
     nn.Module.__init__(model)
     model.config = SimpleNamespace(is_moe=False, mla_nope=False)
     model.quant_config = None
+    model.num_redundant_experts = 0
     layer = nn.Module()
     layer.self_attn = nn.Module()
     for proj in ("q", "k", "v"):
@@ -292,6 +294,7 @@ def test_glm5next_mtp_requires_embedding_when_pp_cannot_share(
         mla_nope=False,
     )
     model.quant_config = None
+    model.num_redundant_experts = 0
     model.model = nn.Module()
     model.model.mtp_start_layer_idx = 45
     model.model.num_mtp_layers = 1

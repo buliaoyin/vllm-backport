@@ -7,6 +7,7 @@ from vllm.config import CompilationMode, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.utils import PPMissingLayer
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -33,12 +34,57 @@ def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module
     )
 
 
+def maybe_share_target_embed(
+    draft_model: nn.Module, draft_inner: nn.Module, target_inner: nn.Module
+) -> None:
+    """Share the target input embedding with the drafter when needed."""
+    target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+        target_inner, "embedding", None
+    )
+    if isinstance(target_embed, PPMissingLayer):
+        target_embed = None
+    # The drafter does not use the target's LoRA adapter.
+    if isinstance(target_embed, BaseLayerWithLoRA):
+        target_embed = target_embed.base_layer
+    draft_embed = getattr(draft_inner, "embed_tokens", None)
+
+    if get_pp_group().world_size > 1 and not hasattr(
+        draft_model, "has_own_embed_tokens"
+    ):
+        return
+
+    if target_embed is None:
+        if hasattr(draft_inner, "embed_tokens") and not getattr(
+            draft_model, "has_own_embed_tokens", False
+        ):
+            raise RuntimeError(
+                f"{type(draft_model).__name__} needs the target input embedding, "
+                "but it is unavailable on this PP stage"
+            )
+        return
+
+    if _should_share(draft_model, "has_own_embed_tokens", draft_embed, target_embed):
+        if draft_embed is not None:
+            del draft_inner.embed_tokens
+        draft_inner.embed_tokens = target_embed
+
+
 def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
 
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    if speculative_config.moe_backend is not None:
+        # Otherwise the draft inherits the target's --moe-backend, which
+        # fails when the draft is unquantized and that backend is not.
+        vllm_config = replace(
+            vllm_config,
+            kernel_config=replace(
+                vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            ),
+        )
     if speculative_config.kv_cache_dtype is not None:
         vllm_config = replace(
             vllm_config,
@@ -47,18 +93,23 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 cache_dtype=speculative_config.kv_cache_dtype,
             ),
         )
-    # enforce_eager on the speculative config must make the DRAFT eager too.
-    # Without this the draft inherits the target's VLLM_COMPILE mode; dynamo
-    # then fails on data-dependent asserts in some draft models (observed:
-    # Qwen3.5 MTP head), and concurrent draft+target AOT compiles race in
-    # TritonBundler's cache.
-    #
-    # Mutate the mode in place instead of dataclasses.replace(): the draft's
-    # attention layers register into THIS compilation_config's
-    # static_forward_context at construction, and the runtime forward context
-    # looks them up in the original object — a replaced copy strands the
-    # draft's layers in a dict nobody reads (KeyError
-    # 'mtp.layers.0.self_attn.attn' during profiling).
+    if speculative_config.attention_backend is not None:
+        # Before get_model(): the backend is read off the constructed layers.
+        # Only when set, so the draft keeps a KV cache layout the target shares.
+        vllm_config = replace(
+            vllm_config,
+            attention_config=replace(
+                vllm_config.attention_config,
+                backend=speculative_config.attention_backend,
+            ),
+        )
+    # enforce_eager on the speculative config must make the DRAFT eager too;
+    # otherwise the draft inherits the target's VLLM_COMPILE mode (dynamo
+    # fails on data-dependent asserts in some MTP heads, and concurrent
+    # draft+target AOT compiles race in TritonBundler's cache). Mutate the
+    # mode in place rather than replace(): the draft's attention layers
+    # register into this compilation_config's static_forward_context, which
+    # the runtime forward context looks up on the original object.
     compilation_config = vllm_config.compilation_config
     original_mode = compilation_config.mode
     if speculative_config.enforce_eager:
@@ -79,25 +130,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     target_inner = target_language_model.model
     draft_inner = eagle_model.model
 
-    # Skip embedding sharing under PP — each rank owns its own embedding.
-    if get_pp_group().world_size == 1:
-        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
-            target_inner, "embedding", None
-        )
-        # If the target's embedding is LoRA-wrapped, share the underlying base
-        # layer. The draft is not part of the LoRA adapter; sharing the wrapper
-        # would make the draft run the LoRA embedding kernel with the target's
-        # punica metadata (sized for the target's token count), causing an
-        # out-of-bounds GPU access during multi-step draft decode.
-        if isinstance(target_embed, BaseLayerWithLoRA):
-            target_embed = target_embed.base_layer
-        draft_embed = getattr(draft_inner, "embed_tokens", None)
-        if target_embed is not None and _should_share(
-            eagle_model, "has_own_embed_tokens", draft_embed, target_embed
-        ):
-            if draft_embed is not None:
-                del draft_inner.embed_tokens
-            draft_inner.embed_tokens = target_embed
+    maybe_share_target_embed(eagle_model, draft_inner, target_inner)
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(eagle_model, "lm_head", None)

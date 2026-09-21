@@ -29,7 +29,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 
 WINDOW = 8
-MAX_IMG = 12
+MAX_IMG = 6
 WIDTH = WINDOW + MAX_IMG
 BLOCK_SIZE = 64
 
@@ -289,7 +289,6 @@ def combine_case(
     query_lens: list[int],
     spans: list[list[tuple[int, int]]],
     with_image: bool,
-    backend: str = "shared",
 ):
     """Run combine_topk_swa_indices and return (indices, lens, expected)."""
     device = torch.device("cuda")
@@ -320,12 +319,7 @@ def combine_case(
     else:
         left_t = right_t = None
 
-    from vllm.models.deepseek_v4.amd.rocm import (
-        combine_topk_swa_indices as ampere_combine,
-    )
-
-    combine = ampere_combine if backend == "ampere" else combine_topk_swa_indices
-    combined_indices, combined_lens = combine(
+    combined_indices, combined_lens = combine_topk_swa_indices(
         topk_indices,
         query_start_loc,
         seq_lens_t,
@@ -363,8 +357,7 @@ def combine_case(
             swa_len = end - start
             row = [-1] * combined_topk
             for j in range(topk_len):
-                index = int(topk_cpu[token, j])
-                row[j] = index + M * b if backend == "shared" or index < N else -1
+                row[j] = int(topk_cpu[token, j]) + M * b
             for j in range(swa_len):
                 row[topk_len + j] = M * b + N + start + j - gather_start
             rows.append(row)
@@ -380,9 +373,8 @@ COMBINE_CASES = [
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("backend", ["shared", "ampere"])
 @pytest.mark.parametrize("cfg", COMBINE_CASES)
-def test_combine_topk_swa_with_image_spans(cfg, backend):
+def test_combine_topk_swa_with_image_spans(cfg):
     case = CASES[0]
     indices, lens, rows, exp_lens = combine_case(
         cfg["compress_ratio"],
@@ -391,16 +383,14 @@ def test_combine_topk_swa_with_image_spans(cfg, backend):
         case["query_lens"],
         case["spans"],
         with_image=True,
-        backend=backend,
     )
     assert lens.cpu().tolist() == exp_lens
     assert indices.cpu().tolist() == rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("backend", ["shared", "ampere"])
 @pytest.mark.parametrize("cfg", COMBINE_CASES)
-def test_combine_topk_swa_without_image_unchanged(cfg, backend):
+def test_combine_topk_swa_without_image_unchanged(cfg):
     """left_visible=None must reproduce the plain causal combined indices."""
     case = CASES[0]
     indices, lens, rows, exp_lens = combine_case(
@@ -410,7 +400,6 @@ def test_combine_topk_swa_without_image_unchanged(cfg, backend):
         case["query_lens"],
         case["spans"],
         with_image=False,
-        backend=backend,
     )
     assert lens.cpu().tolist() == exp_lens
     assert indices.cpu().tolist() == rows

@@ -751,9 +751,7 @@ def _c128_prefill_inputs(m_tokens: int, depth: int, device: torch.device) -> dic
     gather_start = seq_len - gather_len
     row_stride = n_rows + SWA_LEN + m_tokens
     ratio = _PREFILL_COMPRESS_RATIO
-    top_k = min(
-        max(triton.next_power_of_2(max(seq_len // ratio, 1)), ratio), n_rows
-    )
+    top_k = min(max(triton.next_power_of_2(max(seq_len // ratio, 1)), ratio), n_rows)
 
     positions = torch.arange(depth, seq_len, device=device, dtype=torch.int32)
     topk_len = torch.clamp(
@@ -894,9 +892,7 @@ def _c128_prefill_fp32_error(inp: dict, out: torch.Tensor, samples: int = 24) ->
     those are the two the block's masks treat specially.
     """
     m_tokens = inp["q"].shape[0]
-    picks = sorted(
-        {0, m_tokens - 1, *torch.randint(0, m_tokens, (samples,)).tolist()}
-    )
+    picks = sorted({0, m_tokens - 1, *torch.randint(0, m_tokens, (samples,)).tolist()})
     worst = 0.0
     for t in picks:
         n = int(inp["lens"][t])
@@ -948,9 +944,7 @@ def bench_sparse_prefill_c128(
                 ]
             )
 
-        for block_m, block_k, num_warps in itertools.product(
-            block_ms, block_ks, warps
-        ):
+        for block_m, block_k, num_warps in itertools.product(block_ms, block_ks, warps):
             fn = partial(
                 _launch_c128_prefill_blocked,
                 inp,
@@ -1035,8 +1029,10 @@ def _c128_decode_inputs(
         torch.div(positions + 1, _PREFILL_COMPRESS_RATIO, rounding_mode="floor"),
         max=comp_per_req,
     ).reshape(-1)
-    comp_dense = comp_slots[:, None, :].expand(batch, next_n, comp_per_req).reshape(
-        batch * next_n, comp_per_req
+    comp_dense = (
+        comp_slots[:, None, :]
+        .expand(batch, next_n, comp_per_req)
+        .reshape(batch * next_n, comp_per_req)
     )
     comp_dense = torch.where(
         torch.arange(comp_per_req, device=device)[None, :] < comp_lens[:, None],
@@ -1214,7 +1210,7 @@ def bench_sparse_decode_c128(
 
         reference = None
 
-        def _err(got: torch.Tensor) -> str:
+        def _err(got: torch.Tensor, reference: torch.Tensor | None) -> str:
             # Scaled by the output's own magnitude, not per element: attention
             # over ~1,700 rows of random KV has components scattered around
             # zero, and a per-element ratio divides by that noise.
@@ -1231,7 +1227,7 @@ def bench_sparse_decode_c128(
                 # The per-query kernel measured against its own first split
                 # count is the metric's floor: whatever it reports is split-K
                 # reassociation, not a property of the blocked path.
-                err = _err(inp["out"]) if us == us else "-"
+                err = _err(inp["out"], reference) if us == us else "-"
                 if reference is None and us == us:
                     reference = inp["out"].clone().to(torch.float32)
                     err = "ref"
@@ -1253,7 +1249,7 @@ def bench_sparse_decode_c128(
         for block_m, s, w in itertools.product(usable, all_splits, warps):
             fn = partial(_launch_c128_decode_blocked, inp, block_m, block_h, 32, s, w)
             us = _time_us(fn)
-            err = _err(inp["out"]) if us == us else "-"
+            err = _err(inp["out"], reference) if us == us else "-"
             rows.append(
                 [
                     str(batch),

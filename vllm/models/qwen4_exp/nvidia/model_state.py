@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.distributed.utils import get_pp_indices
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -27,9 +28,28 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
-        self.uses_ngram_embedding = (
-            bool(config.ple_layer_ids) and get_pp_group().is_first_rank
-        )
+        has_ple_layers = bool(config.ple_layer_ids)
+        pp_group = get_pp_group()
+        if has_ple_layers and pp_group.world_size > 1:
+            # Non-first pipeline ranks receive intermediate tensors instead of
+            # the raw input_ids PLE needs, so every PLE layer must live on the
+            # first stage, which is the only rank preparing the PLE inputs.
+            _, first_stage_end = get_pp_indices(
+                config.num_hidden_layers, 0, pp_group.world_size
+            )
+            misplaced = sorted(
+                int(layer_id)
+                for layer_id in config.ple_layer_ids
+                if int(layer_id) - 1 >= first_stage_end
+            )
+            if misplaced:
+                raise RuntimeError(
+                    "N-gram PLE embedding requires every PLE layer on the first "
+                    f"pipeline stage (layers 1..{first_stage_end}), but "
+                    f"ple_layer_ids={misplaced} fall on later stages. Adjust "
+                    "VLLM_PP_LAYER_PARTITION or run with PP=1."
+                )
+        self.uses_ngram_embedding = has_ple_layers and pp_group.is_first_rank
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -39,6 +59,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if self.ngram_context_len <= 0:
             raise ValueError("N-gram embedding requires context length >= 1.")
         self.ngram_eos_token_id = int(config.eos_token_id)
+        # PLE runs inside captured regions, so these buffers keep a fixed shape
+        # and address as the active request count changes between replays.
         self.ngram_context = torch.full(
             (self.max_num_reqs, self.ngram_context_len),
             self.ngram_eos_token_id,
@@ -63,8 +85,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         req_states: RequestState,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
-        num_reqs_padded = input_batch.num_reqs_after_padding
-        context = self.ngram_context[:num_reqs_padded]
+        context = self.ngram_context
         context.fill_(self.ngram_eos_token_id)
         if num_reqs == 0:
             return context
@@ -96,8 +117,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return model_inputs
 
         num_reqs_padded = input_batch.num_reqs_after_padding
-        query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
-        query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        query_start_loc = self.ple_query_start_loc
+        query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
+        # Represent unused capacity as trailing zero-length requests.
+        query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
         model_inputs.update(
             query_start_loc=query_start_loc,
             ngram_context=self._prepare_ngram_context(input_batch, req_states),
@@ -113,7 +136,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if not self.uses_ngram_embedding:
             return model_inputs
 
-        query_start_loc = self.ple_query_start_loc[: num_reqs + 1]
+        query_start_loc = self.ple_query_start_loc
         query_start_loc[0] = 0
         tokens_per_req, num_extra_tokens = divmod(num_tokens, num_reqs)
         query_lens = torch.full(
@@ -124,9 +147,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         if num_extra_tokens > 0:
             query_lens[-num_extra_tokens:] += 1
-        torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
+        torch.cumsum(query_lens, dim=0, out=query_start_loc[1 : num_reqs + 1])
+        query_start_loc[num_reqs + 1 :].fill_(num_tokens)
 
-        ngram_context = self.ngram_context[:num_reqs]
+        ngram_context = self.ngram_context
         ngram_context.fill_(self.ngram_eos_token_id)
         model_inputs.update(
             query_start_loc=query_start_loc,

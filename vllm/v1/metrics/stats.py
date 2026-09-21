@@ -183,6 +183,32 @@ class SchedulerIterationDetails:
 
 
 @dataclass
+class ExpertCacheStats:
+    """Hybrid expert cache deltas; routes include speculative verification work."""
+
+    gpu_hits: int = 0
+    cpu_misses: int = 0
+    decode_checks: int = 0
+    updates: int = 0
+    experts_reloaded: int = 0
+    reload_seconds: float = 0.0
+    host_lru_hits: int = 0
+    repacked_experts: int = 0
+
+    def accumulate(self, other: "ExpertCacheStats") -> None:
+        for name in self.__dataclass_fields__:
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+
+    def delta(self, previous: "ExpertCacheStats") -> "ExpertCacheStats":
+        return ExpertCacheStats(
+            **{
+                name: getattr(self, name) - getattr(previous, name)
+                for name in self.__dataclass_fields__
+            }
+        )
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -204,6 +230,7 @@ class SchedulerStats:
     kv_cache_eviction_events: list[KVCacheEvictionEvent] = field(default_factory=list)
 
     spec_decoding_stats: SpecDecodingStats | None = None
+    expert_cache_stats: ExpertCacheStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
 
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)
@@ -219,6 +246,7 @@ class RequestStateStats:
     """Stats that need to be tracked across delta updates."""
 
     num_generation_tokens: int = 0
+    num_preemptions: int = 0
 
     # This is an engine frontend timestamp (wall-clock)
     arrival_time: float = 0.0
@@ -244,6 +272,7 @@ class FinishedRequestStats:
     request_id: str | None = None
     e2e_latency: float = 0.0
     num_prompt_tokens: int = 0
+    num_preemptions: int = 0
     num_generation_tokens: int = 0
     max_tokens_param: int | None = None
     queued_time: float = 0.0
@@ -523,6 +552,7 @@ class IterationStats:
                 lora_states.request_running(req_id, lora_name)
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
+                req_stats.num_preemptions += 1
                 lora_states.request_waiting(req_id, lora_name)
 
     def update_from_finished_request(
@@ -563,6 +593,7 @@ class IterationStats:
             request_id=request_id,
             e2e_latency=e2e_latency,
             num_prompt_tokens=num_prompt_tokens,
+            num_preemptions=req_stats.num_preemptions,
             num_generation_tokens=req_stats.num_generation_tokens,
             max_tokens_param=max_tokens_param,
             queued_time=queued_time,

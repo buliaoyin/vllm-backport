@@ -135,6 +135,10 @@ class MultiprocExecutor(Executor):
         )
         set_multiprocessing_worker_envs(num_local_procs)
 
+        from vllm.models.deepseek_v4_1.hybrid_runtime import HybridExecutorResources
+
+        self.hybrid_resources = HybridExecutorResources(self.vllm_config)
+
         if aiter_requires_tcp_store():
             distributed_init_method = get_distributed_init_method(
                 get_loopback_ip(), get_open_port()
@@ -556,6 +560,8 @@ class MultiprocExecutor(Executor):
                 mq.shutdown()
             self.response_mqs = []
 
+        if resources := getattr(self, "hybrid_resources", None):
+            resources.close()
         logger.debug_once("[shutdown] Executor: complete")
 
     def check_health(self) -> None:
@@ -696,8 +702,6 @@ class WorkerProc:
 
         # Load model
         self.worker.init_device()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
-            self.worker.spawn_ple_offload()
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
@@ -706,8 +710,6 @@ class WorkerProc:
             self.worker.elastic_ep_execute("load_model")
         else:
             self.worker.load_model()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
-            self.worker.wait_ple_offload_ready()
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling

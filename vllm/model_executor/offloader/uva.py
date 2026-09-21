@@ -3,6 +3,7 @@
 """UVA-based CPU offloading using Unified Virtual Addressing."""
 
 from collections.abc import Generator
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -10,7 +11,12 @@ from torch.func import functional_call
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.offloader.base import BaseOffloader, should_pin_memory
+from vllm.model_executor.offloader.base import (
+    BaseOffloader,
+    pin_exact,
+    should_pin_memory,
+)
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -110,7 +116,11 @@ class UVAOffloader(BaseOffloader):
 
             cpu_data = p.data.to(device="cpu")
             if self.pin_memory:
-                cpu_data = cpu_data.pin_memory()
+                # Exact-size page-locked allocation. Tensor.pin_memory() rounds to
+                # the next power of two (measured 1.78x on large expert blocks),
+                # which multiplies the host RAM an offloaded MoE needs and gets the
+                # worker OOM-killed during construction.
+                cpu_data = pin_exact(cpu_data)
 
             if not self.uva_offloading:
                 p.data = cpu_data
@@ -126,13 +136,14 @@ class UVAOffloader(BaseOffloader):
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device,
-                    # it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
+                with nullcontext() if self.pin_memory else gpu_sync_allowed():
+                    device_state = {
+                        # here we blindly call `to(device)`
+                        # if the parameter is already on the device,
+                        # it will be a no-op
+                        k: v.to(device, non_blocking=True)
+                        for k, v in module.state_dict().items()
+                    }
 
                 # set `tie_weights=False` as tied weights in original model
                 # become untied when calling .to(device) individually

@@ -17,7 +17,7 @@ from vllm.config.fault_tolerance import FaultToleranceConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.network_utils import get_open_ports_list, get_open_zmq_ipc_path
+from vllm.utils.network_utils import get_open_ports_list
 
 if TYPE_CHECKING:
     from ray.runtime_env import RuntimeEnv
@@ -142,6 +142,8 @@ class ParallelConfig:
     """IP of the data parallel master."""
     data_parallel_rpc_port: int = Field(default=29550, ge=1, le=65535)
     """Fixed port for data parallel messaging, shared by all nodes."""
+    dp_sync_interval: int = Field(default=16, ge=1)
+    """Steps between DP finish-sync all-reduces; must match across DP ranks."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
     data_parallel_backend: DataParallelBackend = "mp"
@@ -346,9 +348,6 @@ class ParallelConfig:
     """Port of the coordination TCPStore. Can be set by the API server; workers
     connect as clients to exchange self-picked group ports at runtime."""
 
-    _ple_offload_ipc_path: str = ""
-    """Node-local ZMQ IPC address for the PLE offload worker."""
-
     decode_context_parallel_size: int = Field(default=1, ge=1)
     """Number of ranks that shard the decode KV cache. DCP does not expand
     the process world size. Without PCP, DCP reuses TP ranks. With PCP, DCP
@@ -488,9 +487,6 @@ class ParallelConfig:
                 "The FT system assumes one AsyncMPClient manages all engines."
             )
 
-        if envs.VLLM_PLE_CPU_OFFLOAD and not self._ple_offload_ipc_path:
-            self._ple_offload_ipc_path = get_open_zmq_ipc_path()
-
         if self.all2all_backend in ["pplx", "naive"]:
             logger.warning(
                 "The '%s' all2all backend has been removed. "
@@ -551,8 +547,6 @@ class ParallelConfig:
         tp = self.tensor_parallel_size
         pcp = self.prefill_context_parallel_size
         dcp = self.decode_context_parallel_size
-        if pcp > 1 and self.data_parallel_size > 1:
-            raise ValueError("PCP does not support data parallelism yet.")
         if pcp == 1:
             # DCP reuses the TP ranks when PCP is disabled.
             if tp % dcp != 0:
@@ -850,7 +844,6 @@ class ParallelConfig:
             "worker_extension_cls",
             "_api_process_count",
             "_api_process_rank",
-            "_ple_offload_ipc_path",
             # NUMA binding is per-rank host-side memory locality; it does
             # not affect collective-communication semantics. When numa_bind
             # is enabled with auto-detection, each DP rank stores its own
@@ -1070,6 +1063,17 @@ class ParallelConfig:
         if self.ray_workers_use_nsight and not self.use_ray:
             raise ValueError(
                 "Unable to use nsight profiling unless workers run with Ray."
+            )
+
+        # A batch below one token per microbatch cannot be split, so the
+        # thresholds have to keep it out rather than the split having to cope.
+        if self.use_ubatching and (
+            min(self.dbo_decode_token_threshold, self.dbo_prefill_token_threshold)
+            < self.num_ubatches
+        ):
+            raise ValueError(
+                "dbo_decode_token_threshold and dbo_prefill_token_threshold must "
+                f"be at least the number of microbatches ({self.num_ubatches})."
             )
 
         return self

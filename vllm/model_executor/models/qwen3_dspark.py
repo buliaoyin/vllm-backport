@@ -26,10 +26,15 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+    dequantize_to_dtype,
+    nvfp4_gathered_bias,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
+from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.spec_decode.dspark.markov_argmax import (
@@ -91,6 +96,7 @@ class DSparkMarkovHead(nn.Module):
         markov_rank: int,
         prefix: str,
         quant_config: QuantizationConfig | None = None,
+        retain_weight_for_gather: bool = False,
         *,
         shard_vocab: bool | None = None,
     ) -> None:
@@ -107,6 +113,8 @@ class DSparkMarkovHead(nn.Module):
             prefix=maybe_prefix(prefix, "markov_w2"),
             disable_tp=not shard_vocab,
         )
+        self.markov_w2._retain_weight_for_gather = retain_weight_for_gather
+        self.markov_w2.is_w4a16_nvfp4 = False
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         """r-dim Markov embedding of ``token_ids`` ([B] -> [B, r])."""
@@ -134,8 +142,52 @@ class DSparkMarkovHead(nn.Module):
         positions. This method scatters the corrected candidate values into
         that dense buffer so the normal sampler sees the truncated proposal.
         """
-        weight = self.markov_w2.weight[index]
-        corrected = values.unsqueeze(-1)
+        if self.markov_w2._retain_weight_for_gather and self.markov_w2.is_w4a16_nvfp4:
+            # Use the fast Triton kernel for W4A16 NVFP4 weights with BF16
+            # activations on CUDA. FP16 activations, non-CUDA accelerators, and
+            # CPU use the slower dequantize/scatter fallback below.
+            if (
+                current_platform.is_cuda()
+                and markov_embed.is_cuda
+                and markov_embed.dtype == torch.bfloat16
+                and values.dtype == torch.bfloat16
+                and logits.dtype == torch.bfloat16
+            ):
+                nvfp4_gathered_bias(
+                    markov_embed,
+                    self.markov_w2._nvfp4_weight_for_gather,
+                    self.markov_w2._nvfp4_weight_scale_for_gather,
+                    self.markov_w2._nvfp4_weight_global_scale_for_gather,
+                    values,
+                    index,
+                    logits,
+                    scale,
+                )
+                return logits
+
+            flat_index = index.reshape(-1)
+            packed_weight = self.markov_w2._nvfp4_weight_for_gather.index_select(
+                0, flat_index
+            )
+            weight_scale = self.markov_w2._nvfp4_weight_scale_for_gather.index_select(
+                0, flat_index
+            )
+            weight = dequantize_to_dtype(
+                packed_weight,
+                weight_scale,
+                self.markov_w2._nvfp4_weight_global_scale_for_gather,
+                dtype=markov_embed.dtype,
+                block_size=self.markov_w2._nvfp4_group_size_for_gather,
+                swizzle=False,
+            ).view(*index.shape, -1)
+        else:
+            weight = self.markov_w2.weight[index]
+            if weight.dtype != markov_embed.dtype:
+                raise RuntimeError(
+                    "Gathered Markov projection requires unquantized weights or "
+                    "retained ModelOpt W4A16 NVFP4 weights."
+                )
+        corrected = values.unsqueeze(-1).clone()
         corrected.baddbmm_(
             weight,
             markov_embed.unsqueeze(-1),
@@ -144,33 +196,6 @@ class DSparkMarkovHead(nn.Module):
         )
         return logits.scatter_(1, index, corrected.squeeze(-1))
 
-
-class DSparkConfidenceHead(nn.Module):
-    """DSpark acceptance-confidence head."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        prefix: str,
-        bias: bool = False,
-        with_markov: bool = True,
-    ) -> None:
-        super().__init__()
-        self.with_markov = with_markov
-        self.proj = ReplicatedLinear(
-            input_dim,
-            1,
-            bias=bias,
-            return_bias=False,
-            params_dtype=torch.float32,
-            prefix=maybe_prefix(prefix, "proj"),
-        )
-
-    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
-        x = (
-            torch.cat([hidden, markov_embed], dim=-1) if self.with_markov else hidden
-        ).float()
-        return self.proj(x).squeeze(-1)
     def select_top_tokens(
         self,
         markov_embed: torch.Tensor,
@@ -232,6 +257,34 @@ class DSparkConfidenceHead(nn.Module):
         )
 
 
+class DSparkConfidenceHead(nn.Module):
+    """DSpark acceptance-confidence head."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        prefix: str,
+        bias: bool = False,
+        with_markov: bool = True,
+    ) -> None:
+        super().__init__()
+        self.with_markov = with_markov
+        self.proj = ReplicatedLinear(
+            input_dim,
+            1,
+            bias=bias,
+            return_bias=False,
+            params_dtype=torch.float32,
+            prefix=maybe_prefix(prefix, "proj"),
+        )
+
+    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
+        x = (
+            torch.cat([hidden, markov_embed], dim=-1) if self.with_markov else hidden
+        ).float()
+        return self.proj(x).squeeze(-1)
+
+
 class Qwen3DSparkModel(DFlashQwen3Model):
     """DFlash Qwen3 backbone + DSpark Markov / confidence heads."""
 
@@ -255,6 +308,9 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             config.markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
             quant_config=self.quant_config,
+            retain_weight_for_gather=(
+                getattr(config, "dspark_draft_topk", None) is not None
+            ),
         )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", False):
@@ -277,9 +333,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = Qwen3DSparkModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -356,6 +410,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         """Per-position acceptance probability for each drafted token."""
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+
     def markov_fusion_operands(self) -> "MarkovFusionOperands | None":
         return self.model.markov_head.fusion_operands(self.logits_processor)
 

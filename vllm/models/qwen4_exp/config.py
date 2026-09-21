@@ -69,7 +69,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
             # "full_attention" entries as "qwen_sparse_attention"; accept both
             # spellings so re-saved checkpoints (e.g. quantized exports) load.
             layer_types = [
-                "full_attention" if layer_type == "qwen_sparse_attention" else layer_type
+                "full_attention"
+                if layer_type == "qwen_sparse_attention"
+                else layer_type
                 for layer_type in layer_types
             ]
         super().__init__(layer_types=layer_types, **kwargs)

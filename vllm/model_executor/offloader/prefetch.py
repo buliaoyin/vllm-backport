@@ -124,6 +124,21 @@ class StaticBufferPool:
         return self._buffers[key][slot_idx % self.slot_capacity]
 
 
+def _get_next_prefetch_index(
+    index: int,
+    prefetch_step: int,
+    module_count: int,
+) -> int:
+    """Return a refill target that preserves static-buffer slot ownership."""
+    next_index = (index + prefetch_step) % module_count
+    if (
+        prefetch_step < module_count
+        and next_index % prefetch_step != index % prefetch_step
+    ):
+        next_index = index % prefetch_step
+    return next_index
+
+
 class PrefetchOffloader(BaseOffloader):
     """Prefetching-based offloader with group-based layer selection.
 
@@ -231,7 +246,11 @@ class PrefetchOffloader(BaseOffloader):
 
             # Start prefetch for next layer (circular)
             # mutates_args on output_tensor creates ordering dependency
-            next_index = (index + self.prefetch_step) % len(self.module_offloaders)
+            next_index = _get_next_prefetch_index(
+                index,
+                self.prefetch_step,
+                len(self.module_offloaders),
+            )
             # Handle tuple output (e.g., (hidden_states, residual))
             if isinstance(output, tuple):
                 torch.ops.vllm.start_prefetch(output[0], next_index)
@@ -673,15 +692,20 @@ class _CpuParamOffloader(_BaseParamOffloader):
 
         if param.data.device.type == "cpu":
             if should_pin_memory() and not param.data.is_pinned():
-                pinned = torch.empty_strided(
+                # Allocate unpinned, then page-lock at exactly this size.
+                # pin_memory=True here rounds to the next power of two.
+                from vllm.model_executor.offloader.base import pin_exact
+
+                staging = torch.empty_strided(
                     size=param.data.size(),
                     stride=param.data.stride(),
                     dtype=param.data.dtype,
                     layout=param.data.layout,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=False,
                 )
-                pinned.copy_(param.data)
+                staging.copy_(param.data)
+                pinned = pin_exact(staging)
                 self._cpu_storage = pinned
             else:
                 self._cpu_storage = param.data

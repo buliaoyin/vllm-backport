@@ -15,6 +15,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
 """
 
+import contextlib
 import functools
 import json
 import os
@@ -206,7 +207,7 @@ class FileSystemTierManager(SecondaryTierManager):
         )
 
         # LRU capacity management (fork feature): 0 disables (unbounded).
-        # When exceeded, least-recently-used block files are unlinked until
+        # When exceeded, least-recently-used chunk files are unlinked until
         # usage drops below max_capacity_gb * evict_watermark. Files stored or
         # touched within evict_protect_s seconds are exempt, protecting
         # lookup-hit -> load races. Assumes one manager owns root_dir.
@@ -218,7 +219,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 watermark=evict_watermark,
                 protect_s=evict_protect_s,
             )
-            # Block files live under the mapper's base dir; legacy layouts
+            # Chunk files live under the mapper's base dir; legacy layouts
             # used sibling per-rank dirs (<base>_r<idx>) - scan both.
             base_path = os.path.dirname(config_path)
             parent = os.path.dirname(base_path) or "."
@@ -258,7 +259,7 @@ class FileSystemTierManager(SecondaryTierManager):
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in keys],
             self._primary_kv_view,
-            [int(bid) * self._block_size for bid in job_metadata.block_ids],
+            [int(cid) * self._block_size for cid in job_metadata.chunk_ids],
             self._block_size,
             self._use_o_direct,
         )
@@ -272,7 +273,7 @@ class FileSystemTierManager(SecondaryTierManager):
         keys = list(job_metadata.keys)
         self._load_job_keys[job_id] = keys
         paths = [self.file_mapper.get_file_name(key) for key in keys]
-        offsets = [int(bid) * self._block_size for bid in job_metadata.block_ids]
+        offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
 
         def load_task() -> None:
             try:
@@ -313,10 +314,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 cap_paths = self._capacity_job_paths.pop(job_id, None)
                 if success and cap_paths:
                     for path in cap_paths:
-                        try:
+                        with contextlib.suppress(OSError):
                             self._capacity.record_store(path, os.path.getsize(path))
-                        except OSError:
-                            pass
             if self.events is not None:
                 keys = self._store_job_keys.pop(job_id, None)
                 if success and keys:

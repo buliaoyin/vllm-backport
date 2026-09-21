@@ -817,7 +817,9 @@ class Glm5NextProcessor(ProcessorMixin):
                 )
             return cfg
 
-        ip_cfg = _cap_cfg(dict(get_image_processor_config(model_path)), is_video=False)
+        ip_cfg = _cap_cfg(
+            dict(get_image_processor_config(model_path, **kwargs)), is_video=False
+        )
         image_processor = Glm5NextImageProcessor(
             **{k: v for k, v in ip_cfg.items() if k != "image_processor_type"}
         )
@@ -827,12 +829,9 @@ class Glm5NextProcessor(ProcessorMixin):
             model_path,
             revision=kwargs.get("revision", "main"),
         )
-        video_processor_config = (processor_config or {}).get("video_processor")
-        if not isinstance(video_processor_config, dict):
-            raise ValueError(
-                f"processor_config.json for {model_path} is missing video_processor"
-            )
-        vp_cfg = _cap_cfg(dict(video_processor_config), is_video=True)
+        if processor_config is None:
+            raise ValueError(f"Missing processor_config.json for {model_path}")
+        vp_cfg = _cap_cfg(dict(processor_config["video_processor"]), is_video=True)
         video_processor = Glm5NextVideoProcessor(
             **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
         )

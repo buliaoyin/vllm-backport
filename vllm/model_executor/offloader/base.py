@@ -4,10 +4,13 @@
 # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/utils/offloader.py
 """Base classes for model parameter offloading."""
 
+import contextlib
+import mmap
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 from typing import TYPE_CHECKING
 
+import torch
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -30,6 +33,80 @@ def should_pin_memory() -> bool:
     return (
         is_pin_memory_available() and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY
     )
+
+
+# Anonymous mmaps backing exact-size pinned tensors, held for the process
+# lifetime. See pin_exact(): these back model weights, which live as long as the
+# model does; releasing them early un-maps memory CUDA still has registered.
+_PINNED_MAPPINGS: dict[int, mmap.mmap] = {}
+
+
+def pin_exact(t: torch.Tensor) -> torch.Tensor:
+    """Return a page-locked copy of ``t`` occupying exactly its own size.
+
+    ``Tensor.pin_memory()`` allocates through torch's ``CachingHostAllocator``,
+    which rounds every block up to the next power of two. For the large,
+    awkwardly-sized tensors weight offloading deals with that is a multiplier,
+    not a rounding error: a 2.250 GiB expert block costs 4.008 GiB of pinned
+    host memory (measured 1.78x on torch 2.13.0+cu130), so offloading a MoE's
+    experts needs ~1.78x the host RAM the weights occupy and the worker is
+    OOM-killed during construction.
+
+    An anonymous mmap is page-aligned and exactly sized; registering it with
+    ``cudaHostRegister`` yields page-locked memory with no bucketing. Falls back
+    to ``pin_memory()`` for non-contiguous inputs or if registration fails.
+    """
+    nbytes = t.numel() * t.element_size()
+    if nbytes == 0 or not t.is_contiguous():
+        return t.pin_memory()
+
+    buf = None
+    try:
+        buf = mmap.mmap(-1, nbytes)
+        # Build the tensor at its final dtype/shape directly: a uint8 -> dtype
+        # -> shape view chain leaves intermediate bases that confuse code
+        # inspecting storage_offset()/is_contiguous().
+        out = torch.frombuffer(buf, dtype=t.dtype, count=t.numel()).view(t.shape)
+        # Register the whole mapping (mmap rounds up to a page), not nbytes.
+        rc = torch.cuda.cudart().cudaHostRegister(out.data_ptr(), len(buf), 0)
+        if int(rc) != 0:
+            raise RuntimeError(f"cudaHostRegister returned {rc}")
+        out.copy_(t)
+        # The mapping must outlive every view of it. Callers reassign
+        # ``param.data`` and drop the returned tensor's Python object, so hold a
+        # process-level reference keyed by pointer; release_pinned() drops it.
+        _PINNED_MAPPINGS[out.data_ptr()] = buf
+        return out
+    except Exception as e:
+        if buf is not None:
+            with contextlib.suppress(Exception):
+                buf.close()
+        logger.warning_once(
+            "pin_exact() unavailable (%s); falling back to Tensor.pin_memory(), "
+            "which rounds allocations up to the next power of two.",
+            e,
+        )
+        return t.pin_memory()
+
+
+def release_pinned(ptr: int) -> bool:
+    """Unregister and unmap an exact-size pinned buffer created by pin_exact().
+
+    Callers that replace an offloaded parameter must call this with the old
+    ``data_ptr()``. ``process_weights_after_loading`` repacks expert weights
+    (e.g. for Marlin), so the same logical parameter is offloaded twice; without
+    releasing the first mapping both copies stay resident. ``Tensor.pin_memory()``
+    gets this for free from its caching allocator, so the exact-size path has to
+    recycle explicitly.
+    """
+    buf = _PINNED_MAPPINGS.pop(ptr, None)
+    if buf is None:
+        return False
+    with contextlib.suppress(Exception):
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+    with contextlib.suppress(Exception):
+        buf.close()
+    return True
 
 
 """

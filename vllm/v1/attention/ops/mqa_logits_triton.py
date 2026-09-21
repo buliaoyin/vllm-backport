@@ -3,7 +3,6 @@
 """Triton fallback for DeepGEMM's fp8_mqa_logits / fp8_paged_mqa_logits."""
 
 import functools
-
 import os
 
 import torch
@@ -111,7 +110,6 @@ _PREFILL_WARMUP_N = 8192
 _INDEXER_LUT_NAN_VALUE = 480.0
 
 
-
 @functools.lru_cache
 def _paged_q_bf16_default(device: torch.device) -> bool:
     """Whether to pre-decode q to bf16 on the host for the paged kernel.
@@ -128,6 +126,7 @@ def _paged_q_bf16_default(device: torch.device) -> bool:
         torch.cuda.get_device_properties(device).shared_memory_per_block_optin
         >= 160 * 1024
     )
+
 
 def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
     return get_e4m3fn_bf16_lut(device, nan_value=_INDEXER_LUT_NAN_VALUE)
@@ -320,9 +319,9 @@ def fp8_paged_mqa_logits_triton(
         # of once per (query, KV block). `lut[byte]` produces exactly what
         # `_decode_e4m3fn_bf16_lut` produces -- NaN pin at +-480 included --
         # so the operands reaching tl.dot are bit-identical.
-        q_in = fp8_lut.index_select(
-            0, q_byte.reshape(-1).to(torch.int32)
-        ).view(q_byte.shape)
+        q_in = fp8_lut.index_select(0, q_byte.reshape(-1).to(torch.int32)).view(
+            q_byte.shape
+        )
     else:
         q_in = q_byte
     # The block table is allocated at full max_model_len width and only
@@ -521,6 +520,7 @@ def fp8_mqa_logits_triton(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     clean_logits: bool = True,
+    round_allocations: bool = False,
 ) -> torch.Tensor:
     """Triton implementation of DeepGEMM's fp8_mqa_logits.
 
@@ -532,6 +532,8 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ke: [M] int32
         clean_logits: when False, skip the -inf pre-fill of the output
             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
+        round_allocations: Use power-of-two storage capacities to let growing
+            contexts reuse allocation sizes. The logical output shape is unchanged.
     Returns:
         logits:       [M, N] float32
     """
@@ -542,6 +544,7 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ks,
         cu_seqlen_ke,
         _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
+        round_allocations=round_allocations,
     )
 
 
@@ -552,6 +555,7 @@ def _fp8_mqa_logits_triton_impl(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     kv_group: int,
+    round_allocations: bool = False,
 ) -> torch.Tensor:
     k_fp8, k_scales = kv
     k_scales = k_scales.reshape(-1)
@@ -562,14 +566,21 @@ def _fp8_mqa_logits_triton_impl(
     # The grid covers every (m, n_block) and each tile stores its full row
     # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
     # is accepted for DeepGEMM signature parity only.
-    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
+    capacity = triton.next_power_of_2(N) if round_allocations else N
+    logits = torch.empty((M, capacity), dtype=torch.float32, device=q.device)[:, :N]
 
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)
 
     # Pre-decode FP8 → bf16; the kernel runs a straight `tl.dot`.
     q_bf16 = q.to(torch.bfloat16)
-    k_bf16 = k_fp8.to(torch.bfloat16)
+    if round_allocations:
+        k_bf16 = torch.empty(
+            (capacity, head_dim), dtype=torch.bfloat16, device=q.device
+        )[:N]
+        k_bf16.copy_(k_fp8)
+    else:
+        k_bf16 = k_fp8.to(torch.bfloat16)
 
     # Grid depends on the autotuned BLOCK_N and the M/N-selected KV_GROUP.
     grid = lambda meta: (  # noqa: E731

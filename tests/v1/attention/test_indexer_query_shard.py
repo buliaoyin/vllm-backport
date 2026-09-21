@@ -501,9 +501,7 @@ def test_full_size_output_buffers_satisfy_the_fused_op_contract():
     import torch
 
     num_tokens, n_head, head_dim = 32, 4, 128
-    q_quant = torch.zeros(
-        (num_tokens, n_head, head_dim), dtype=torch.float8_e4m3fn
-    )
+    q_quant = torch.zeros((num_tokens, n_head, head_dim), dtype=torch.float8_e4m3fn)
     weights = torch.zeros((num_tokens, n_head), dtype=torch.float32)
     # `indexer_weights` reaches the indexer as a column split of the merged
     # input GEMM, i.e. row-strided but unit-strided in the head dim.

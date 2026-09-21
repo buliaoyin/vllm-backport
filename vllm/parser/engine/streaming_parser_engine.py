@@ -51,7 +51,7 @@ def _build_drop_info(
 
     configured_texts = (
         set(config.token_id_terminals.values())
-        | set(config.terminals.values())
+        | config.terminal_literals
         | config.preserve_tokens
     )
 
@@ -164,7 +164,12 @@ class StreamingParserEngine:
             if state in self._TOOL_STATES and tr.next_state not in self._TOOL_STATES
         )
 
+        self._reasoning_markup_terminals: frozenset[str] = (
+            self._compute_reasoning_markup_terminals()
+        )
+
         self.skip_tool_parsing = False
+        self.skip_reasoning_parsing = False
         # Function names declared by the request, or None when unknown.
         # Consulted only by transitions with ``validate_tool_name``;
         # set per request by the owning ParserEngine, like
@@ -383,6 +388,37 @@ class StreamingParserEngine:
         }
     )
 
+    _PLAIN_STATES = frozenset({ParserState.CONTENT, ParserState.REASONING})
+
+    _REASONING_EVENTS = frozenset({EventType.REASONING_START, EventType.REASONING_END})
+
+    def _compute_reasoning_markup_terminals(self) -> frozenset[str]:
+        """Terminals the ``skip_reasoning_parsing`` bypass may neutralize.
+
+        Only reasoning-exclusive markers qualify: every transition they
+        participate in stays within CONTENT/REASONING and emits nothing
+        but reasoning events. Inkling's ``<|end_message|>`` is labelled
+        THINK_END yet also closes text, header, and tool blocks;
+        bypassing a shared marker would eat that structure, so one impure
+        marker disables the bypass for the whole config.
+        """
+        markers = frozenset(
+            terminal
+            for (state, terminal), tr in self.config.transitions.items()
+            if ParserState.REASONING in (state, tr.next_state)
+            and tr.next_state not in self._TOOL_STATES
+        )
+        for (state, terminal), tr in self.config.transitions.items():
+            if terminal not in markers:
+                continue
+            if (
+                state not in self._PLAIN_STATES
+                or tr.next_state not in self._PLAIN_STATES
+                or not self._REASONING_EVENTS.issuperset(tr.events)
+            ):
+                return frozenset()
+        return markers
+
     def _on_terminal(
         self, terminal: str, value: str, token_count: int = 0
     ) -> list[SemanticEvent]:
@@ -404,6 +440,9 @@ class StreamingParserEngine:
             # The projected skip state may not define the wrapper closer.
             if self.skip_tool_parsing and terminal in self._tool_exit_terminals:
                 self._in_skipped_tool_span = False
+            return self._emit_for_state(value, token_count)
+
+        if self.skip_reasoning_parsing and terminal in self._reasoning_markup_terminals:
             return self._emit_for_state(value, token_count)
 
         if self.skip_tool_parsing and terminal in self._tool_terminals:
@@ -651,7 +690,13 @@ class StreamingParserEngine:
             self._message_header_buffer = ""
             self._message_header_token_count = 0
 
-        if transition.next_state not in self._TOOL_STATES:
+        # A real wrapper start (TOOL_PREAMBLE is only reachable through it)
+        # ends the recovered sequence: the wrapped block that follows keeps
+        # the ordinary between-invoke semantics.
+        if (
+            transition.next_state not in self._TOOL_STATES
+            or transition.next_state == ParserState.TOOL_PREAMBLE
+        ):
             self._recovered_tool_call = False
 
         self.state = transition.next_state

@@ -23,7 +23,11 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
-from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.model_executor.models.utils import (
+    WeightsMapper,
+    get_pp_missing_layer_names,
+    maybe_prefix,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -332,10 +336,12 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
+            num_redundant_experts=self.num_redundant_experts,
         )
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
         _pending_wk_fp8: dict = {}
         pending_awq: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
@@ -352,9 +358,13 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
-            if name == "model.embed_tokens.weight":
-                # PP drafts run on the last rank, where the target embedding
-                # cannot be shared from the first rank.
+            # The checkpoint stores embed_tokens once, as a top-level (tied)
+            # weight with no spec layer index. Without PP the draft shares the
+            # target's embedding afterwards, but under pipeline parallelism the
+            # target's embed_tokens is a PPMissingLayer on the draft's (last)
+            # stage, so the draft must load its own copy here or it drafts
+            # from uninitialized weights (acceptance collapses to ~0).
+            if name == "model.embed_tokens.weight" and name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -377,6 +387,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 _pending_wk_fp8,
                 params_dict,
                 loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 
@@ -392,6 +403,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,
+                pp_missing_layer_names,
             ):
                 continue
 

@@ -2,15 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from tests.v1.attention.utils import create_vllm_config
+from tests.v1.attention.utils import (
+    BatchSpec,
+    create_common_attn_metadata,
+    create_vllm_config,
+)
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla import indexer
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    CompressedSlotMappingKernel,
+)
 from vllm.v1.attention.backends.mla.indexer import (
     BuildPrefillChunkMetadataKernel,
     DeepseekV32IndexerMetadataBuilder,
+)
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    ConvertReqIndexToGlobalIndexKernel,
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
@@ -20,7 +32,7 @@ def test_indexer_warmup_normalizes_zero_compress_ratios():
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(compress_ratios=[0, 0, 4, 128, 0])
+            hf_config=SimpleNamespace(compress_ratios=[0, 0, 4, 128, 0], index_kpool=32)
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
@@ -30,7 +42,42 @@ def test_indexer_warmup_normalizes_zero_compress_ratios():
 
     keys = BuildPrefillChunkMetadataKernel().get_warmup_keys(config)
 
-    assert {key.COMPRESS_RATIO for key in keys} == {1, 4, 128}
+    assert {key.compress_ratio for key in keys} == {1, 4, 32, 128}
+    assert {(key.query_slice_start, key.query_slice_stop) for key in keys} == {
+        (query_slice_start, query_slice_stop)
+        for query_slice_start in (1, 2, 16)
+        for query_slice_stop in (1, 2, 16)
+    }
+
+
+def test_compressed_slot_mapping_warmup_includes_index_kpool():
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=256),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(index_kpool=32)),
+    )
+
+    keys = CompressedSlotMappingKernel().get_warmup_keys(config)
+    assert {(key.compress_ratio, key.block_size) for key in keys} == {(32, 2)}
+
+
+def test_index_conversion_warmup_uses_physical_block_stride():
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64),
+        model_config=SimpleNamespace(
+            max_model_len=1024,
+            hf_config=SimpleNamespace(index_topk=2048),
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+    )
+
+    keys = ConvertReqIndexToGlobalIndexKernel().get_warmup_keys(
+        config,
+        block_stride_rows=4096,
+    )
+    assert {key.block_stride_rows for key in keys} == {4096}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -116,3 +163,42 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_num_states():
         device=device,
     )
     torch.testing.assert_close(valid_slots, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [1, 4, 32])
+def test_decode_metadata_without_deepgemm_architecture_support(
+    monkeypatch, compress_ratio
+):
+    """An installed DeepGEMM must not prevent Triton decode on unsupported GPUs."""
+    monkeypatch.setattr(indexer, "has_deep_gemm", lambda: True)
+    monkeypatch.setattr(indexer, "is_deep_gemm_supported", lambda: False)
+    schedule = Mock(side_effect=AssertionError("DeepGEMM is unsupported"))
+    monkeypatch.setattr(indexer, "get_paged_mqa_logits_metadata", schedule)
+    device = torch.device("cuda")
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=compress_ratio,
+    )
+    config = create_vllm_config(max_model_len=1024)
+    width = get_block_table_width(
+        spec.max_num_blocks_per_req(config, 1024), spec.block_size
+    )
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["dummy"],
+        vllm_config=config,
+        device=device,
+        block_table_width=width,
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[257], query_lens=[1]), spec.block_size, device
+    )
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    assert metadata.decode is not None
+    assert metadata.decode.seq_lens.tolist() == [[257 // compress_ratio]]
+    assert common.seq_lens.tolist() == [257]
+    schedule.assert_not_called()

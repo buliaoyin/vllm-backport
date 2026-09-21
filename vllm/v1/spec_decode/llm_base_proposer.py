@@ -94,7 +94,7 @@ class SpecDecodeBaseProposer:
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
-        self.hidden_size = self._get_hidden_size()
+        self.hidden_size = self.draft_model_config.get_hidden_size()
         self.inputs_embeds_size = self.draft_model_config.get_inputs_embeds_size()
 
         # DeepSeek V4 MTP consumes the target's pre-hc_head residual stream,
@@ -173,25 +173,17 @@ class SpecDecodeBaseProposer:
         # Use draft model's M-RoPE setting, not target model's
         # Draft models may be text-only even if target is multimodal
         self.uses_mrope = self.draft_model_config.uses_mrope
-        self.uses_xdrope_dim = self.vllm_config.model_config.uses_xdrope_dim
-        self.draft_uses_xdrope_dim = self.draft_model_config.uses_xdrope_dim
         if self.uses_mrope:
             # NOTE: `mrope_positions` is implemented with one additional dummy
             # position on purpose to make it non-contiguous so that it can work
             # with torch compile.
             # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
 
-            # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
-            # the modality of inputs. For text-only inputs, each dimension has
-            # identical position IDs, making M-RoPE functionally equivalent to
-            # 1D-RoPE.
+            # NOTE: For text-only inputs, each dimension has identical position
+            # IDs, making M-RoPE functionally equivalent to 1D-RoPE.
             # See page 5 of https://arxiv.org/abs/2409.12191
             self.mrope_positions = torch.zeros(
-                (3, self.max_positions + 1), dtype=torch.int64, device=device
-            )
-        elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-            self.xdrope_positions = torch.zeros(
-                (self.uses_xdrope_dim, self.max_positions + 1),
+                (self.draft_model_config.mrope_num_dims, self.max_positions + 1),
                 dtype=torch.int64,
                 device=device,
             )
@@ -320,10 +312,6 @@ class SpecDecodeBaseProposer:
 
             self.allowed_attn_types = tuple(rocm_types)
 
-    def _get_hidden_size(self) -> int:
-        """Return the hidden width consumed by the draft model."""
-        return self.draft_model_config.get_hidden_size()
-
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -385,15 +373,11 @@ class SpecDecodeBaseProposer:
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
             return self.mrope_positions[:, :num_tokens]
-        if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-            return self.xdrope_positions[:, :num_tokens]
         return self.positions[:num_tokens]
 
     def _set_positions(self, num_tokens: int, positions: torch.Tensor):
         if self.uses_mrope:
             self.mrope_positions[:, :num_tokens] = positions
-        elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-            self.xdrope_positions[:, :num_tokens] = positions
         else:
             # Convert M-RoPE positions if target model uses M-RoPE
             # but draft doesn't, For text inputs, all M-RoPE
@@ -791,8 +775,6 @@ class SpecDecodeBaseProposer:
         positions_1d = positions[0] if self.uses_mrope else positions
         if self.uses_mrope:
             out_pos = self.mrope_positions[0, :batch_size]
-        elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-            out_pos = self.xdrope_positions[0, :batch_size]
         else:
             out_pos = self.positions[:batch_size]
         eagle_step_update_slot_mapping_and_metadata(
@@ -809,11 +791,6 @@ class SpecDecodeBaseProposer:
         if self.uses_mrope:
             self.mrope_positions[1:, :batch_size] = self.mrope_positions[0, :batch_size]
             positions = self.mrope_positions[:, :batch_size]
-        elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-            self.xdrope_positions[1:, :batch_size] = self.xdrope_positions[
-                0, :batch_size
-            ]
-            positions = self.xdrope_positions[0, :batch_size]
         else:
             positions = self.positions[:batch_size]
         common_attn_metadata.max_seq_len = min(
@@ -863,8 +840,6 @@ class SpecDecodeBaseProposer:
             self.input_ids[token_indices_to_sample] = next_token_ids
 
             # copy inputs to buffer for cudagraph
-            if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0:
-                target_positions = target_positions[0]
             self._set_positions(num_tokens, target_positions)
 
             self.hidden_states[:num_tokens] = target_hidden_states
@@ -1381,6 +1356,7 @@ class SpecDecodeBaseProposer:
             # handle multimodality
             assert hasattr(target_model, "config")
             if self.get_model_name(target_model) in [
+                "BailingMoeV3VLForConditionalGeneration",
                 "Cohere2VisionForConditionalGeneration",
                 "Exaone4_5_ForConditionalGeneration",
                 "GlmOcrForConditionalGeneration",
@@ -1392,7 +1368,6 @@ class SpecDecodeBaseProposer:
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3VLForConditionalGeneration",
                 "Qwen3VLMoeForConditionalGeneration",
-                "Qwen4ExpForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
                 "Gemma4UnifiedForConditionalGeneration",
                 "Step3p7ForConditionalGeneration",

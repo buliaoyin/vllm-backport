@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 import torch.nn as nn
 
 from vllm.config import ModelConfig, VllmConfig, replace
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -18,9 +19,9 @@ def _resolve_dspark_attention_backend(
 ) -> AttentionBackendEnum | None:
     if draft_backend is not None:
         return draft_backend
-    # DeepSeek-V4 draft layers share the target's KV-cache layout. Other
+    # DeepSeek-V4(.1) draft layers share the target's KV-cache layout. Other
     # DSpark architectures may use a different attention kind.
-    if draft_model_config.hf_config.model_type == "deepseek_v4":
+    if draft_model_config.hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
         if target_backend is not None:
             logger.info_once(
                 "Using the target model's %s attention backend for the "
@@ -31,7 +32,25 @@ def _resolve_dspark_attention_backend(
     return None
 
 
+def dspark_backbone_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    """Size draft attention for all query positions without changing verification."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None:
+        return vllm_config
+    query_tokens = speculative_config.dspark_num_query_tokens
+    if (
+        query_tokens is None
+        or query_tokens == speculative_config.num_speculative_tokens
+    ):
+        return vllm_config
+    draft_config = copy.copy(vllm_config)
+    draft_config.speculative_config = copy.copy(speculative_config)
+    draft_config.speculative_config.num_speculative_tokens = query_tokens
+    return draft_config
+
+
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+    vllm_config = dspark_backbone_vllm_config(vllm_config)
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
@@ -39,13 +58,11 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.model_loader import get_model
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
-    from vllm.model_executor.models.utils import (
-        PPMissingLayer,
-        get_draft_quant_config,
-    )
+    from vllm.model_executor.models.utils import get_draft_quant_config
     from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
         _should_share,
         get_target_lm_head,
+        maybe_share_target_embed,
     )
 
     draft_attention_backend = _resolve_dspark_attention_backend(
@@ -56,6 +73,13 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     draft_vllm_config = replace(
         vllm_config,
+        parallel_config=replace(
+            vllm_config.parallel_config,
+            pipeline_parallel_size=1,
+            tensor_parallel_size=(
+                speculative_config.draft_parallel_config.tensor_parallel_size
+            ),
+        ),
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
@@ -88,28 +112,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_inner = draft_model.model
     target_vocab_size = vllm_config.model_config.get_vocab_size()
 
-    target_embed = getattr(target_inner, "embed_tokens", None)
-    draft_embed = getattr(draft_inner, "embed_tokens", None)
-
-    # Under PP the target only builds the embedding where it is needed. The
-    # drafter runs on the last stage and owns no table of its own, so aliasing a
-    # PPMissingLayer here would embed garbage instead of failing. Fail loudly.
-    if get_pp_group().world_size != 1 and isinstance(target_embed, PPMissingLayer):
-        raise RuntimeError(
-            "DSpark under pipeline parallelism needs the target's embedding on "
-            "the last stage, but it is a PPMissingLayer there. The target model "
-            "must build embed_tokens on the last rank when a drafter aliases it."
-        )
-    if (
-        target_embed is not None
-        and draft_model_config.get_vocab_size() <= target_vocab_size
-        and _should_share(
-            draft_model, "has_own_embed_tokens", draft_embed, target_embed
-        )
-    ):
-        if draft_embed is not None:
-            del draft_inner.embed_tokens
-        draft_inner.embed_tokens = target_embed
+    if draft_model_config.get_vocab_size() <= target_vocab_size:
+        maybe_share_target_embed(draft_model, draft_inner, target_inner)
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(draft_model, "lm_head", None)

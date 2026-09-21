@@ -74,6 +74,36 @@ def test_external_computed_blocks_do_not_corrupt_free_pool():
     assert len(manager.req_to_blocks[request_id]) == 3
 
 
+def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=1,
+    )
+    block_pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=4)
+    manager = MambaManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    block = block_pool.get_new_blocks(1)[0]
+    blocks = [block]
+
+    manager._relocate_speculative_block(blocks, 0)
+
+    assert blocks == [block_pool.null_block, block]
+    assert block.ref_cnt == 1
+
+    pinned_block = block_pool.get_new_blocks(1)[0]
+    block_pool.touch((pinned_block,))
+    with pytest.raises(AssertionError, match="exclusively owned and unhashed"):
+        manager._relocate_speculative_block([pinned_block], 0)
+
+
 def get_sliding_window_manager(
     sliding_window_spec,
     block_pool,
@@ -163,7 +193,7 @@ def test_circular_buffer_allocates_one_block_for_the_request_lifetime():
         )
         assert manager.allocate_new_blocks(request_id, num_tokens, num_tokens) == []
 
-    manager.cache_blocks(request_id, 1024)
+    manager.cache_blocks(request_id, 1024, replay_boundaries=(0,))
     manager.remove_skipped_blocks(request_id, 1024)
     assert manager.get_num_common_prefix_blocks(request_id) == 0
     assert manager.get_num_skipped_tokens(1024) == 0
@@ -368,6 +398,47 @@ def test_sliding_window_possible_cached_prefix():
         [True, True, False, True, False, False, True, True, False, False, False, True],
         8,
     )
+
+
+def test_sliding_window_cache_hit_with_finer_hash_alignment():
+    """Sliding-window lookup uses full blocks with finer hybrid-cache hashes."""
+    hash_block_size = 2
+    block_size = 4
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    manager = get_sliding_window_manager(sliding_window_spec, block_pool)
+    block_hashes = [BlockHash(str(i).encode()) for i in range(4)]
+
+    # Each physical block uses the last chained hash in its block-size view.
+    for block_hash, block in zip(
+        (block_hashes[1], block_hashes[3]), block_pool.blocks[10:12]
+    ):
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(block_hash, 0), block
+        )
+
+    computed_blocks, hit_length = manager.find_longest_cache_hit(
+        block_hashes=block_hashes,
+        max_length=8,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=sliding_window_spec,
+        drop_eagle_block=False,
+        alignment_tokens=hash_block_size,
+    )
+
+    assert hit_length == 8
+    assert computed_blocks[0] == block_pool.blocks[10:12]
 
 
 def test_chunked_local_attention_remove_skipped_blocks():
@@ -716,10 +787,10 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
 @pytest.mark.parametrize("alignment", [4, 16])
 @pytest.mark.parametrize("max_length", [0, 15, 16, 20, 32, 48])
 @pytest.mark.parametrize("drop_eagle_block", [False, True])
-def test_mamba_prefix_hit_leaves_a_block_for_speculative_replay(
+def test_mamba_prefix_hit_keeps_the_target_recurrent_checkpoint(
     alignment, max_length, drop_eagle_block
 ):
-    """A cached recurrent state cannot replay tokens that precede that state."""
+    """Draft models have no Mamba layers; target cache hits need no extra drop."""
     block_size = 16
     spec = MambaSpec(
         block_size=block_size,
@@ -736,8 +807,7 @@ def test_mamba_prefix_hit_leaves_a_block_for_speculative_replay(
     (blocks,), hit_length = MambaManager.find_longest_cache_hit(
         hashes, max_length, [0], pool, spec, drop_eagle_block, alignment
     )
-    expected = max(0, max_length - (block_size if drop_eagle_block else 0))
-    expected = expected // alignment * alignment
+    expected = max_length // alignment * alignment
     assert hit_length == expected
     assert len(blocks) == (expected + block_size - 1) // block_size
     if expected:

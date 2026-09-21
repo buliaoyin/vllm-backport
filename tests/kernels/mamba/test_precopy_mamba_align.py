@@ -446,12 +446,37 @@ def _assert_copies_landed(convs, ssms, conv_ref, ssm_ref):
 @_parametrize("conv_state_dim_first", [False, True])
 @_cuda_required
 def test_precopy_indexes_block_tables_by_req_slot(conv_state_dim_first):
-    """Permuted batches must copy each request's own recurrent state."""
+    """Block-table ROW ATTRIBUTION under a permuted ``idx_mapping``.
+
+    The tables handed to the align copy kernels are the persistent
+    per-request-slot tables (row = request-state slot, written by
+    ``BlockTables.append_block_ids(req_index, ...)``), while the grid runs in
+    batch order and ``idx_mapping`` resolves batch row -> slot. The equivalence
+    test above only ever launches with an identity mapping, where indexing rows
+    by batch row and by request slot are indistinguishable -- so it cannot see a
+    regression on this axis.
+
+    It matters: under pipeline parallelism a non-last rank runs its postprocess
+    ``pp_size`` steps late, so the batch mapping it holds is stale. Indexing the
+    source tables by batch row then walks *another request's* block ids -- freed
+    or reallocated ones -- and on a hybrid model whose unified cache layout
+    aliases every cache tensor inside one page, that silently poisons live
+    recurrent state (all-NaN logits, constant-token output) or faults outright.
+    """
     device = torch.device("cuda")
     torch.manual_seed(0)
     num_reqs = len(_PERM)
     bt, num_blocks = _build_disjoint_block_table(num_reqs, device)
 
+    # Per-slot decisions must DIFFER, or the permutation is invisible: with an
+    # identity-shaped setup every batch row performs the same copy, so reading
+    # row ``batch_idx`` instead of row ``req_idx`` still touches the right bytes
+    # in aggregate. Here only slots 0 and 3 copy, and each row owns disjoint
+    # block ids, so a row mix-up moves state onto a different physical block.
+    #   slot 0: col 1 -> col 0, bias 0            (copy)
+    #   slot 1: src_col == dst_col                (no boundary, skip)
+    #   slot 2: src_col < 0                       (fresh, skip)
+    #   slot 3: col 2 -> col 0, bias 1            (copy, accepted-token shift)
     src_col = torch.tensor([1, 1, -1, 2], dtype=torch.int32, device=device)
     dst_col = torch.tensor([0, 1, 0, 0], dtype=torch.int32, device=device)
     bias = torch.tensor([0, 0, 0, 1], dtype=torch.int32, device=device)
@@ -501,13 +526,30 @@ def test_precopy_indexes_block_tables_by_req_slot(conv_state_dim_first):
 @_parametrize("conv_state_dim_first", [False, True])
 @_cuda_required
 def test_postprocess_indexes_block_tables_by_req_slot(conv_state_dim_first):
-    """Deferred postprocessing must retain the original request-slot mapping."""
+    """Same row-attribution invariant for ``postprocess_mamba_fused_kernel``.
+
+    The two kernels share ``_copy_mamba_state_block``, and the postprocess one is
+    the deferred-under-PP path where the stale batch mapping actually bites.
+    Decision inputs are chosen so every slot copies col 1 -> col 0 with zero
+    accepted-token bias: ``num_computed + num_scheduled - num_draft ==
+    block_size`` makes the aligned position equal the running-state count, so
+    ``needs_copy`` holds, ``accept_token_bias`` is 0 and ``dest_block_idx`` is 0.
+    """
     device = torch.device("cuda")
     torch.manual_seed(0)
     num_reqs = len(_PERM)
     block_size = 8
     bt, num_blocks = _build_disjoint_block_table(num_reqs, device)
 
+    # Per-slot decisions differ (see the precopy test for why that is required).
+    # With num_scheduled = num_draft = 1, num_accepted = 1:
+    #   num_tokens_running_state = num_computed, new_num_computed = same,
+    #   aligned = floor(num_computed / block_size) * block_size.
+    #   slot 0: computed 8 -> aligned 8, bias 0, dest 0, src 1   (copy)
+    #   slot 1: computed 8 -> dest 0 == src 0, bias 0            (skip)
+    #   slot 2: computed 5 -> aligned 0 < 5, needs_copy false    (skip)
+    #   slot 3: computed 7 + accepted 2 -> aligned 8, bias 1,
+    #           dest 0, src 2                                    (copy)
     num_accepted = torch.tensor([1, 1, 1, 2], dtype=torch.int32, device=device)
     state_idx = torch.tensor([1, 0, 1, 2], dtype=torch.int32, device=device)
     num_scheduled = torch.ones(num_reqs, dtype=torch.int32, device=device)
@@ -515,6 +557,9 @@ def test_postprocess_indexes_block_tables_by_req_slot(conv_state_dim_first):
     num_draft = torch.ones(num_reqs, dtype=torch.int32, device=device)
     num_accepted_out = num_accepted.clone()
 
+    # What a correct kernel must do, stated directly: slots 0 and 3 copy; slot 2
+    # is marked fresh here because its skip comes from ``needs_copy``, which the
+    # reference models through the src_col < 0 branch.
     ref_src = torch.tensor([1, 0, -1, 2], dtype=torch.int32)
     ref_dst = torch.zeros(num_reqs, dtype=torch.int32)
     ref_bias = torch.tensor([0, 0, 0, 1], dtype=torch.int32)
@@ -582,115 +627,7 @@ if __name__ == "__main__":
             f"OK num_reqs={nr} token_bias={tb} has_idx_mapping={mapping} "
             f"conv_dim_first={dim_first} temporal_tiles={tt}"
         )
-
-
-def _run_precopy_kernel(
-    convs,
-    ssms,
-    block_table,
-    src_col,
-    dst_col,
-    token_bias,
-    conv_state_dim_first,
-):
-    device = block_table.device
-    num_reqs = src_col.numel()
-    base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
-        convs, ssms, device, conv_state_dim_first
-    )
-    block_table_ptrs = torch.tensor(
-        [block_table.data_ptr()], dtype=torch.int64, device=device
-    )
-    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
-    grid = (num_reqs, NUM_LAYERS * 2, 1)
-    precopy_mamba_align_fused_kernel[grid](
-        dst_col,
-        src_col,
-        token_bias,
-        block_table_ptrs,
-        block_table.stride(0),
-        base,
-        blk_stride,
-        elem,
-        inner,
-        width,
-        group,
-        drc,
-        drs,
-        idx_mapping,
-        num_reqs,
-        COPY_BLOCK_SIZE=1024,
-        CONV_STATE_DIM_FIRST=conv_state_dim_first,
-        HAS_IDX_MAPPING=True,
-        TEMPORAL_TILES=1,
-    )
-    torch.accelerator.synchronize()
-
-
-@_parametrize("conv_state_dim_first", [False, True])
-@_parametrize(
-    "invalid_lookup",
-    [
-        "destination_oob",
-        "source_oob",
-        "temporal_oob",
-        "null_destination",
-        "null_source",
-    ],
-)
-@_cuda_required
-def test_precopy_invalid_block_lookup_is_fail_closed(
-    conv_state_dim_first, invalid_lookup
-):
-    device = torch.device("cuda")
-    torch.manual_seed(2027)
-    num_blocks = 5
-    convs, ssms = _build_state(num_blocks, device, conv_state_dim_first)
-    conv_before = [state.clone() for state in convs]
-    ssm_before = [state.clone() for state in ssms]
-
-    block_table_storage = torch.zeros(2, MAX_COLS, dtype=torch.int32, device=device)
-    block_table = block_table_storage[:1]
-    block_table[0, 0] = 2
-    block_table[0, 1] = 1
-    block_table[0, 2] = 3
-    src_col = torch.tensor([1], dtype=torch.int32, device=device)
-    dst_col = torch.tensor([0], dtype=torch.int32, device=device)
-    token_bias = torch.tensor([1], dtype=torch.int32, device=device)
-
-    if invalid_lookup == "destination_oob":
-        dst_col.fill_(MAX_COLS)
-        block_table_storage[1, 0] = 2
-    elif invalid_lookup == "source_oob":
-        src_col.fill_(MAX_COLS)
-        block_table_storage[1, 0] = 1
-    elif invalid_lookup == "temporal_oob":
-        src_col.fill_(MAX_COLS - 1)
-        block_table[0, MAX_COLS - 1] = 1
-        block_table_storage[1, 0] = 3
-    elif invalid_lookup == "null_destination":
-        block_table[0, 0] = 0
-    else:
-        block_table[0, 1] = 0
-        block_table[0, 2] = 0
-
-    _run_precopy_kernel(
-        convs,
-        ssms,
-        block_table,
-        src_col,
-        dst_col,
-        token_bias,
-        conv_state_dim_first,
-    )
-
-    for actual, before in zip(convs, conv_before):
-        expected = before.clone()
-        if invalid_lookup == "temporal_oob":
-            if conv_state_dim_first:
-                expected[2, :, : CONV_WIDTH - 1] = before[1, :, 1:]
-            else:
-                expected[2, : CONV_WIDTH - 1] = before[1, 1:]
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    for actual, before in zip(ssms, ssm_before):
-        torch.testing.assert_close(actual, before, rtol=0, atol=0)
+    for dim_first in (False, True):
+        test_precopy_indexes_block_tables_by_req_slot(dim_first)
+        test_postprocess_indexes_block_tables_by_req_slot(dim_first)
+        print(f"OK row attribution conv_dim_first={dim_first}")

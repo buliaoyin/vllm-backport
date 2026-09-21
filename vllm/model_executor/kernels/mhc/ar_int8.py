@@ -53,8 +53,9 @@ def ar_hoisted(vllm_config) -> bool:
     return get_tp_group().world_size > 1
 
 
-def assert_hoist_preconditions(vllm_config, moe_config=None,
-                               routed_output_transform=None) -> None:
+def assert_hoist_preconditions(
+    vllm_config, moe_config=None, routed_output_transform=None
+) -> None:
     """Turn every remaining unknown into a startup failure.
 
     Called at construction with whatever is in scope; each check is skipped only
@@ -68,7 +69,7 @@ def assert_hoist_preconditions(vllm_config, moe_config=None,
     # than merely unlikely. A comment cannot survive someone raising the cap or
     # lowering the threshold; this can.
     cap = getattr(vllm_config.compilation_config, "max_cudagraph_capture_size", 0) or 0
-    assert MIN_INT8_TOKENS > cap, (
+    assert cap < MIN_INT8_TOKENS, (
         f"VLLM_MHC_AR_INT8 requires the int8 token threshold to exceed the "
         f"cudagraph capture cap so prefill is always eager and no replayed "
         f"graph can contain the int8 op; got threshold={MIN_INT8_TOKENS} "

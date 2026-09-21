@@ -324,6 +324,7 @@ def test_the_offset_guard_can_actually_fail():
     real = indexer_decode_shard_rows
     saved = list(FAILURES)
     try:
+
         def group_relative_rows(bounds, batch_size, next_n):
             if bounds is None:
                 return 0, batch_size * next_n

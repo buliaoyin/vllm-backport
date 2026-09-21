@@ -124,6 +124,20 @@ class FixFunctionalizationPass(VllmInductorPass):
                     5: "scale_out",
                 }
                 self.defunctionalize(graph, node, mutated_args)
+            elif (
+                hasattr(
+                    torch.ops.vllm,
+                    "flashinfer_fused_add_rms_norm_nvfp4_quant",
+                )
+                and at_target
+                == torch.ops.vllm.flashinfer_fused_add_rms_norm_nvfp4_quant.default
+            ):
+                mutated_args = {
+                    1: "result",
+                    2: "result_block_scale",
+                    3: "residual",
+                }
+                self.defunctionalize(graph, node, mutated_args)
             # For some reason we need to specify the args for both
             # silu_and_mul and silu_and_mul_quant. The kwargs
             # pathway gets the wrong answer.
@@ -171,15 +185,6 @@ class FixFunctionalizationPass(VllmInductorPass):
                     "forced_token_heads_per_warp",
                 )
                 self.defunctionalize(graph, node, mutated_args=mutated_args, args=args)
-            elif (
-                hasattr(torch.ops.vllm, "ple_offload_wait")
-                and at_target == torch.ops.vllm.ple_offload_wait.default
-            ):
-                # Functionalization would clone the declared-mutated buffer
-                # before the wait, potentially reading it before the CPU signals.
-                # Restore the wait and keep users on the original IPC buffer.
-                mutated_args = {1: "gpu_output_buffer"}
-                self.defunctionalize(graph, node, mutated_args)
             elif (
                 hasattr(torch.ops.vllm, "fused_rope_and_unified_kv_cache_update")
                 and at_target

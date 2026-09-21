@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     CUTLASS_BLOCK_FP8_SUPPORTED,
     convert_to_channelwise,
+    cutlass_fp8_supported,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -166,6 +167,13 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cuda():
             return False, "requires CUDA."
+        supported = (
+            cutlass_fp8_supported()
+            if compute_capability is None
+            else ops.cutlass_scaled_mm_supports_fp8(compute_capability)
+        )
+        if not supported:
+            return False, "requires a compiled CUTLASS FP8 kernel for this device."
         return True, None
 
     @classmethod

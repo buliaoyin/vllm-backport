@@ -54,6 +54,7 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_4BIT_NC = 7
     TURBOQUANT_K3V4_NC = 8
     TURBOQUANT_3BIT_NC = 9
+    NVFP4_DS_MLA = 10  # opaque-bytes NVFP4 DS-MLA layouts (FlashMLA sparse)
 
     @property
     def is_per_token_head(self) -> bool:
@@ -88,6 +89,11 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
+    # Must precede the ``nvfp4`` prefix test below, which would otherwise match.
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        # Page size is keyed on cache_dtype_str in the MLA specs, not
+        # nvfp4_kv_cache_full_dim.
+        return KVQuantMode.NVFP4_DS_MLA
     if kv_cache_dtype.startswith("nvfp4"):
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
@@ -151,21 +157,9 @@ class KVCacheSpec:
     block_size: int
 
     @property
-    def participates_in_prefix_caching(self) -> bool:
+    def prefix_cacheable(self) -> bool:
         """Whether this spec's group participates in prefix caching."""
         return True
-
-    @property
-    def prefix_cacheable(self) -> bool:
-        """Deprecated alias for :attr:`participates_in_prefix_caching`.
-
-        Out-of-tree KV connectors probe this with ``getattr(spec,
-        "prefix_cacheable", True)``, so dropping it during the upstream rename
-        would silently default per-request scratch groups (the GLM-5.3-Flash
-        kpool tail, the DSV4 compressor ring) back to "cacheable" and let a
-        connector store and serve them as prefix KV.
-        """
-        return self.participates_in_prefix_caching
 
     @property
     def num_heads(self) -> int:
@@ -230,9 +224,10 @@ class KVCacheSpec:
         """
         Merge a list of KVCacheSpec objects into a single KVCacheSpec object.
         """
-        assert all(spec == specs[0] for spec in specs[1:]), (
-            "All layers in the same KV cache group must be the same."
-        )
+        if not all(spec == specs[0] for spec in specs[1:]):
+            raise AssertionError(
+                "All layers in the same KV cache group must be the same."
+            )
         return copy.deepcopy(specs[0])
 
     def is_uniform_with_collection(
@@ -564,7 +559,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     model_version: str | None = None
     storage_block_size: int | None = None
     """Token width used to view storage when it differs from the kernel block."""
-    # Marks draft groups that flatten a non-causal query block into decode rows.
+    # Group capability enabled when any member flattens a non-causal query block
+    # into decode rows. Runtime metadata still selects causal vs. non-causal mode.
     non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
@@ -793,7 +789,7 @@ class CircularBufferSpec(AttentionSpec):
         )
 
     @property
-    def participates_in_prefix_caching(self) -> bool:
+    def prefix_cacheable(self) -> bool:
         return False
 
 
@@ -881,7 +877,7 @@ class KpoolTailSpec(SlidingWindowSpec):
         return all(isinstance(spec, KpoolTailSpec) for spec in kv_cache_specs.values())
 
     @property
-    def participates_in_prefix_caching(self) -> bool:
+    def prefix_cacheable(self) -> bool:
         return False
 
 
@@ -893,12 +889,13 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    num_prefill_checkpoint_blocks: int = 0
+    prefill_checkpoint_alignment: int | None = None
+    num_heads: int = 1
+    tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
-    num_prefill_checkpoint_blocks: int = 0
-    num_heads: int = 1
-    tokens_per_state: int = -1
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -959,8 +956,47 @@ class MambaSpec(KVCacheSpec):
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
+            and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
+            and spec.page_size_bytes == self.page_size_bytes
+            and spec.tp_replicated == self.tp_replicated
             for spec in kv_cache_specs.values()
         )
+
+
+def get_mamba_prefill_checkpoint_position(
+    num_tokens: int,
+    hash_block_size: int,
+    drop_eagle_block: bool,
+) -> int:
+    """Return the reusable Mamba checkpoint boundary for a prefill."""
+    checkpoint_position = (num_tokens - 1) // hash_block_size * hash_block_size
+    if drop_eagle_block:
+        checkpoint_position -= hash_block_size
+    return max(checkpoint_position, 0)
+
+
+def is_mamba_prefill_checkpoint_valid(
+    query_start: int,
+    query_end: int,
+    checkpoint_position: int,
+    hash_block_size: int,
+    mamba_block_size: int,
+    checkpoint_alignment: int | None,
+) -> bool:
+    """Whether a backend can export the checkpoint in this query."""
+    if checkpoint_alignment is None:
+        return False
+    assert checkpoint_alignment > 0
+
+    initial_state_col = (query_start - 1) // mamba_block_size
+    checkpoint_col = cdiv(query_end, mamba_block_size) - 2
+    return (
+        query_start % hash_block_size == 0
+        and checkpoint_col > initial_state_col
+        and query_start + hash_block_size <= checkpoint_position
+        and query_start < checkpoint_position < query_end
+        and (checkpoint_position - query_start) % checkpoint_alignment == 0
+    )
 
 
 @dataclass(frozen=True)
@@ -1050,10 +1086,8 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
-    def participates_in_prefix_caching(self) -> bool:
-        return all(
-            spec.participates_in_prefix_caching for spec in self.kv_cache_specs.values()
-        )
+    def prefix_cacheable(self) -> bool:
+        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
 
     @property
     def first_spec(self) -> KVCacheSpec:
@@ -1112,11 +1146,9 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         else:
             return None
 
-    # Helpers for cache formats composed of repeated physical layer tuples.
-    def get_page_sizes(self) -> list[int]:
-        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
-
-    def get_num_layer_tuples(self) -> int:
+    def get_max_layers_per_page_size(self) -> int:
+        """Max number of layers sharing a page size. For a balanced bucket
+        this equals the number of repetitions of the layer pattern."""
         return Counter(
             spec.page_size_bytes for spec in self.kv_cache_specs.values()
         ).most_common(1)[0][1]
@@ -1319,13 +1351,11 @@ class KVCacheConfig:
 
     @property
     def has_mamba_layers(self) -> bool:
-        for group in self.kv_cache_groups:
-            group_spec = group.kv_cache_spec
-            if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                group_spec = group_spec.first_spec
-            if isinstance(group_spec, MambaSpec):
-                return True
-        return False
+        return any(
+            isinstance(spec, MambaSpec)
+            for group in self.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:

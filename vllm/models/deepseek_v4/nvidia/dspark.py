@@ -396,6 +396,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         """Per-position acceptance probability for each drafted token."""
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+
     def markov_fusion_operands(self):
         return self.model.markov_head.fusion_operands(self.logits_processor)
 

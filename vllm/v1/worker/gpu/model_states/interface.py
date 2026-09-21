@@ -16,6 +16,7 @@ from vllm.tasks import GenerationTask
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.stats import ExpertCacheStats
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -155,6 +156,13 @@ class ModelState(ABC):
     ) -> None:
         return None
 
+    def reset_expert_cache_stats(self) -> None:
+        """Exclude model warmup from serving cache statistics."""
+        return None
+
+    def take_expert_cache_stats(self) -> ExpertCacheStats | None:
+        return None
+
     @abstractmethod
     def prepare_inputs_embeds(
         self,
@@ -221,6 +229,7 @@ class ModelState(ABC):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_idx: int = 0,
     ) -> dict[str, Any]:
         raise NotImplementedError
 

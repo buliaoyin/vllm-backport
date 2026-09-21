@@ -54,9 +54,7 @@ def _moe_align_block_size_deterministic(
     counts_full.scatter_add_(0, key, torch.ones_like(key))
     counts = counts_full[:num_experts]
     padded_counts = ((counts + block_size - 1) // block_size) * block_size
-    cum_padded = torch.zeros(
-        num_experts + 1, dtype=torch.int64, device=topk_ids.device
-    )
+    cum_padded = torch.zeros(num_experts + 1, dtype=torch.int64, device=topk_ids.device)
     torch.cumsum(padded_counts, 0, out=cum_padded[1:])
     cum_unpadded = torch.zeros_like(cum_padded)
     torch.cumsum(counts, 0, out=cum_unpadded[1:])
@@ -89,8 +87,7 @@ def _moe_align_block_size_deterministic(
     # inactive (-1), matching the CUDA kernel.
     nblocks = expert_ids.numel()
     block_starts = (
-        torch.arange(nblocks, dtype=torch.int64, device=topk_ids.device)
-        * block_size
+        torch.arange(nblocks, dtype=torch.int64, device=topk_ids.device) * block_size
     )
     block_expert = torch.searchsorted(cum_padded[1:], block_starts, right=True)
     total_padded = cum_padded[num_experts]

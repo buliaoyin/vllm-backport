@@ -112,19 +112,39 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
 
+    @property
+    def _mamba_block_size(self) -> int:
+        """The mamba group's block size, resolved on read.
+
+        This must not be cached in `__init__`: at that point
+        `cache_config.mamba_block_size` is still unset and
+        `cache_config.block_size` still holds the attention default, so the
+        value comes out far smaller than the real mamba block size (16 vs 1152
+        on GLM-5.3-Flash). Both only settle once the KV cache groups are built,
+        which is also where `_mamba_spec` -- the authoritative source -- becomes
+        available.
+
+        `add_request` would otherwise seed `state_idx` with an out-of-range
+        block_table column, which the fused align pre-copy reads out of bounds
+        (vllm#53142).
+        """
+        if self._mamba_spec is not None:
+            return self._mamba_spec.block_size
+        return self.cache_config.mamba_block_size or self.cache_config.block_size
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
-            block_size = (
-                self._mamba_spec.block_size
-                if self._mamba_spec is not None
-                else self.cache_config.block_size
-            )
+            # The divisor must be the mamba group's block size, not the
+            # attention block size: on hybrids they differ, and a resume over a
+            # cached prefix would otherwise seed an out-of-range block_table
+            # column that the fused align pre-copy reads as a garbage block id
+            # (vllm#53142).
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // block_size
+                (new_req_data.num_computed_tokens - 1) // self._mamba_block_size
             )
 
     def _get_mamba_group_info(
@@ -174,8 +194,9 @@ class MambaHybridModelState(DefaultModelState):
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
             forward_context = self.vllm_config.compilation_config.static_forward_context
-            # Capture persistent request-slot tables, whose addresses remain stable
-            # when later batches are reordered or PP postprocessing is deferred.
+            # ``block_tables`` are the SOURCE per-request-slot tables (stable
+            # data_ptr, req-indexed), so the metadata is captured once here and
+            # reused across steps; the copy kernels index rows by req_idx.
             ctx.initialize_from_forward_context(
                 kv_cache_config,
                 forward_context,
@@ -242,7 +263,9 @@ class MambaHybridModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_idx: int = 0,
     ) -> dict[str, Any]:
+        assert ubatch_idx == 0, "DBO is not supported"
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -326,9 +349,6 @@ class MambaHybridModelState(DefaultModelState):
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
-            # Position-dependent metadata builders need this. GLM-5.3-Flash's
-            # kpool tail maps each token to `own_block * kpool + pos % kpool`,
-            # so without positions it cannot build its slot mapping at all.
             positions=input_batch.positions,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
