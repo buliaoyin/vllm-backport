@@ -311,6 +311,70 @@ def test_prefix_cache_hit_uses_per_group_dcp_geometry():
     manager.free(req1)
 
 
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize("prompt_length", [17, 128, 129, 256, 1026])
+@pytest.mark.parametrize("output_length", [0, 256])
+def test_prefix_hit_reserves_decoder_replay_window(
+    block_size, prompt_length, output_length
+):
+    """CED needs fresh suffix activations, including after decode preemption."""
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 512),
+        max_model_len=2048,
+        hash_block_size=block_size,
+        min_prefill_tokens=128,
+    )
+    tokens = list(range(prompt_length + output_length))
+    seed = make_request("seed", tokens, block_size, sha256)
+    assert manager.allocate_slots(seed, len(tokens)) is not None
+    manager.free(seed)
+
+    request = make_request("reuse", tokens[:prompt_length], block_size, sha256)
+    if output_length:
+        request.append_output_token_ids(tokens[prompt_length:])
+        request.num_preemptions = 1
+    blocks, hit, _ = manager.get_computed_blocks(request)
+    assert hit == max(0, len(tokens) - 128) // block_size * block_size
+    assert manager.allocate_slots(request, len(tokens) - hit, hit, blocks) is not None
+    assert hit <= max(0, request.num_tokens - 128)
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("prompt_length", [2049, 2175, 4097, 4223, 32768])
+def test_sparse_retention_keeps_ced_replay_boundary(use_eagle, prompt_length):
+    """A CED resend must retain SWA at its earlier replay start, also with DSpark."""
+    spec_args = dict(num_kv_heads=1, head_size=1, dtype=torch.float32)
+    groups = [
+        KVCacheGroupSpec(["full"], FullAttentionSpec(128, **spec_args)),
+        KVCacheGroupSpec(
+            ["swa"], SlidingWindowSpec(128, **spec_args, sliding_window=128)
+        ),
+    ]
+    if use_eagle:
+        groups.append(
+            KVCacheGroupSpec(
+                ["draft"], FullAttentionSpec(32, **spec_args), is_eagle_group=True
+            )
+        )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(num_blocks=4096, kv_cache_tensors=[], kv_cache_groups=groups),
+        max_model_len=65536,
+        hash_block_size=32,
+        retention_interval=0,
+        min_prefill_tokens=128,
+        use_eagle=use_eagle,
+    )
+    tokens = list(range(prompt_length))
+    seed = make_request("seed", tokens, 32, sha256)
+    assert manager.allocate_slots(seed, prompt_length) is not None
+    manager.free(seed)
+    request = make_request("reuse", tokens, 32, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(request)
+    expected = (prompt_length - 128 - (32 if use_eagle else 0)) // 128 * 128
+    assert hit == expected
+    assert manager.allocate_slots(request, prompt_length - hit, hit, blocks) is not None
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_prefill(hash_fn):
     block_size = 16

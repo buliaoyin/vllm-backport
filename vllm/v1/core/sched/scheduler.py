@@ -313,6 +313,14 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        min_prefill_tokens = 1
+        hf_config = vllm_config.model_config.hf_config
+        if (
+            hf_config.model_type == "deepseek_v41"
+            and isinstance(vllm_config.additional_config, dict)
+            and vllm_config.additional_config.get("ced_prefill", False)
+        ):
+            min_prefill_tokens = hf_config.sliding_window
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -331,6 +339,7 @@ class Scheduler(SchedulerInterface):
             enable_mamba_fine_grained_prefix_cache=(
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
             ),
+            min_prefill_tokens=min_prefill_tokens,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.

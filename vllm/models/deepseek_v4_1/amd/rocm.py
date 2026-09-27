@@ -133,6 +133,7 @@ def _combine_topk_swa_indices_kernel(
         pos = start_pos + token_idx_in_query
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        swa_len = tl.minimum(swa_len, tl.maximum(pos - gather_start + 1, 0))
 
         topk_offset = tl.arange(0, PADDED_TOP_K)
         topk_mask = topk_offset < topk_len
@@ -229,10 +230,13 @@ def combine_topk_swa_indices(
     swa_lens = torch.minimum(
         positions + 1, torch.full_like(positions, window_size)
     ).clamp_min(0)
+    gather_starts = seq_lens - gather_lens
+    swa_lens = torch.minimum(
+        swa_lens, (positions - gather_starts[req_ids] + 1).clamp_min(0)
+    )
     swa_offsets = torch.arange(window_size, device=seq_lens.device)
     swa_mask = swa_offsets[None, :] < swa_lens[:, None]
     swa_columns = topk_lens[:, None] + swa_offsets[None, :]
-    gather_starts = seq_lens - gather_lens
     swa_values = (
         M * req_ids[:, None]
         + N

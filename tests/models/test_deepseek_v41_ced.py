@@ -36,9 +36,44 @@ def test_ced_suffix_rejects_missing_encoder_history():
         suffix.append("request", 1024, positions=torch.arange(128))
 
 
-def test_ced_replay_limits_swa_without_shortening_global_context(monkeypatch):
+def test_ced_prefix_suffix_still_rejects_gaps_and_other_requests():
+    suffix = SuffixBuffer(128, allow_prefix=True)
+    suffix.append("request", 2048, positions=torch.arange(2048, 2112))
+    with pytest.raises(ValueError, match="contiguous"):
+        suffix.append("request", 2113, positions=torch.tensor([2113]))
+    with pytest.raises(ValueError, match="contiguous"):
+        suffix.append("other", 2112, positions=torch.tensor([2112]))
+    saved = suffix.append("request", 2112, positions=torch.arange(2112, 2176))
+    torch.testing.assert_close(saved["positions"], torch.arange(2048, 2176))
+
+
+def test_ced_rejects_prefix_hit_without_a_complete_replay_window():
     config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128))
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128)),
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+    )
+    state = CEDMetadata(config, torch.device("cpu"))
+    batch = SimpleNamespace(
+        has_prefill=True,
+        num_tokens=1,
+        req_ids=["request"],
+        num_computed_prefill_tokens_np=np.array([2048]),
+        prefill_len_np=np.array([2049]),
+        is_prefilling_np=np.array([True]),
+        positions=torch.tensor([2048]),
+        input_ids=torch.tensor([1]),
+    )
+    with pytest.raises(ValueError, match="complete replay window"):
+        state.prepare(batch, (), torch.tensor([[2048]]), [], None)
+
+
+@pytest.mark.parametrize("prefix_length", [0, 2048])
+def test_ced_replay_limits_swa_without_shortening_global_context(
+    monkeypatch, prefix_length
+):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128)),
+        cache_config=SimpleNamespace(enable_prefix_caching=bool(prefix_length)),
     )
     state = CEDMetadata(config, torch.device("cpu"))
     state.groups = []
@@ -59,14 +94,15 @@ def test_ced_replay_limits_swa_without_shortening_global_context(monkeypatch):
         }
 
     monkeypatch.setattr("vllm.models.deepseek_v4_1.ced.build_attn_metadata", build)
-    for start, count in [(0, 1024), (1024, 2)]:
+    for chunk, (start, count) in enumerate([(0, 1024), (1024, 2)]):
+        start += prefix_length
         positions = torch.arange(start, start + count)
         batch = SimpleNamespace(
             has_prefill=True,
             num_reqs=1,
             is_prefilling_np=np.array([True]),
             num_computed_prefill_tokens_np=np.array([start]),
-            prefill_len_np=np.array([1026]),
+            prefill_len_np=np.array([prefix_length + 1026]),
             num_tokens=count,
             req_ids=["request"],
             positions=positions,
@@ -75,17 +111,17 @@ def test_ced_replay_limits_swa_without_shortening_global_context(monkeypatch):
             seq_lens_cpu_upper_bound=torch.tensor([start + count]),
         )
         step = state.prepare(batch, (), positions[None, :], [], None)
-        if not start:
+        if chunk == 0:
             assert not step.final and not captured
     assert len(captured) == 1
     assert captured[0]["num_tokens"] == 128
-    assert captured[0]["max_seq_len"] == 1026
-    torch.testing.assert_close(step.positions, torch.arange(898, 1026))
-    torch.testing.assert_close(step.input_ids, torch.arange(998, 1126))
+    assert captured[0]["max_seq_len"] == prefix_length + 1026
+    torch.testing.assert_close(step.positions, torch.arange(898, 1026) + prefix_length)
+    torch.testing.assert_close(step.input_ids, torch.arange(998, 1126) + prefix_length)
     torch.testing.assert_close(captured[0]["slot_mappings"][0], step.positions)
     metadata = step.replay_metadata["decoder.swa"]
     assert metadata.prefill_gather_lens.item() == 128
-    assert metadata.prefill_seq_lens.item() == 1026
+    assert metadata.prefill_seq_lens.item() == prefix_length + 1026
 
 
 @pytest.mark.parametrize("prompt_logprobs", [None, 0, 1])
@@ -523,10 +559,14 @@ def test_hybrid_feedback_ignores_warmup_requests(monkeypatch):
     assert state.hybrid_requests == {"real": 256}
 
 
-def test_ced_interleaved_requests_keep_separate_suffixes_and_decode_rows(monkeypatch):
+@pytest.mark.parametrize("prefix_length", [0, 2048])
+def test_ced_interleaved_requests_keep_separate_suffixes_and_decode_rows(
+    monkeypatch, prefix_length
+):
     """A mixed batch must select each request's own history and block table."""
     config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128))
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128)),
+        cache_config=SimpleNamespace(enable_prefix_caching=bool(prefix_length)),
     )
     state = CEDMetadata(config, torch.device("cpu"))
     state.groups = []
@@ -539,6 +579,12 @@ def test_ced_interleaved_requests_keep_separate_suffixes_and_decode_rows(monkeyp
     monkeypatch.setattr("vllm.models.deepseek_v4_1.ced.build_attn_metadata", build)
 
     def prepare(rows, disabled=frozenset()):
+        rows = [
+            (name, start + prefix_length, n, total + prefix_length, prefill)
+            if prefill and name not in disabled
+            else (name, start, n, total, prefill)
+            for name, start, n, total, prefill in rows
+        ]
         positions = torch.cat(
             [torch.arange(start, start + n) for _, start, n, _, _ in rows]
         )
@@ -571,14 +617,15 @@ def test_ced_interleaved_requests_keep_separate_suffixes_and_decode_rows(monkeyp
     )
     assert [r.replay_count for r in mixed.requests] == [4, 0, 128]
     torch.testing.assert_close(
-        mixed.positions, torch.cat([torch.arange(40, 44), torch.arange(2, 130)])
+        mixed.positions,
+        torch.cat([torch.arange(40, 44), torch.arange(2, 130) + prefix_length]),
     )
     assert captured[-1]["query_start_loc_cpu"].tolist() == [0, 4, 132]
     assert captured[-1]["block_tables"][0].flatten().tolist() == [1000, 1002]
     assert captured[-1]["is_prefilling"].tolist() == [False, True]
     assert set(state.suffixes) == {"b"}
     final = prepare([("b", 133, 3, 136, True)])
-    torch.testing.assert_close(final.positions, torch.arange(8, 136))
+    torch.testing.assert_close(final.positions, torch.arange(8, 136) + prefix_length)
     assert not state.suffixes
     prepare([("cancelled", 0, 32, 256, True)])
     state.remove_request("cancelled")

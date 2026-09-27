@@ -41,6 +41,7 @@ DeepSeek-V4.1-Flash 使用 CPU/GPU 混合推理，分层由 `deepseek_v41_hybrid
 - 优化 Engram／专家权重加载、CPU 专家算子和 prefill，并限制主机预打包缓存的内存占用。
 - 可选 [Engram SSD 存储](docs/features/deepseek_v41_engram_ssd.md)，按需直接读取原权重文件，使用有界缓冲及热点缓存。
 - CPU 专家按 NUMA 节点自动分片和绑核，适配单／双路 NPS1、NPS2、NPS4；共享 Engram 内存分散到可用节点，无需新增启动参数。
+- 可通过 `--enable-prefix-caching` 复用相同前缀的 KV，兼容 CED 尾回放和 DSpark。
 
 内存参考（此前三卡实测）：加载后 worker 主存占用约 **344 GiB（PSS）**，建议配置
 **512 GiB 主存**。开启 DSpark 时三卡显存采样峰值合计约 **188–189 GiB**；
@@ -67,6 +68,11 @@ CUDA_VISIBLE_DEVICES=0,1,2 NCCL_P2P_DISABLE=1 \
 `cpu_threads` 的两个值分别为 prefill 和 decode 的**总线程数**，并非每个 NUMA
 节点的线程数。首次检查启动时，可先将 `--max-model-len` 降为 `32768`、
 `--kv-cache-tokens` 降为 `131072`，再按负载增加预算。
+
+重复长前缀、多轮对话可在上例增加 `--enable-prefix-caching`（混合模式默认关闭）。
+命中后仍至少重算最后 **128 token**，按 KV 块边界对齐，以重建 CED 尾回放和
+草稿上下文；日志中的 `Prefix cache hit rate` 反映前缀复用，与专家缓存命中率独立。
+缓存使用已有 KV 预算，不额外扩大 `--kv-cache-tokens` 的内存预留。
 
 内存不足时，可将上例的 `--additional-config` 替换为：
 

@@ -80,14 +80,13 @@ def apply_hybrid_defaults(args):
         raise ValueError("DeepSeek CPU hybrid requires TP1 and DP1 on one host")
     if args.distributed_executor_backend not in (None, "mp"):
         raise ValueError("DeepSeek CPU hybrid currently requires the local mp executor")
-    if args.enable_prefix_caching:
-        raise ValueError("DeepSeek CPU hybrid requires prefix caching disabled")
     for key in ("cpu_moe", "ced_prefill", "pp_kv_transfer", "cpu_phase_threads"):
         if key in args.additional_config:
             raise ValueError(f"{key} cannot be combined with deepseek_v41_hybrid")
     if args.max_num_seqs is None:
         args.max_num_seqs = 1
-    args.enable_prefix_caching = False
+    if args.enable_prefix_caching is None:
+        args.enable_prefix_caching = False
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = 2048
     if not args.limit_mm_per_prompt:

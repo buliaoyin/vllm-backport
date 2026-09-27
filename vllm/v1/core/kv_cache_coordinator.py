@@ -84,8 +84,10 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        min_prefill_tokens: int = 1,
     ):
         self.kv_cache_config = kv_cache_config
+        self.min_prefill_tokens = min_prefill_tokens
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
         # of the hash_block_size and the block size of each group.
         assert scheduler_block_size % hash_block_size == 0 and all(
@@ -314,17 +316,17 @@ class KVCacheCoordinator(ABC):
         at each position; EAGLE groups also keep the block above, which they
         match and drop back from (see ``reachable_block_mask``).
 
-        Two positions are reachable: a resend of the identical prompt is capped
-        at ``num_tokens - 1`` (its last token is recomputed for logits), a
-        longer sibling matches the final aligned block. They differ only on a
-        block-aligned prompt, where retaining just the higher one collapses the
-        resend's hit to 0. The alignment is the scheduler block size, not the
-        finer hash granularity, which would over-estimate the reach.
+        A resend leaves the required prefill suffix uncached; a longer sibling
+        can match the final aligned block. CED needs an earlier boundary to
+        reconstruct its decoder window. Keep both under sparse retention.
         """
+        resend_limit = max(0, request.num_prompt_tokens - self.min_prefill_tokens)
         if not self.eagle_group_ids:
-            return (request.num_prompt_tokens - 1,)
+            if self.min_prefill_tokens == 1:
+                return (resend_limit,)
+            return (resend_limit, request.num_prompt_tokens)
         block = self.scheduler_block_size
-        resend = (request.num_prompt_tokens - 1) // block * block
+        resend = resend_limit // block * block
         extension = request.num_prompt_tokens // block * block
         return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
 
@@ -468,6 +470,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        min_prefill_tokens: int = 1,
     ):
         super().__init__(
             kv_cache_config,
@@ -482,6 +485,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            min_prefill_tokens=min_prefill_tokens,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -520,6 +524,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        min_prefill_tokens: int = 1,
     ):
         super().__init__(
             kv_cache_config,
@@ -534,6 +539,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            min_prefill_tokens=min_prefill_tokens,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.dcp_world_size = self.single_type_managers[0].dcp_world_size
@@ -605,6 +611,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        min_prefill_tokens: int = 1,
     ):
         super().__init__(
             kv_cache_config,
@@ -619,6 +626,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            min_prefill_tokens=min_prefill_tokens,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -987,6 +995,7 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
+    min_prefill_tokens: int = 1,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -1001,6 +1010,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            min_prefill_tokens=min_prefill_tokens,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -1016,6 +1026,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            min_prefill_tokens=min_prefill_tokens,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -1030,4 +1041,5 @@ def get_kv_cache_coordinator(
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
         num_prefill_lookahead=num_prefill_lookahead,
+        min_prefill_tokens=min_prefill_tokens,
     )

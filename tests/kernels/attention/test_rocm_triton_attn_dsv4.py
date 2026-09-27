@@ -452,6 +452,56 @@ def test_dsv41_ampere_prefill_indices_capture_without_host_sync(bounded_submissi
         torch.testing.assert_close(result, baseline, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 17, 128])
+@pytest.mark.parametrize("topk", [0, 4])
+@torch.inference_mode()
+def test_dsv41_ced_replay_never_reads_before_gathered_swa(num_tokens, topk):
+    """Unread workspace before the CED tail must not become attention keys."""
+    from vllm.models.deepseek_v4_1.ampere.prefill_metadata import (
+        combine_topk_swa_indices,
+    )
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
+
+    n = 256
+    indices, lengths = combine_topk_swa_indices(
+        torch.arange(4, device="cuda", dtype=torch.int32).expand(num_tokens, -1),
+        torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32),
+        torch.tensor([1024], device="cuda", dtype=torch.int32),
+        torch.tensor([num_tokens], device="cuda", dtype=torch.int32),
+        128,
+        1,
+        topk,
+        n + 128,
+        n,
+    )
+    rows = [list(range(topk)) + list(range(n, n + i + 1)) for i in range(num_tokens)]
+    assert lengths.tolist() == [len(row) for row in rows]
+    for actual, expected in zip(indices.tolist(), rows):
+        assert actual[: len(expected)] == expected
+        assert all(index == -1 for index in actual[len(expected) :])
+
+    torch.manual_seed(41)
+    q = torch.randn(num_tokens, 2, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    kv = torch.full((n + 128, HEAD_DIM), float("nan"), dtype=q.dtype, device="cuda")
+    kv[:topk] = torch.randn_like(kv[:topk])
+    kv[n : n + num_tokens] = torch.randn_like(kv[n : n + num_tokens])
+    output = torch.empty_like(q)
+    rocm_sparse_attn_prefill(
+        q=q,
+        kv=kv[:, None],
+        indices=indices,
+        topk_length=lengths,
+        scale=HEAD_DIM**-0.5,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        attn_sink=None,
+        output=output,
+    )
+    expected = _ref_sparse_prefill_ragged(q, kv, rows, HEAD_DIM**-0.5, None)
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
 @torch.inference_mode()
 def test_sparse_attn_prefill_ragged_kernel() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (

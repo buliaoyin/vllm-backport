@@ -43,6 +43,7 @@ def _combine_kernel(
     else:
         topk_len = 0
     swa_len = tl.minimum(tl.maximum(position + 1, 0), WINDOW_SIZE)
+    swa_len = tl.minimum(swa_len, tl.maximum(position - seq_len + gather_len + 1, 0))
     columns = tl.arange(0, BLOCK_COLS)
     topk = tl.load(
         topk_ptr + token.to(tl.int64) * topk_stride + columns,

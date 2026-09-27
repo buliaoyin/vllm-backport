@@ -585,7 +585,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     "CED prefill requires encoder layer 19 and all decoder layers "
                     "on the last PP rank"
                 )
-            self.ced_prefill = CEDPrefill(config.sliding_window)
+            self.ced_prefill = CEDPrefill(
+                config.sliding_window,
+                allow_prefix=vllm_config.cache_config.enable_prefix_caching,
+            )
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
         # (chunked prefill / decode lookback); key it off the first local

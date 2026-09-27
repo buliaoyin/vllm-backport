@@ -30,8 +30,6 @@ def ced_prefill_enabled(config: VllmConfig) -> bool:
     parallel = config.parallel_config
     if parallel.tensor_parallel_size != 1 or parallel.use_ubatching:
         raise ValueError("CED prefill currently requires TP1 without microbatches")
-    if config.cache_config.enable_prefix_caching:
-        raise ValueError("CED prefill currently requires prefix caching disabled")
     if (
         config.speculative_config is not None
         and config.speculative_config.method != "dspark"
@@ -43,19 +41,22 @@ def ced_prefill_enabled(config: VllmConfig) -> bool:
 class SuffixBuffer:
     """Keep a suffix across arbitrary chunk boundaries without retaining the chunk."""
 
-    def __init__(self, width: int):
+    def __init__(self, width: int, allow_prefix: bool = False):
         self.width = width
+        self.allow_prefix = allow_prefix
         self.request_id: str | None = None
         self.next_position = 0
         self.tensors: dict[str, torch.Tensor] = {}
 
     def append(self, request_id: str, start: int, **tensors) -> dict[str, torch.Tensor]:
-        if start == 0:
+        if start == 0 or (self.request_id is None and self.allow_prefix):
             self.request_id = request_id
-            self.next_position = 0
+            self.next_position = start
             self.tensors = {}
         if request_id != self.request_id or start != self.next_position:
-            raise ValueError("CED prefill chunks must be contiguous from position zero")
+            raise ValueError(
+                "CED prefill chunks must be contiguous from the replay start"
+            )
         lengths = {value.shape[0] for value in tensors.values()}
         if len(lengths) != 1:
             raise ValueError("CED suffix tensors have different token counts")
@@ -108,6 +109,7 @@ class CEDMetadata:
         self.config = config
         self.device = device
         self.width = config.model_config.hf_config.sliding_window
+        self.allow_prefix = config.cache_config.enable_prefix_caching
         self.suffixes: dict[str, SuffixBuffer] = {}
         self.groups: list[list[AttentionGroup]] | None = None
 
@@ -144,8 +146,16 @@ class CEDMetadata:
                 input_ids=batch.input_ids[offset:end],
             )
             if use_ced:
-                buffer = self.suffixes.setdefault(request_id, SuffixBuffer(self.width))
+                buffer = self.suffixes.setdefault(
+                    request_id, SuffixBuffer(self.width, self.allow_prefix)
+                )
                 values = buffer.append(request_id, start, **values)
+                if final and len(values["positions"]) < min(
+                    self.width, int(batch.prefill_len_np[index])
+                ):
+                    raise ValueError(
+                        "CED prefix hit must leave a complete replay window"
+                    )
             if not use_ced or final:
                 request.replay_count = values["positions"].shape[0]
                 selected.append(index)
@@ -220,6 +230,8 @@ class CEDMetadata:
                 isinstance(metadata, DeepseekSparseSWAMetadata)
                 and metadata.prefill_gather_lens is not None
             ):
+                # Cached decoder SWA rows may never have been computed by CED.
+                # Replay reads only this request's freshly rebuilt suffix.
                 bounds = [
                     r.replay_count if r.use_ced else int(seq_cpu[i])
                     for i, r in enumerate(active)
@@ -247,8 +259,9 @@ def publish_decoder_kv(attn, normalized, positions):
 
 
 class CEDPrefill:
-    def __init__(self, width: int):
+    def __init__(self, width: int, allow_prefix: bool = False):
         self.width = width
+        self.allow_prefix = allow_prefix
         self.suffixes: dict[str, SuffixBuffer] = {}
         self.encoder_tokens = 0
         self.decoder_tokens = 0
@@ -303,7 +316,7 @@ class CEDPrefill:
             values = dict(hidden=encoder_hidden[begin:end], pre_mix=pre_mix[begin:end])
             if request.use_ced:
                 suffix = self.suffixes.setdefault(
-                    request.request_id, SuffixBuffer(self.width)
+                    request.request_id, SuffixBuffer(self.width, self.allow_prefix)
                 )
                 values = suffix.append(request.request_id, request.start, **values)
             if request.replay_count:

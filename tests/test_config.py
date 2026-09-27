@@ -2995,8 +2995,9 @@ def test_revision_resolved_when_weights_match_model(mock_resolve):
 
 
 @pytest.mark.parametrize("draft_tokens", [None, 3, 5, 7])
+@pytest.mark.parametrize("prefix_caching", [None, False, True])
 def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
-    monkeypatch, draft_tokens
+    monkeypatch, draft_tokens, prefix_caching
 ):
     from vllm.engine.arg_utils import EngineArgs
     from vllm.models.deepseek_v4_1 import hybrid
@@ -3009,6 +3010,7 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
         max_num_batched_tokens=4096,
         additional_config={"deepseek_v41_hybrid": {"pipeline_layers": [7, 7, 26]}},
         speculative_config={"method": "dspark"},
+        enable_prefix_caching=prefix_caching,
     )
     if draft_tokens is not None:
         args.speculative_config["num_speculative_tokens"] = draft_tokens
@@ -3016,7 +3018,7 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
     hybrid.apply_hybrid_defaults(args)
     assert args.max_num_batched_tokens == 4096
     assert args.max_num_seqs == 1
-    assert args.enable_prefix_caching is False
+    assert args.enable_prefix_caching is bool(prefix_caching)
     assert args.kv_cache_memory_bytes is None
     assert args.limit_mm_per_prompt == {"image": 1}
     assert args.speculative_config["num_speculative_tokens"] == (draft_tokens or 3)
