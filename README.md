@@ -74,6 +74,12 @@ CUDA_VISIBLE_DEVICES=0,1,2 NCCL_P2P_DISABLE=1 \
 草稿上下文；日志中的 `Prefix cache hit rate` 反映前缀复用，与专家缓存命中率独立。
 缓存使用已有 KV 预算，不额外扩大 `--kv-cache-tokens` 的内存预留。
 
+需要按任务采纳率调整 DSpark 草稿预算时，可将 `--speculative-config` 改为
+`'{"method":"dspark","num_speculative_tokens":7,"enable_adaptive_verification":true}'`。
+混合模式结合置信度、实际采纳情况和耗时，在 1 到配置上限之间调整实际起草数量；
+上限设为 7 时包含 2／4／6 档。该选项默认关闭，增大上限不保证更快，详见
+[动态草稿预算说明](docs/features/deepseek_v41_adaptive_verification.md)。
+
 内存不足时，可将上例的 `--additional-config` 替换为：
 
 ```bash

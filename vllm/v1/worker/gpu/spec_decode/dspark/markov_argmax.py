@@ -337,13 +337,14 @@ class FusedMarkovSampler:
         anchor_ids: torch.Tensor,
         draft_tokens: torch.Tensor,
     ) -> None:
-        """Run all ``n_spec`` Markov steps, filling ``draft_tokens[:num_reqs]``.
+        """Sample the supplied steps into the prefix of ``draft_tokens[:num_reqs]``.
 
-        ``base_logits`` is ``[num_reqs, n_spec, shard_width]`` and
+        ``base_logits`` is ``[num_reqs, num_steps, shard_width]`` and
         ``anchor_ids`` the ``[num_reqs]`` bonus tokens the chain starts from.
         """
         op = self.op
         assert base_logits.stride(-1) == 1
+        assert 0 < base_logits.shape[1] <= self.n_spec
         prev = self.prev[:num_reqs]
         prev.copy_(anchor_ids)
 
@@ -351,7 +352,7 @@ class FusedMarkovSampler:
         pair = self.pair[:num_reqs]
         shard_width = op.w2.shape[0]
 
-        for step in range(self.n_spec):
+        for step in range(base_logits.shape[1]):
             _markov_gemv_blockmax[(num_reqs, self.nblk)](
                 prev,
                 op.w1,

@@ -1030,6 +1030,62 @@ def test_automatic_cache_respects_each_devices_remaining_budget(capacities):
         assert all(count > 0 for _, count in plan)
 
 
+@pytest.mark.parametrize(
+    "connections,external", [(None, False), ("8", False), (None, True)]
+)
+def test_owned_mps_respects_and_restores_work_queue_configuration(
+    monkeypatch, tmp_path, connections, external
+):
+    from vllm.models.deepseek_v4_1 import hybrid_runtime as runtime
+
+    for key in (
+        "CUDA_MPS_PIPE_DIRECTORY",
+        "CUDA_MPS_LOG_DIRECTORY",
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_DEVICE_MAX_CONNECTIONS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    if connections is not None:
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", connections)
+    if external:
+        monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/external/mps")
+    for key in ("OMP_WAIT_POLICY", "GOMP_SPINCOUNT", "OPENBLAS_NUM_THREADS"):
+        monkeypatch.setenv(key, "1")
+    monkeypatch.setattr(runtime, "hybrid_settings", lambda _: {})
+    monkeypatch.setattr(runtime, "check_host_headroom", lambda _: None)
+    monkeypatch.setattr(runtime, "physical_cpus", lambda: [0])
+    monkeypatch.setattr(runtime.shutil, "which", lambda _: "/test/mps-control")
+    monkeypatch.setattr(runtime.tempfile, "tempdir", str(tmp_path))
+    launched = []
+
+    def run(*args, **kwargs):
+        launched.append(os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    hf = SimpleNamespace(
+        hidden_size=32,
+        moe_intermediate_size=32,
+        num_hidden_layers=40,
+        n_routed_experts=8,
+        engram_num_embeddings=[1],
+        engram_head_dim=32,
+    )
+    resources = runtime.HybridExecutorResources(
+        SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=hf),
+            additional_config={"cpu_phase_threads": [1, 1]},
+            parallel_config=SimpleNamespace(pipeline_parallel_size=4),
+        )
+    )
+    resources.close()
+    assert launched == ([] if external else [connections or "16"] * 2)
+    assert os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == connections
+    assert os.environ.get("CUDA_MPS_PIPE_DIRECTORY") == (
+        "/external/mps" if external else None
+    )
+
+
 def test_registered_lru_dma_does_not_cross_registration_boundaries(monkeypatch):
     """GPU expert copies must fit one registered span, including remote GPUs."""
     from vllm.models.deepseek_v4_1 import host_memory

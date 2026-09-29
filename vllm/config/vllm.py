@@ -2743,6 +2743,29 @@ class VllmConfig:
                 "enforce_eager/cudagraph_mode=none"
             )
 
+        from vllm.v1.spec_decode.dynamic.adaptive import (
+            uses_scheduler_adaptive_verification,
+        )
+
+        if uses_scheduler_adaptive_verification(self):
+            if (
+                not self.use_v2_model_runner
+                or not self.scheduler_config.async_scheduling
+            ):
+                raise ValueError("Hybrid adaptive verification requires async MRv2")
+            if spec_config.num_speculative_tokens_per_batch_size is not None:
+                raise ValueError(
+                    "Use either hybrid adaptive verification or a fixed batch-size "
+                    "schedule, not both"
+                )
+            return
+
+        if spec_config.dspark_num_query_tokens is not None:
+            raise ValueError(
+                "dspark_num_query_tokens with adaptive verification requires "
+                "DeepSeek V4.1 CPU hybrid"
+            )
+
         if self.parallel_config.pipeline_parallel_size > 1:
             # Cost curves and confidences currently only exist on the last PP rank;
             # earlier ranks would diverge on the trimmed batch shape.

@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+from vllm.v1.spec_decode.dynamic.adaptive import uses_scheduler_adaptive_verification
 
 logger = init_logger(__name__)
 
@@ -1092,7 +1093,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
         """Prepare native or per-token flattened decode tensors."""
         spec_config = self.vllm_config.speculative_config
-        adaptive = bool(spec_config and spec_config.enable_adaptive_verification)
+        # Scheduler budgets already have exact CPU query lengths. Only device-side
+        # trimming can make a CPU-uniform batch non-uniform on the GPU.
+        adaptive = bool(
+            spec_config
+            and spec_config.enable_adaptive_verification
+            and not uses_scheduler_adaptive_verification(self.vllm_config)
+        )
         min_decode_len = int(decode_lens_cpu.min().item())
         if not use_native:
             assert self.decode_seq_lens_buffer.dim() == 1

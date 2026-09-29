@@ -1999,6 +1999,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
             scheduler_step_id=scheduler_output.scheduler_step_id,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
             cudagraph_stats=cudagraph_stats,
         )
 
@@ -2030,6 +2031,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
         scheduler_step_id = self.execute_model_state.scheduler_step_id
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         self.execute_model_state = None
 
@@ -2091,6 +2095,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             cudagraph_stats=cudagraph_stats,
         )
+        confidence_table = None
+        if getattr(self.speculator, "record_scheduler_confidence", False):
+            confidence_table = getattr(
+                self.speculator, "scheduler_confidence_table", None
+            )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
@@ -2100,6 +2109,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
+            draft_confidences=(
+                confidence_table[input_batch.idx_mapping]
+                if confidence_table is not None
+                else None
+            ),
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -2138,6 +2152,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            if getattr(self.speculator, "dynamic_draft", False):
+                # Warmup has no scheduler decision; profile the maximum shape.
+                self.speculator.set_draft_budget(
+                    num_spec_tokens_to_schedule or self.num_speculative_steps
+                )
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
@@ -2168,6 +2187,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
+                )
+            if confidence_table is not None:
+                confidence_table[input_batch.idx_mapping] = (
+                    self.speculator.draft_token_confidence_probs[: input_batch.num_reqs]
                 )
 
         async_scheduling = self.scheduler_config.async_scheduling
@@ -2330,6 +2353,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
     cudagraph_stats: CUDAGraphStat | None
+    num_spec_tokens_to_schedule: int = 0
 
 
 class BatchReqState(NamedTuple):

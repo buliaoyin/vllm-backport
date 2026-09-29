@@ -4,8 +4,13 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.spec_decode.dynamic.adaptive import (
+    AdaptiveDraftBudget,
+    ConfidenceDraftBudget,
+)
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
@@ -14,6 +19,209 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
 )
 from vllm.v1.worker.gpu.structured_outputs import _build_grammar_mapping
+
+
+@pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, ConfidenceDraftBudget])
+def test_scheduler_budget_follows_acceptance_when_task_changes(budget_cls):
+    """An inexpensive extra verification is useful only while drafts are accepted."""
+    budget = budget_cls(7)
+    budget.choose(["request"], 32000, False)
+    for phase, accepted in enumerate((7, 0, 7)):
+        for step in range(60):
+            k = budget.lengths[step % len(budget.lengths)]
+            stamp = phase * 100 + step
+            budget.scheduled(stamp, 0.0, 32000, False, {"request": k})
+            budget.complete(
+                stamp,
+                0.017 + 0.003 * k,
+                {"request": 1 + min(accepted, k)},
+            )
+        assert budget.choose(["request"], 32000, False) == (7 if accepted else 1)
+
+
+@pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, ConfidenceDraftBudget])
+def test_scheduler_budget_does_not_treat_unverified_suffix_as_rejected(budget_cls):
+    budget = budget_cls(7)
+    budget.choose(["request"], 32000, False)
+    budget.scheduled(1, 0.0, 32000, False, {"request": 7})
+    budget.complete(1, 0.03, {"request": 8})
+    suffix = budget.requests["request"].conditional[1:]
+    budget.scheduled(2, 0.1, 32000, False, {"request": 1})
+    budget.complete(2, 0.12, {"request": 1})
+    assert budget.requests["request"].conditional[1:] == suffix
+
+
+@pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, ConfidenceDraftBudget])
+def test_scheduler_budget_recovers_after_short_prefix_acceptance_improves(budget_cls):
+    budget = budget_cls(7)
+    budget.choose(["request"], 32000, False)
+    for step in range(60):
+        k = budget.lengths[step % len(budget.lengths)]
+        budget.scheduled(step, 0.0, 32000, False, {"request": k})
+        budget.complete(step, 0.017 + 0.003 * k, {"request": 1})
+    assert budget.choose(["request"], 32000, False) == 1
+
+    # Rejections at the first position must not poison unobserved later ones.
+    for step in range(60, 100):
+        budget.scheduled(step, 0.0, 32000, False, {"request": 3})
+        budget.complete(step, 0.026, {"request": 4})
+    assert budget.choose(["request"], 32000, False) > 3
+
+
+@pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, ConfidenceDraftBudget])
+def test_scheduler_budget_ignores_stale_output_and_reclaims_request_state(budget_cls):
+    budget = budget_cls(7)
+    budget.choose(["aborted", "active"], 32000, False)
+    budget.scheduled(1, 0.0, 32000, False, {"aborted": 7})
+    budget.complete(1, 0.04, {})
+    assert not budget.counts
+    assert not budget.pending
+    budget.retain_requests({"active"})
+    assert set(budget.requests) == {"active"}
+    assert not budget.costs[budget.key(2, 32000, False)].samples
+
+
+@pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, ConfidenceDraftBudget])
+@pytest.mark.parametrize("best_budget", [2, 4, 5, 6])
+def test_scheduler_budget_selects_middle_budget_when_longer_is_expensive(
+    budget_cls, best_budget
+):
+    """An efficient middle budget must not be rounded to an old preset."""
+    budget = budget_cls(7)
+    budget.choose(["request"], 32000, False)
+    for step in range(120):
+        k = budget.lengths[step % len(budget.lengths)]
+        budget.scheduled(step, 0.0, 32000, False, {"request": k})
+        budget.complete(
+            step,
+            0.017 + 0.003 * k if k <= best_budget else 0.060,
+            {"request": min(k, best_budget) + 1},
+        )
+    assert budget.choose(["request"], 32000, False) == best_budget
+
+
+@pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, ConfidenceDraftBudget])
+def test_scheduler_confidence_rejects_stale_and_invalid_feedback(budget_cls):
+    budget = budget_cls(3)
+    budget.observe_confidences("request", 8, [0.8, 0.7, 0.6])
+    budget.observe_confidences("request", 7, [0.1, 0.1, 0.1])
+    budget.observe_confidences("request", 9, [float("nan"), 0.9, 0.9])
+    budget.observe_confidences("request", 10, [0.9])
+    assert budget.confidences["request"] == (8, [0.8, 0.7, 0.6])
+    budget.retain_requests(set())
+    assert not budget.confidences
+
+
+def test_calibrated_budget_follows_high_low_high_acceptance():
+    budget = ConfidenceDraftBudget(5)
+    now = 0.0
+    for phase, accepted in enumerate((5, 0, 5)):
+        selected = []
+        for iteration in range(100):
+            k = budget.choose(["request"], 32000, False)
+            step = phase * 100 + iteration
+            budget.scheduled(step, now, 32000, False, {"request": k})
+            now += 0.02 + 0.004 * k
+            budget.complete(step, now, {"request": min(k, accepted) + 1})
+            budget.observe_confidences(
+                "request", step, [0.99 if accepted else 0.05] * 5
+            )
+            if iteration >= 80:
+                selected.append(k)
+        assert set(selected) == {5 if accepted else 1}
+
+
+def test_first_confidence_feedback_can_raise_the_initial_budget():
+    budget = ConfidenceDraftBudget(7)
+    assert budget.choose(["request"], 32000, False) == 3
+    budget.scheduled(1, 0.0, 32000, False, {"request": 3})
+    budget.complete(1, 0.03, {"request": 4})
+    budget.observe_confidences("request", 1, [0.99] * 4 + [float("nan")] * 3)
+    assert budget.choose(["request"], 32000, False) > 3
+
+
+def test_single_request_confidence_budget_is_stable_under_timing_noise():
+    """Routing latency must not change choices for the same acceptance feedback."""
+    choices = []
+    for noisy in (False, True):
+        budget = ConfidenceDraftBudget(7)
+        now, selected = 0.0, []
+        for step in range(80):
+            k = budget.choose(["request"], 32000, False)
+            selected.append(k)
+            accepted = 7 if step < 30 or step >= 60 else 0
+            budget.scheduled(step, now, 32000, False, {"request": k})
+            now += (0.02 + 0.002 * k) * (8 if noisy and step % 3 == 0 else 1)
+            budget.complete(step, now, {"request": 1 + min(k, accepted)})
+            budget.observe_confidences(
+                "request", step, [0.99 if accepted else 0.05] * 7
+            )
+        choices.append(selected)
+    assert choices[0] == choices[1]
+    assert min(choices[0]) == 1
+    assert max(choices[0]) == 7
+
+
+def test_calibration_only_uses_observed_prefix_from_matching_step():
+    budget = ConfidenceDraftBudget(5)
+    budget.choose(["request"], 32000, False)
+    budget.scheduled(1, 0.0, 32000, False, {"request": 1})
+    budget.complete(1, 0.02, {"request": 1})
+    budget.observe_confidences("request", 1, [0.8] * 5)
+    calibrated = list(budget.confidence_bias["request"])
+    assert calibrated[0] < 0
+    assert calibrated[1:] == [0.0] * 4
+    budget.observe_confidences("request", 2, [0.9] * 5)
+    assert budget.confidence_bias["request"] == calibrated
+    budget.retain_requests(set())
+    assert not budget.confidence_bias
+    assert not budget.smoothed_confidences
+    assert not budget.last_observations
+
+
+@pytest.mark.parametrize("num_reqs,mixed", [(2, False), (1, True)])
+def test_batched_or_mixed_budget_uses_measured_nonlinear_costs(num_reqs, mixed):
+    budget = ConfidenceDraftBudget(5)
+    req_ids = [str(index) for index in range(num_reqs)]
+    now, selected = 0.0, []
+    for step in range(120):
+        k = budget.choose(req_ids, 32000, mixed)
+        budget.scheduled(step, now, 32000, mixed, dict.fromkeys(req_ids, k))
+        now += 0.0195 + 0.0005 * k if k <= 3 else 0.100
+        budget.complete(step, now, dict.fromkeys(req_ids, k + 1))
+        for req_id in req_ids:
+            budget.observe_confidences(req_id, step, [0.99] * 5)
+        selected.append(k)
+    # High acceptance must not override the expensive five-token batch shape.
+    assert selected[-64:].count(3) >= 54
+
+
+@pytest.mark.parametrize("num_reqs,mixed", [(4, False), (1, True)])
+def test_low_acceptance_batch_does_not_explore_every_long_budget(num_reqs, mixed):
+    budget = ConfidenceDraftBudget(7)
+    req_ids = [str(index) for index in range(num_reqs)]
+    now, selected = 0.0, []
+    for step in range(12):
+        k = budget.choose(req_ids, 32000, mixed)
+        budget.scheduled(step, now, 32000, mixed, dict.fromkeys(req_ids, k))
+        now += 0.01 + 0.005 * k
+        budget.complete(step, now, dict.fromkeys(req_ids, 1))
+        selected.append(k)
+    assert set(selected) == {1, 3}
+    assert selected[-3:] == [1, 1, 1]
+
+
+@pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, ConfidenceDraftBudget])
+def test_short_proposal_confidence_keeps_unobserved_suffix(budget_cls):
+    budget = budget_cls(7)
+    budget.choose(["request"], 32000, False)
+    budget.observe_confidences("request", 1, [0.9] * 7)
+    budget.observe_confidences("request", 2, [0.6, 0.5] + [float("nan")] * 5)
+    assert budget.confidences["request"] == (2, [0.6, 0.5])
+    if isinstance(budget, ConfidenceDraftBudget):
+        assert budget.smoothed_confidences["request"][2:] == [0.9] * 5
+    budget.observe_confidences("request", 3, [float("nan")] * 7)
+    assert budget.confidences["request"][0] == 2
 
 
 def make_manager(

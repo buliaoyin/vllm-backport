@@ -116,6 +116,70 @@ def test_model_without_the_hooks_is_rejected():
         spec._validate_local_argmax_reduction()
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("feedback", [False, True])
+@pytest.mark.parametrize("drafts_count", range(1, 8))
+def test_fused_confidence_uses_previous_token_from_the_same_request(
+    feedback, drafts_count
+):
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    spec = DSparkSpeculator.__new__(DSparkSpeculator)
+    spec._draft_topk = None
+    spec.num_speculative_steps = 7
+    spec._active_draft_tokens = drafts_count
+    spec.use_local_argmax_reduction = True
+    spec.record_scheduler_confidence = feedback
+    num_sample = 2 * drafts_count
+    query = max(5, drafts_count)
+    spec.num_query_per_req = query
+    spec.sample_indices = (
+        torch.arange(2 * query).view(2, query)[:, :drafts_count].flatten()
+    )
+    spec.sample_idx_mapping = torch.zeros(num_sample, dtype=torch.int32)
+    spec.sample_pos = torch.zeros(num_sample, dtype=torch.int32)
+    spec._anchor_idx = torch.tensor([0, query])
+    spec.input_buffers = SimpleNamespace(
+        input_ids=torch.zeros(2 * query, dtype=torch.int64)
+    )
+    spec.input_buffers.input_ids[spec._anchor_idx] = torch.tensor([10, 20])
+    drafts = torch.arange(1, num_sample + 1).view(2, drafts_count)
+    spec.draft_tokens = torch.full((2, 7), 99, dtype=torch.int64)
+    spec.draft_token_confidence_probs = torch.full((2, 7), float("nan"))
+    spec._fused_markov = SimpleNamespace(
+        sample=lambda n, logits, previous, out: out[:, :drafts_count].copy_(drafts)
+    )
+    spec.model = SimpleNamespace(
+        compute_draft_logits_shard=lambda hidden: torch.zeros(num_sample, 8),
+        markov_embed=lambda ids: ids[..., None].float(),
+        compute_confidence=lambda hidden, embedded: (
+            embedded[:, 0] / 100 + hidden[:, 0] / 1000
+        ),
+    )
+    spec._run_model = lambda *_: torch.arange(2 * query).float()[:, None]
+    spec._generate_draft(2, 2 * query, None, None, None)
+    torch.testing.assert_close(spec.draft_tokens[:, :drafts_count], drafts)
+    assert (spec.draft_tokens[:, drafts_count:] == -1).all()
+    if feedback:
+        torch.testing.assert_close(
+            spec.draft_token_confidence_probs[:, :drafts_count],
+            torch.cat((torch.tensor([[10], [20]]), drafts[:, :-1]), dim=1) / 100
+            + (torch.arange(drafts_count)[None, :] + torch.tensor([[0], [query]]))
+            / 1000,
+        )
+        observed = drafts_count
+        if drafts_count < min(query, spec.num_speculative_steps):
+            torch.testing.assert_close(
+                spec.draft_token_confidence_probs[:, drafts_count],
+                drafts[:, -1] / 100
+                + torch.tensor([drafts_count, query + drafts_count]) / 1000,
+            )
+            observed += 1
+        assert torch.isnan(spec.draft_token_confidence_probs[:, observed:]).all()
+    else:
+        assert torch.isnan(spec.draft_token_confidence_probs).all()
+
+
 def _markov_head_for_fusion(monkeypatch, tp=4, soft_cap=None, scale=1.0):
     """A sharded Markov head plus the LogitsProcessor the speculator pairs it
     with, built without an engine."""
@@ -139,6 +203,48 @@ def _markov_head_for_fusion(monkeypatch, tp=4, soft_cap=None, scale=1.0):
     )
     lp = LogitsProcessor(vocab, scale=scale, soft_cap=soft_cap)
     return head, lp, vocab, rank_dim, tp
+
+
+@pytest.mark.cpu_test
+def test_dynamic_draft_capture_and_switch_keep_query_and_sampling_shapes(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    spec = DSparkSpeculator.__new__(DSparkSpeculator)
+    spec.dynamic_draft = True
+    spec.num_speculative_steps = 7
+    spec._max_query_tokens = 7
+    spec.max_num_reqs = 2
+    spec.device = torch.device("cpu")
+    spec._draft_anchors = {}
+    spec._draft_managers = {}
+
+    def init_manager(self, mode):
+        self.query_cudagraph_manager = SimpleNamespace(query=self.num_query_per_req)
+
+    captures = {}
+
+    def capture(self):
+        captures[self.num_draft_tokens] = (
+            self.num_query_per_req,
+            self._anchor_idx.tolist(),
+            self.query_cudagraph_manager,
+        )
+
+    monkeypatch.setattr(DFlashSpeculator, "init_cudagraph_manager", init_manager)
+    monkeypatch.setattr(DFlashSpeculator, "capture", capture)
+    spec.init_cudagraph_manager(None)
+    spec.capture()
+    assert set(captures) == set(range(1, 8))
+    for drafts in (2, 7, 4, 6, 1, 5, 3):
+        spec.set_draft_budget(drafts)
+        query, anchors, manager = captures[drafts]
+        assert spec.num_draft_tokens == drafts
+        assert spec.num_query_per_req == query == max(5, drafts)
+        assert spec._anchor_idx.tolist() == anchors == [0, query]
+        assert spec.query_cudagraph_manager is manager
+    with pytest.raises(ValueError, match="maximum"):
+        spec.set_draft_budget(8)
 
 
 @pytest.mark.cpu_test

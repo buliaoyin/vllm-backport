@@ -28,6 +28,7 @@ def _make_async_output_stub() -> AsyncOutput:
     output._draft_req_ids = []
     output._draft_req_indices = []
     output._draft_producer_step_id = None
+    output._draft_confidence_cpu = None
     output.sampled_token_ids = np.array([[1], [2]])
     output.num_sampled_tokens_np = np.array([1, 1])
     output.sampling_mask_tensors = None
@@ -116,3 +117,37 @@ def test_sync_output_preserves_drafts_for_plain_requests(monkeypatch):
     assert drafts.req_ids == ["plain", "structured"]
     assert drafts.draft_token_ids == [[3, 4], [5, 6]]
     assert drafts.producer_step_id is None
+
+
+def test_draft_confidence_snapshot_survives_next_batch_reusing_buffer(monkeypatch):
+    """Feedback travels with sampled output without waiting for the next draft."""
+    event = Mock()
+    events = Mock(return_value=event)
+    monkeypatch.setattr(async_utils.torch.cuda, "Event", events)
+    monkeypatch.setattr(async_utils, "stream", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        async_utils, "async_copy_to_np", lambda tensor: tensor.array.copy()
+    )
+    values = np.array([[0.9, 0.8], [0.4, 0.2]])
+    confidence = SimpleNamespace(array=values, record_stream=Mock())
+    output = AsyncOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["plain", "structured"],
+            req_id_to_index={"plain": 0, "structured": 1},
+        ),
+        sampler_output=SimpleNamespace(
+            sampled_token_ids=SimpleNamespace(array=np.array([[1], [2]])),
+            logprobs_tensors=None,
+            num_nans=None,
+            sampling_mask_tensors=None,
+        ),
+        num_sampled_tokens=SimpleNamespace(array=np.array([1, 1])),
+        main_stream=Mock(),
+        copy_stream=Mock(),
+        draft_confidences=confidence,
+    )
+    values.fill(0.0)
+    result = output.get_output()
+    assert result.draft_token_confidences == [[0.9, 0.8], [0.4, 0.2]]
+    events.assert_called_once_with(blocking=True)
+    event.synchronize.assert_called_once_with()

@@ -151,6 +151,70 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
             assert desc.num_active_loras == 0
 
 
+@pytest.mark.parametrize("sparse,hybrid", [(False, True), (True, True), (True, False)])
+def test_adaptive_budgets_keep_full_graphs_with_sparse_capture_sizes(
+    monkeypatch, sparse, hybrid
+):
+    """A smaller graph for another K must not hide this K's compatible graph."""
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
+    )
+    config = _create_vllm_config_for_dsd(16, 7, use_dynamic_sd=not hybrid)
+    if hybrid:
+        config.additional_config = {"deepseek_v41_hybrid": {}}
+        config.speculative_config.enable_adaptive_verification = True
+    if sparse:
+        config.compilation_config.cudagraph_capture_sizes = [
+            1,
+            2,
+            4,
+            8,
+            *range(16, 129, 8),
+        ]
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=8,
+    )
+    manager._graphs_captured = True
+    for requests in range(1, 17):
+        for length in range(2, 9):
+            desc = manager.dispatch(
+                num_reqs=requests,
+                num_tokens=requests * length,
+                uniform_token_count=length,
+                num_active_loras=0,
+            )
+            assert desc.cg_mode == CUDAGraphMode.FULL
+            assert desc.uniform_token_count == length
+            if not sparse or hybrid:
+                assert desc.num_tokens == requests * length
+
+    # Each parallel draft manager captures its own fixed query shape.
+    draft_manager = gpu_cudagraph_utils.CudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=7,
+        fixed_decode_query_len=True,
+    )
+    draft_manager._graphs_captured = True
+    for length in (1, 3, 5, 7):
+        desc = draft_manager.dispatch(
+            num_reqs=1,
+            num_tokens=length,
+            uniform_token_count=length,
+            num_active_loras=0,
+        )
+        assert (desc.cg_mode == CUDAGraphMode.FULL) == (length == 7)
+
+
 def test_dynamic_sd_cudagraphs_use_clamped_query_length(monkeypatch):
     """Clamp configured K=5 to K=3, yielding query length 4 rather than 6."""
     monkeypatch.setattr(

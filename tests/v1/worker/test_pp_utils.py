@@ -18,6 +18,56 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+@requires_cuda
+def test_send_staging_preserves_reused_sources_and_inflight_slots():
+    """Delayed consumers must see each generation after both buffers wrap."""
+    staging = pp_utils.PPSendStaging(
+        {"hidden_states": ((257, 128), torch.float32)}, torch.device("cuda:0")
+    )
+    source = torch.empty((257, 128), device="cuda:0")
+    consumer = torch.cuda.Stream()
+    received, expected, pointers = [], [], set()
+    allocation = staging.nbytes
+
+    def send(tensors):
+        tensor = tensors["hidden_states"]
+        pointers.add(tensor.data_ptr())
+        consumer.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(consumer):
+            torch.cuda._sleep(200000)
+            received.append(tensor.clone())
+            done = torch.cuda.Event()
+            done.record()
+        return [Mock(), pp_utils._CopyComplete(done)]
+
+    for generation in range(12):
+        rows = (1, 17, 257)[generation % 3]
+        view = source[:rows].fill_(generation)
+        handles = staging.isend({"hidden_states": view}, send)
+        for handle in handles[1:]:
+            handle.wait()
+        source.fill_(-1)
+        expected.append(generation)
+    torch.accelerator.synchronize()
+    for tensor, value in zip(received, expected):
+        torch.testing.assert_close(tensor, torch.full_like(tensor, value))
+    assert len(pointers) == 2
+    assert staging.nbytes == allocation == 2 * source.numel() * source.element_size()
+
+
+@requires_cuda
+def test_send_staging_falls_back_without_growing_for_unsupported_layout():
+    staging = pp_utils.PPSendStaging(
+        {"hidden_states": ((2, 8), torch.float32)}, torch.device("cuda:0")
+    )
+    tensors = {"hidden_states": torch.zeros((3, 8), device="cuda:0")}
+    handles = [Mock(), Mock()]
+    send = Mock(return_value=handles)
+    assert staging.isend(tensors, send) is handles
+    assert send.call_args.args[0] is tensors
+    assert staging.nbytes == 2 * 2 * 8 * 4
+
+
 def _batch(num_computed, prefill_len, num_scheduled):
     return Mock(
         num_reqs=len(num_computed),
@@ -255,3 +305,38 @@ def test_relayed_draft_tokens_are_scattered_on_consume(monkeypatch):
     assert (draft_tokens[:2] == 7).all()
     assert (draft_tokens[2:] == 0).all()
     assert (outputs["sampled_tokens"] == 7).all()
+
+
+@requires_cuda
+@pytest.mark.parametrize("num_spec", [3, 7])
+def test_mixed_draft_relay_skips_prefill_and_reused_slots_without_host_sync(
+    monkeypatch, num_spec
+):
+    receiver = make_handler(
+        monkeypatch, is_last_rank=False, num_speculative_steps=num_spec
+    )
+    record_broadcasts(monkeypatch, fill_value=7)
+    batch = make_input_batch(num_reqs=3)
+    batch.idx_mapping_np = np.array([4, 2, 6], dtype=np.intp)
+    batch.idx_mapping = torch.as_tensor(batch.idx_mapping_np, device="cuda")
+    batch.prefill_len_np[1] = 4096
+    assert not receiver.receive(batch)
+    receiver.on_req_idx_freed(6)
+
+    drafts = torch.full((8, num_spec), -9, dtype=torch.int64, device="cuda")
+    # Compile the scatter before checking that consuming a mixed step is async.
+    pp_utils.scatter_draft_tokens(drafts, drafts[:3], batch.idx_mapping)
+    torch.accelerator.synchronize()
+    assert receiver.get_prev_sampled_outputs(drafts) is None
+    previous = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        outputs = receiver.get_prev_sampled_outputs(drafts)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+
+    expected = torch.full_like(drafts, -9)
+    expected[4] = 7
+    torch.testing.assert_close(drafts, expected)
+    assert outputs is not None
+    assert outputs["idx_mapping"].tolist() == [4, -1, -1]

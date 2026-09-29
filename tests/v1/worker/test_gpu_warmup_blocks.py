@@ -103,7 +103,9 @@ def _make_runner(
             kv_cache_groups=kv_cache_groups, num_blocks=1024
         ),
         vllm_config=SimpleNamespace(
-            num_lookahead_tokens=num_lookahead_tokens, is_mm_encoder_only=False
+            num_lookahead_tokens=num_lookahead_tokens,
+            is_mm_encoder_only=False,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
         ),
         kv_block_zeroer=None,
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
@@ -117,8 +119,11 @@ class _StepRecorder:
         # (blocks held per group, num_computed_tokens, num_scheduled_tokens)
         self.steps: list[tuple[list[int], int, int]] = []
         self._held: dict[str, list[int]] = {}
+        self.draft_budgets: list[int] = []
 
     def execute_model(self, scheduler_output) -> None:
+        if scheduler_output.total_num_scheduled_tokens:
+            self.draft_budgets.append(scheduler_output.num_spec_tokens_to_schedule)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._held[new_req.req_id] = [len(ids) for ids in new_req.block_ids]
             self._record(new_req.req_id, new_req.num_computed_tokens, scheduler_output)
@@ -173,6 +178,7 @@ def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahea
     )
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
+    assert set(recorder.draft_budgets) == {num_spec_steps}
 
 
 def test_mixed_warmup_reserves_lookahead_blocks():
@@ -187,6 +193,33 @@ def test_mixed_warmup_reserves_lookahead_blocks():
     )
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
+    assert set(recorder.draft_budgets) == {NUM_SPEC_STEPS}
+
+
+def test_pp_warmup_drains_sampling_before_loading_the_next_shape(monkeypatch):
+    from vllm.v1.worker.gpu import warmup
+
+    runner = _make_runner([_attention_group()], NUM_SPEC_STEPS)
+    runner.vllm_config.parallel_config.pipeline_parallel_size = 4
+    pending = False
+
+    def execute(output):
+        assert not pending, "Kernel loading must not overlap pending PP broadcasts"
+
+    def sample(grammar):
+        nonlocal pending
+        pending = True
+
+    def synchronize():
+        nonlocal pending
+        pending = False
+
+    monkeypatch.setattr(warmup.torch.accelerator, "synchronize", synchronize)
+    monkeypatch.setattr(
+        warmup, "get_pp_group", lambda: SimpleNamespace(barrier=lambda: None)
+    )
+    warmup_kernels(runner, execute, sample)
+    assert not pending
 
 
 @pytest.mark.parametrize("mamba_cache_mode", ["none", "all", "align"])

@@ -446,8 +446,9 @@ class SpeculativeConfig:
     """Optional DSpark backbone query length, including the predicting anchor.
     It can exceed num_speculative_tokens to preserve a trained query block while
     proposing only its prefix. Requires greedy DSpark with
-    sample_from_anchor=True and fixed-length verification. DeepSeek V4.1
-    supports query lengths beyond its checkpoint block size."""
+    sample_from_anchor=True. Adaptive verification with this override requires
+    DeepSeek V4.1 CPU hybrid. DeepSeek V4.1 supports query lengths beyond its
+    checkpoint block size."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -544,7 +545,10 @@ class SpeculativeConfig:
 
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget from per-request
-    confidence. Currently only supported for method="dspark"."""
+    confidence. DeepSeek V4.1 CPU hybrid uses observed acceptance and step costs
+    on the scheduler to size each proposal, keeping exact query boundaries
+    across PP ranks and verifying existing drafts at their producer's length.
+    Currently only supported for method="dspark"."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -1799,15 +1803,8 @@ class SpeculativeConfig:
             )
 
         if self.dspark_num_query_tokens is not None:
-            if (
-                not self.use_dspark()
-                or self.draft_sample_method != "greedy"
-                or self.enable_adaptive_verification
-            ):
-                raise ValueError(
-                    "dspark_num_query_tokens requires greedy DSpark with fixed "
-                    "verification length"
-                )
+            if not self.use_dspark() or self.draft_sample_method != "greedy":
+                raise ValueError("dspark_num_query_tokens requires greedy DSpark")
             if self.dspark_num_query_tokens < self.num_speculative_tokens:
                 raise ValueError(
                     "dspark_num_query_tokens must cover every proposed token"

@@ -385,6 +385,75 @@ def test_cpu_phase_threads_switch_only_after_pending_callbacks_finish(monkeypatc
     assert events == ["sync", 8, 8, "sync", 16, 16]
 
 
+@pytest.mark.parametrize(
+    "replay,threads,feedback,decoder_requests",
+    [
+        ([(False, 4), (True, 0)], 8, True, 1),
+        ([(False, 4), (True, 128)], 16, False, 2),
+        ([(False, 4)], 8, True, 1),
+        ([(True, 0)], 8, False, 0),
+        ([(True, 128)], 16, False, 1),
+    ],
+)
+def test_ced_intermediate_chunks_preserve_concurrent_decode_expert_path(
+    monkeypatch, replay, threads, feedback, decoder_requests
+):
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+    monkeypatch.setattr(DefaultModelState, "prepare_inputs", lambda *args: {})
+    syncs: list[bool] = []
+    enabled: list[bool] = []
+    checks: list[bool] = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(synchronize=lambda: syncs.append(True)),
+    )
+    config = SimpleNamespace(num_threads=8)
+    module = SimpleNamespace(
+        backend=SimpleNamespace(
+            config=config,
+            set_num_threads=lambda n: setattr(config, "num_threads", n),
+            check_cuda_errors=lambda: checks.append(True),
+        ),
+        gpu_cache=SimpleNamespace(
+            decode_feedback=SimpleNamespace(set_enabled=enabled.append)
+        ),
+    )
+    state = object.__new__(DeepseekV41ModelState)
+    state.cpu_phase_threads = [16, 8]
+    state.cpu_async_modules = [module]
+    state.requires_eager_prefill = True
+    state.lookback_token_ids = None
+    state.hybrid_requests = {"request": 256}
+    state.hybrid_active = "request"
+    state.ced_step = SimpleNamespace(
+        requests=[
+            SimpleNamespace(is_prefilling=prefill, replay_count=count)
+            for prefill, count in replay
+        ]
+    )
+    batch = SimpleNamespace(
+        has_prefill=any(prefill for prefill, _ in replay),
+        num_reqs=len(replay),
+        req_ids=["request"],
+    )
+    state.prepare_inputs(batch, None)
+    assert config.num_threads == threads
+    assert len(syncs) == (threads != 8)
+    assert module.hybrid_has_prefill == (threads == 16)
+    assert enabled == [feedback]
+    assert state.hybrid_decoding == feedback
+    assert state.hybrid_decode_requests == decoder_requests
+
+    monkeypatch.setattr(DefaultModelState, "postprocess_state", lambda *args: None)
+    state.hybrid_active = None
+    syncs.clear()
+    state.postprocess_state(None, None)
+    assert len(syncs) == len(checks) == bool(decoder_requests)
+
+
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_ced_publishes_encoder_kv_with_a_compatible_prefill_subclass(
     monkeypatch, hybrid

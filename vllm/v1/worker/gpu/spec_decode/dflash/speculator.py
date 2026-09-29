@@ -105,6 +105,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_kv_cache_group_id: int = -1
 
     @property
+    def num_draft_tokens(self) -> int:
+        return self.num_speculative_steps
+
+    @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
         config = copy.copy(super().attn_vllm_config)
@@ -138,6 +142,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
+            fixed_decode_query_len=True,
         )
 
     def capture(self) -> None:
@@ -431,7 +436,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.block_tables.cp_interleave,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
-                self.num_speculative_steps,
+                self.num_draft_tokens,
                 self.max_num_reqs,
                 self.max_num_tokens,
                 self.max_model_len,

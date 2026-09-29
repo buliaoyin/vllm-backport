@@ -32,7 +32,12 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.v1.spec_decode.dynamic.adaptive import (
+    uses_scheduler_adaptive_verification,
+    verification_lengths,
+)
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.markov_argmax import (
     FusedMarkovSampler,
@@ -48,6 +53,7 @@ logger = init_logger(__name__)
 
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
+    record_scheduler_confidence = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
@@ -108,11 +114,77 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
+            and not uses_scheduler_adaptive_verification(vllm_config)
+        )
+        self.record_scheduler_confidence = (
+            self.speculative_config.enable_adaptive_verification
+            and uses_scheduler_adaptive_verification(vllm_config)
+        )
+        self.scheduler_confidence_table = (
+            torch.full(
+                (self.max_num_reqs, self.num_speculative_steps),
+                float("nan"),
+                dtype=torch.float32,
+                device=device,
+            )
+            if self.record_scheduler_confidence
+            else None
         )
 
         # Fused Markov chain (greedy vocab-sharded path only); built in
         # load_draft_model once the head's weights and shard geometry exist.
         self._fused_markov: FusedMarkovSampler | None = None
+        self.dynamic_draft = uses_scheduler_adaptive_verification(vllm_config)
+        self._active_draft_tokens = self.num_speculative_steps
+        self._max_query_tokens = self.num_query_per_req
+        self._draft_managers: dict[int, DFlashCudaGraphManager | None] = {}
+        self._draft_anchors = {self.num_query_per_req: self._anchor_idx}
+
+    @property
+    def num_draft_tokens(self) -> int:
+        return getattr(self, "_active_draft_tokens", self.num_speculative_steps)
+
+    def query_length_for_budget(self, drafts: int) -> int:
+        # Preserve the trained query block for short proposals, as fixed K=3 does.
+        return min(self._max_query_tokens, max(5, drafts))
+
+    def set_draft_budget(self, drafts: int) -> None:
+        if not self.dynamic_draft:
+            return
+        if not 1 <= drafts <= self.num_speculative_steps:
+            raise ValueError("DSpark draft budget exceeds the configured maximum")
+        self._active_draft_tokens = drafts
+        self.num_query_per_req = self.query_length_for_budget(drafts)
+        self._anchor_idx = self._draft_anchors[self.num_query_per_req]
+        self.query_cudagraph_manager = self._draft_managers[drafts]
+
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if not self.dynamic_draft:
+            super().init_cudagraph_manager(cudagraph_mode)
+            return
+        for drafts in verification_lengths(self.num_speculative_steps):
+            self.num_query_per_req = self.query_length_for_budget(drafts)
+            if self.num_query_per_req not in self._draft_anchors:
+                self._draft_anchors[self.num_query_per_req] = (
+                    torch.arange(
+                        self.max_num_reqs, dtype=torch.int64, device=self.device
+                    )
+                    * self.num_query_per_req
+                )
+            super().init_cudagraph_manager(cudagraph_mode)
+            self._draft_managers[drafts] = self.query_cudagraph_manager
+        self.set_draft_budget(self.num_speculative_steps)
+
+    def capture(self) -> None:
+        if not self.dynamic_draft:
+            super().capture()
+            return
+        try:
+            for drafts in reversed(verification_lengths(self.num_speculative_steps)):
+                self.set_draft_budget(drafts)
+                super().capture()
+        finally:
+            self.set_draft_budget(self.num_speculative_steps)
 
     def set_target_hidden_states_workspace(self, workspace: torch.Tensor) -> bool:
         if (
@@ -190,6 +262,8 @@ class DSparkSpeculator(DFlashSpeculator):
                 "enable_adaptive_verification=false in the speculative config to verify"
                 " a fixed number of drafts instead."
             )
+        if model.model.confidence_head is None:
+            self.record_scheduler_confidence = False
         # `draft_logits is None` is greedy drafting, which is the only mode the
         # fused step covers -- it reduces the logit row instead of emitting it.
         # `_validate_local_argmax_reduction` rejects the other combination
@@ -298,7 +372,7 @@ class DSparkSpeculator(DFlashSpeculator):
             return
 
         # Sequential Markov sampling over the backbone's output hidden states.
-        n_spec = self.num_speculative_steps
+        n_spec = self.num_draft_tokens
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
@@ -327,12 +401,23 @@ class DSparkSpeculator(DFlashSpeculator):
             # three [num_reqs, shard_width] round trips collapsed into one
             # pass over markov_w2. Writes draft_tokens directly.
             self._fused_markov.sample(num_reqs, base_logits, prev, self.draft_tokens)
+            if self.record_scheduler_confidence:
+                previous = torch.cat(
+                    (prev[:, None], self.draft_tokens[:num_reqs, : n_spec - 1]),
+                    dim=1,
+                )
+                confidence = self.model.compute_confidence(
+                    sample_hidden, self.model.markov_embed(previous).flatten(0, 1)
+                )
+                self.draft_token_confidence_probs[:num_reqs, :n_spec] = confidence.view(
+                    num_reqs, n_spec
+                )
             return
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
-            if self.enable_adaptive_verification:
+            if self.enable_adaptive_verification or self.record_scheduler_confidence:
                 confidence_markov_embeds.append(markov_embed)
             if self.use_local_argmax_reduction:
                 # Greedy-only (enforced in _validate_local_argmax_reduction):
@@ -352,12 +437,12 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.enable_adaptive_verification:
+        if self.enable_adaptive_verification or self.record_scheduler_confidence:
             confidence = self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
             )
-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+            self.draft_token_confidence_probs[:num_reqs, :n_spec] = confidence.view(
                 num_reqs, n_spec
             )
 
@@ -370,7 +455,7 @@ class DSparkSpeculator(DFlashSpeculator):
         paths then consume that truncated distribution unchanged.
         """
         assert self._draft_topk is not None
-        n_spec = self.num_speculative_steps
+        n_spec = self.num_draft_tokens
         num_sample = num_reqs * n_spec
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         base_logits = self.model.compute_draft_logits(sample_hidden)
@@ -387,7 +472,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         for i in range(n_spec):
             markov_embed = self.model.markov_embed(prev)
-            if self.enable_adaptive_verification:
+            if self.enable_adaptive_verification or self.record_scheduler_confidence:
                 confidence_markov_embeds.append(markov_embed)
             logits_i = self.model.apply_markov_bias_gathered(
                 markov_embed,
@@ -401,12 +486,12 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.enable_adaptive_verification:
+        if self.enable_adaptive_verification or self.record_scheduler_confidence:
             confidence = self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
             )
-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+            self.draft_token_confidence_probs[:num_reqs, :n_spec] = confidence.view(
                 num_reqs, n_spec
             )
 
@@ -424,6 +509,12 @@ class DSparkSpeculator(DFlashSpeculator):
         # NOTE: these scopes are host-side, so they only resolve when the step
         # runs eagerly. Under CUDA-graph replay the whole step is one launch and
         # the ranges do not reappear -- profile with cudagraphs off to use them.
+        if self.num_draft_tokens < self.num_speculative_steps:
+            self.draft_tokens[:num_reqs, self.num_draft_tokens :].fill_(-1)
+            if self.record_scheduler_confidence:
+                self.draft_token_confidence_probs[
+                    :num_reqs, self.num_draft_tokens :
+                ].fill_(float("nan"))
         with record_function("dspark::draft_backbone"):
             head_hidden = self._run_model(
                 num_tokens_padded,
@@ -434,3 +525,15 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         with record_function("dspark::markov_sampling"):
             self._sample_sequential(num_reqs, head_hidden)
+            drafts = self.num_draft_tokens
+            if self.record_scheduler_confidence and drafts < min(
+                self.num_query_per_req, self.num_speculative_steps
+            ):
+                # Price one more draft from an already computed query, without
+                # running its vocabulary head or extending the Markov chain.
+                next_hidden = head_hidden[self._anchor_idx[:num_reqs] + drafts]
+                confidence = self.model.compute_confidence(
+                    next_hidden,
+                    self.model.markov_embed(self.draft_tokens[:num_reqs, drafts - 1]),
+                )
+                self.draft_token_confidence_probs[:num_reqs, drafts] = confidence

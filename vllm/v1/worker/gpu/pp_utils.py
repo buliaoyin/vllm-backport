@@ -3,18 +3,86 @@
 """Pipeline Parallelism utils for V2 Model Runner."""
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
 import torch
 
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import Handle, get_pp_group
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+
+class _CopyComplete:
+    def __init__(self, event: torch.cuda.Event):
+        self.event = event
+
+    def is_completed(self) -> bool:
+        return self.event.query()
+
+    def wait(self) -> None:
+        torch.cuda.current_stream().wait_event(self.event)
+
+
+class PPSendStaging:
+    """Two preallocated send slots, protected by their actual device work."""
+
+    def __init__(
+        self,
+        specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
+        device: torch.device,
+    ):
+        self.buffers = [
+            {
+                name: torch.empty(shape, dtype=dtype, device=device)
+                for name, (shape, dtype) in specs.items()
+            }
+            for _ in range(2)
+        ]
+        self.copied = [torch.cuda.Event() for _ in self.buffers]
+        self.pending: list[list[Handle]] = [[] for _ in self.buffers]
+        self.next_slot = 0
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            t.numel() * t.element_size() for b in self.buffers for t in b.values()
+        )
+
+    def isend(
+        self,
+        tensors: dict[str, torch.Tensor],
+        submit: Callable[[dict[str, torch.Tensor]], list[Handle]],
+    ) -> list[Handle]:
+        buffers = self.buffers[self.next_slot]
+        if tensors.keys() != buffers.keys() or any(
+            t.device != buffers[name].device
+            or t.dtype != buffers[name].dtype
+            or t.ndim != buffers[name].ndim
+            or t.shape[1:] != buffers[name].shape[1:]
+            or t.shape[0] > buffers[name].shape[0]
+            for name, t in tensors.items()
+        ):
+            return submit(tensors)
+
+        index = self.next_slot
+        self.next_slot = (index + 1) % len(self.buffers)
+        # The slot cannot be overwritten until its real send has finished.
+        for work in self.pending[index]:
+            work.wait()
+        staged = {name: buffers[name][: t.shape[0]] for name, t in tensors.items()}
+        for name, tensor in tensors.items():
+            staged[name].copy_(tensor)
+        self.copied[index].record()
+        handles = submit(staged)
+        self.pending[index] = handles[1:]
+        # Source reuse needs only the copy fence; slot reuse waits on the send.
+        return handles[:1] + [_CopyComplete(self.copied[index])]
 
 
 @triton.jit
@@ -294,18 +362,9 @@ class PPHandler:
 
         self.main_stream.wait_event(slot.event)
         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
-            draft_tokens = slot.draft_tokens
-            draft_idx_mapping = slot.idx_mapping
-            if exclude_mask.any():
-                keep = ~exclude_mask
-                keep_t = torch.as_tensor(keep, device=self.device)
-                draft_tokens = draft_tokens[keep_t]
-                draft_idx_mapping = async_copy_to_gpu(
-                    slot.idx_mapping_np[keep], device=self.device
-                )
-            scatter_draft_tokens(
-                draft_tokens_to_update, draft_tokens, draft_idx_mapping
-            )
+            # The scatter skips -1 rows. GPU boolean indexing would read back
+            # its output size and stall mixed prefill/decode pipelines.
+            scatter_draft_tokens(draft_tokens_to_update, slot.draft_tokens, idx_mapping)
 
         return dict(
             sampled_tokens=slot.sampled_tokens,

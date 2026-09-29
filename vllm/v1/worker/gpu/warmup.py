@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
@@ -143,6 +144,9 @@ def run_mixed_prefill_decode_warmup(
     sampling_params = SamplingParams(max_tokens=2, temperature=0.0)
 
     decode_prefill_output = SchedulerOutput.make_empty()
+    decode_prefill_output.num_spec_tokens_to_schedule = (
+        model_runner.num_speculative_steps
+    )
     decode_prefill_output.scheduled_new_reqs = [
         NewRequestData(
             req_id=decode_req_id,
@@ -172,6 +176,7 @@ def run_mixed_prefill_decode_warmup(
     ]
 
     mixed_output = SchedulerOutput.make_empty()
+    mixed_output.num_spec_tokens_to_schedule = model_runner.num_speculative_steps
     mixed_output.scheduled_cached_reqs = cached_decode_req
     mixed_output.scheduled_new_reqs = [
         NewRequestData(
@@ -238,6 +243,13 @@ def _warmup_kernels(
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
+
+    def finish_step():
+        if model_runner.vllm_config.parallel_config.pipeline_parallel_size > 1:
+            # A new shape can load a CUDA module and synchronize the device.
+            # Drain the previous step's broadcasts before loading that module.
+            torch.accelerator.synchronize()
+            get_pp_group().barrier()
 
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
@@ -336,6 +348,7 @@ def _warmup_kernels(
     ]
 
     prefill_output = SchedulerOutput.make_empty()
+    prefill_output.num_spec_tokens_to_schedule = model_runner.num_speculative_steps
     prefill_output.scheduled_new_reqs = new_reqs
     prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
@@ -362,6 +375,7 @@ def _warmup_kernels(
             )
 
         worker_sample_tokens(grammar_output)
+        finish_step()
 
         # Per-request state carried across the decode steps.
         req_computed = [prompt_len] * num_reqs
@@ -395,6 +409,7 @@ def _warmup_kernels(
                     step_spec_tokens[req_ids[i]] = [0] * num_spec_steps
 
             decode_output = SchedulerOutput.make_empty()
+            decode_output.num_spec_tokens_to_schedule = num_spec_steps
             decode_output.scheduled_cached_reqs = cached_req_data
             decode_output.num_scheduled_tokens = step_num_scheduled_tokens
             decode_output.scheduled_spec_decode_tokens = step_spec_tokens
@@ -405,6 +420,7 @@ def _warmup_kernels(
 
             worker_execute_model(decode_output)
             worker_sample_tokens(None)
+            finish_step()
 
             for i, use_spec in zip(indices, spec_flags):
                 req_computed[i] += decode_query_len if use_spec else 1

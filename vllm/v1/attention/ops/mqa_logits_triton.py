@@ -141,7 +141,7 @@ def _decode_e4m3fn_bf16_lut(u, lut_ptr):
     configs=_PAGED_AUTOTUNE_CONFIGS,
     key=["num_heads", "head_dim", "block_size"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["stride_l_t"])
 def _fp8_paged_mqa_logits_kernel(
     q_ptr,
     kv_fp8_ptr,

@@ -92,6 +92,7 @@ class DeepseekV41ModelState(DefaultModelState):
             for module in self.cpu_expert_modules
             if getattr(module.backend.config, "cuda_library_path", None)
         ]
+        self.cpu_experts_active = True
         self._expert_cache_stats_enabled = False
         additional = vllm_config.additional_config
         self.cpu_phase_threads = (
@@ -115,7 +116,18 @@ class DeepseekV41ModelState(DefaultModelState):
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, torch.Tensor | None]:
-        self._set_cpu_phase_threads(input_batch.has_prefill)
+        decoder_prefill = input_batch.has_prefill
+        decoder_requests = input_batch.num_reqs
+        if self.ced_step is not None:
+            assert self.ced_step.requests is not None
+            replay = [r for r in self.ced_step.requests if r.replay_count]
+            decoder_prefill = any(r.is_prefilling for r in replay)
+            decoder_requests = len(replay)
+        self.cpu_experts_active = decoder_requests > 0
+        # Intermediate CED chunks run only the encoder. A simultaneous decode
+        # still needs the small-batch expert path and its route feedback.
+        if decoder_requests:
+            self._set_cpu_phase_threads(decoder_prefill)
         if (
             getattr(self, "hybrid_ready", False)
             and input_batch.num_reqs > self.hybrid_peak_batch
@@ -128,7 +140,7 @@ class DeepseekV41ModelState(DefaultModelState):
                 input_batch.has_prefill,
             )
         for module in self.cpu_async_modules:
-            module.hybrid_has_prefill = input_batch.has_prefill
+            module.hybrid_has_prefill = decoder_prefill
         if getattr(self, "hybrid_requests", None):
             request = input_batch.req_ids[0]
             if self.hybrid_active is None:
@@ -140,9 +152,11 @@ class DeepseekV41ModelState(DefaultModelState):
                 if module.gpu_cache is not None:
                     feedback = module.gpu_cache.decode_feedback
                     if feedback is not None:
-                        feedback.set_enabled(not input_batch.has_prefill)
-            self.hybrid_decoding = not input_batch.has_prefill
-            self.hybrid_decode_requests = input_batch.num_reqs
+                        feedback.set_enabled(
+                            not decoder_prefill and decoder_requests > 0
+                        )
+            self.hybrid_decoding = not decoder_prefill and decoder_requests > 0
+            self.hybrid_decode_requests = decoder_requests
         model_inputs = super().prepare_inputs(input_batch, req_states)
         if self.requires_eager_prefill:
             model_inputs["ced_step"] = self.ced_step
@@ -181,7 +195,7 @@ class DeepseekV41ModelState(DefaultModelState):
 
     def postprocess_state(self, idx_mapping, num_sampled, num_computed_tokens=None):
         super().postprocess_state(idx_mapping, num_sampled, num_computed_tokens)
-        if self.cpu_async_modules:
+        if self.cpu_async_modules and self.cpu_experts_active:
             torch.cuda.current_stream().synchronize()
             for module in self.cpu_async_modules:
                 module.backend.check_cuda_errors()

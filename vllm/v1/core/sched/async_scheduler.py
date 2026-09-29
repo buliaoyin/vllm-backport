@@ -15,6 +15,33 @@ class AsyncScheduler(Scheduler):
         # reusable read-only placeholder list for speculative decoding.
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size
+        extra = self.vllm_config.additional_config
+        self.align_hybrid_decodes = (
+            self.pp_size > 1
+            and self.use_v2_model_runner
+            and isinstance(extra, dict)
+            and extra.get("ced_prefill", False)
+            and "deepseek_v41_hybrid" in extra
+        )
+        self._decode_phase: int | None = None
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self.align_hybrid_decodes:
+            decodes = [r for r in self.running if not r.is_prefill_chunk]
+            if not decodes:
+                self._decode_phase = None
+            else:
+                if self._decode_phase is None:
+                    self._decode_phase = (
+                        min(r.next_decode_eligible_step for r in decodes) % self.pp_size
+                    )
+                # Join one decode batch after the PP output is available. Moving
+                # eligibility forward preserves the sampled-token ring's fence.
+                for request in decodes:
+                    request.next_decode_eligible_step += (
+                        self._decode_phase - request.next_decode_eligible_step
+                    ) % self.pp_size
+        return super().schedule(throttle_prefills)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)

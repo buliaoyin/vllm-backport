@@ -384,6 +384,8 @@ class ModelRunnerOutput:
     sampling_masks: SamplingMaskLists | None = None
     # V2 drafts travel with the output of their producer batch.
     draft_token_ids: DraftTokenIds | None = None
+    # Confidence of the verified draft block, in req_ids order.
+    draft_token_confidences: list[list[float]] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

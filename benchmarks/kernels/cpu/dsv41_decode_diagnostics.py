@@ -89,7 +89,8 @@ class DecodeBenchmarkWorker:
                 },
             }
         if action == "torch_profile_start":
-            if modules:
+            enabled = bool(modules) or settings.get("all_ranks", False)
+            if enabled:
                 self.dsv41_torch_profiler = torch.profiler.profile(
                     activities=[
                         torch.profiler.ProfilerActivity.CPU,
@@ -100,7 +101,7 @@ class DecodeBenchmarkWorker:
                     with_stack=False,
                 )
                 self.dsv41_torch_profiler.start()
-            return {"pid": os.getpid(), "enabled": bool(modules)}
+            return {"pid": os.getpid(), "enabled": enabled}
         if action == "torch_profile_finish":
             profiler = getattr(self, "dsv41_torch_profiler", None)
             if profiler is not None:
@@ -164,7 +165,17 @@ class DecodeBenchmarkWorker:
                 setattr(obj, method, timed)
 
             wrap(runner.cudagraph_manager, "run_fullgraph", "target_graph")
+            wrap(runner.model, "forward", "target_eager")
+            wrap(state, "_set_cpu_phase_threads", "cpu_phase")
             wrap(state, "postprocess_state", "postprocess")
+            for name, module in runner.model.named_modules():
+                ced = getattr(module, "ced_prefill", None)
+                if ced is not None:
+                    wrap(ced, "forward", "ced_replay")
+            for name, module in modules.items():
+                wrap(module, "forward", f"expert:{name}")
+                if module.gpu_cache is not None:
+                    wrap(module.gpu_cache, "adapt", f"admit:{name}")
             speculator = getattr(runner, "speculator", None)
             draft = getattr(speculator, "query_cudagraph_manager", None)
             if draft is not None:

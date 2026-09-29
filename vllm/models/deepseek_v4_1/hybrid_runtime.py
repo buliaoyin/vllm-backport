@@ -97,6 +97,11 @@ class HybridExecutorResources:
         updates = {
             "CUDA_MPS_PIPE_DIRECTORY": str(self.path / "pipe"),
             "CUDA_MPS_LOG_DIRECTORY": str(self.path / "log"),
+            # MPS otherwise defaults to two work queues. PP communication and
+            # remote experts need independent queues to overlap with prefill.
+            "CUDA_DEVICE_MAX_CONNECTIONS": os.environ.get(
+                "CUDA_DEVICE_MAX_CONNECTIONS", "16"
+            ),
         }
         # The daemon remaps device ordinals. UUIDs have the same meaning in clients.
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -116,7 +121,12 @@ class HybridExecutorResources:
         except Exception:
             self.close()
             raise
-        logger.info("Started executor-owned CUDA MPS instance: %s", self.path)
+        logger.info(
+            "Started executor-owned CUDA MPS instance: %s "
+            "(CUDA_DEVICE_MAX_CONNECTIONS=%s)",
+            self.path,
+            updates["CUDA_DEVICE_MAX_CONNECTIONS"],
+        )
 
     def close(self):
         if self.path is None:
@@ -216,6 +226,30 @@ def initialize_hybrid_cache(worker):
     torch.accelerator.synchronize()
     transient = torch.accelerator.max_memory_allocated() - before
     torch.accelerator.empty_cache()
+    staging_bytes = 0
+    if not group.is_last_rank and runner.max_num_tokens >= 1024:
+        from vllm.v1.worker.gpu.pp_utils import PPSendStaging
+
+        model = runner.model.language_model.model
+        rows = runner.max_num_tokens
+        specs = {
+            "hidden_states": (
+                (rows, model.hc_mult, model.config.hidden_size),
+                config.model_config.dtype,
+            ),
+            "pre_mix": ((rows, model.hc_mult), torch.float32),
+        }
+        if (
+            model.pp_shared_kv is not None
+            and model.pp_shared_kv.plan.outgoing_source is not None
+        ):
+            specs.update(
+                shared_kv_rows=((rows, 584), torch.uint8),
+                shared_topk_indices=((rows, model.config.index_topk), torch.int32),
+            )
+        worker._pp_send_staging = PPSendStaging(specs, worker.device)
+        staging_bytes = worker._pp_send_staging.nbytes
+        logger.info("PP prefill send buffers: 2 slots, %.3f GiB", staging_bytes / GiB)
     free, total = torch.accelerator.get_memory_info()
     # KVCacheTensor entries are views of one shared backing allocation.
     kv_sizes = {tensor.size for tensor in runner.kv_cache_config.kv_cache_tensors}
@@ -227,7 +261,11 @@ def initialize_hybrid_cache(worker):
             GiB, transient, getattr(worker, "cudagraph_memory_estimate", 0)
         )
     reserve = GiB // 2 + graph_reserve
-    profiled = getattr(worker, "available_kv_cache_memory_bytes", free) - kv_bytes
+    profiled = (
+        getattr(worker, "available_kv_cache_memory_bytes", free)
+        - kv_bytes
+        - staging_bytes
+    )
     reserved_for_others = int(total * (1 - config.cache_config.gpu_memory_utilization))
     available = max(0, min(profiled, free - reserved_for_others - transient) - reserve)
     logger.info(
@@ -332,6 +370,28 @@ def initialize_hybrid_cache(worker):
             stats,
         )
     torch.distributed.barrier(group=group.cpu_group)
+
+
+def warmup_hybrid_input_kernels(worker):
+    """Load metadata kernels before asynchronous PP receives can be pending."""
+    if hybrid_settings(worker.vllm_config) is None:
+        return
+    from vllm.v1.attention.ops.common import fill_token_to_req_indices
+    from vllm.v1.worker.gpu.input_batch import expand_idx_mapping
+
+    runner = worker.model_runner
+    device = worker.device
+    buffer = torch.empty(17, dtype=torch.int32, device=device)
+    for requests in range(1, runner.max_num_reqs + 1):
+        query = torch.arange(requests + 1, dtype=torch.int32, device=device)
+        for tokens in (1, 16, 17):
+            fill_token_to_req_indices(query, buffer, tokens)
+    mapping = torch.zeros(1, dtype=torch.int64, device=device)
+    query = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    for exponent in range(runner.decode_query_len.bit_length() + 1):
+        expand_idx_mapping(mapping, 1, query, 1 << exponent)
+    torch.accelerator.synchronize()
+    get_pp_group().barrier()
 
 
 def activate_hybrid_cache(worker):

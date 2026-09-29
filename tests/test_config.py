@@ -1152,12 +1152,15 @@ def test_max_num_new_slots_for_drafting(method, parallel_drafting, expected_slot
 
 
 @pytest.mark.parametrize("draft_tokens, query_tokens", [(3, 5), (5, 5), (7, 7)])
-def test_dspark_query_prefix_reserves_full_backbone_slots(draft_tokens, query_tokens):
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_dspark_query_prefix_reserves_full_backbone_slots(
+    draft_tokens, query_tokens, adaptive
+):
     spec = SpeculativeConfig(model="ngram", num_speculative_tokens=draft_tokens)
     spec.method = "dspark"
     spec.parallel_drafting = True
     spec.draft_sample_method = "greedy"
-    spec.enable_adaptive_verification = False
+    spec.enable_adaptive_verification = adaptive
     spec.dspark_num_query_tokens = query_tokens
     spec._verify_args()
     config = object.__new__(VllmConfig)
@@ -1167,6 +1170,40 @@ def test_dspark_query_prefix_reserves_full_backbone_slots(draft_tokens, query_to
     assert config.uniform_decode_query_len == draft_tokens + 1
     assert config.num_lookahead_tokens == max(draft_tokens, query_tokens)
     assert spec.max_num_new_slots_for_drafting == query_tokens - 1
+
+
+def test_adaptive_verification_pipeline_support_requires_hybrid_scheduler():
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            enable_adaptive_verification=True,
+            num_speculative_tokens_per_batch_size=None,
+            dspark_num_query_tokens=None,
+        ),
+        lora_config=None,
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=4),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        use_v2_model_runner=True,
+        additional_config={},
+    )
+    with pytest.raises(ValueError, match="pipeline parallelism"):
+        VllmConfig._validate_adaptive_verification(config)
+    config.speculative_config.dspark_num_query_tokens = 7
+    with pytest.raises(ValueError, match="CPU hybrid"):
+        VllmConfig._validate_adaptive_verification(config)
+    config.additional_config = {"deepseek_v41_hybrid": None}
+    with pytest.raises(ValueError, match="CPU hybrid"):
+        VllmConfig._validate_adaptive_verification(config)
+    config.additional_config = {"deepseek_v41_hybrid": {}}
+    VllmConfig._validate_adaptive_verification(config)
+    config.speculative_config.num_speculative_tokens_per_batch_size = [(1, 16, 3)]
+    with pytest.raises(ValueError, match="not both"):
+        VllmConfig._validate_adaptive_verification(config)
+    config.scheduler_config.async_scheduling = False
+    with pytest.raises(ValueError, match="async MRv2"):
+        VllmConfig._validate_adaptive_verification(config)
 
 
 @pytest.mark.parametrize(
@@ -1216,7 +1253,7 @@ def test_dspark_query_prefix_cannot_omit_proposed_positions(query_tokens):
         spec._verify_args()
 
 
-@pytest.mark.parametrize("draft_tokens", [3, 5, 7])
+@pytest.mark.parametrize("draft_tokens", [2, 3, 4, 5, 6, 7])
 @patch("vllm.config.speculative.ModelConfig")
 def test_v41_dspark_block_length_does_not_require_mtp_divisibility(
     model_config_cls, draft_tokens, monkeypatch

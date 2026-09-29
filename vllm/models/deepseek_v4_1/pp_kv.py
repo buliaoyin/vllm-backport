@@ -46,14 +46,14 @@ class SharedKVTransferPlan:
         return cls(crossing(start), crossing(end))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_SLOTS"])
 def _copy_packed_kv_rows(
     cache,
     slots,
     rows,
     CACHE_STRIDE: tl.constexpr,
     PAGE_ROWS: tl.constexpr,
-    NUM_SLOTS: tl.constexpr,
+    NUM_SLOTS,
     SCATTER: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)

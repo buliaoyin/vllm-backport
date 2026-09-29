@@ -145,6 +145,7 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        fixed_decode_query_len: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -154,6 +155,7 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        self.fixed_decode_query_len = fixed_decode_query_len
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -234,7 +236,20 @@ class CudaGraphManager:
         # draft tokens. The scheduler might use a smaller number so we need
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
-        if (
+        from vllm.v1.spec_decode.dynamic.adaptive import (
+            uses_scheduler_adaptive_verification,
+            verification_lengths,
+        )
+
+        if self.fixed_decode_query_len:
+            decode_query_lens = [self.decode_query_len]
+        elif uses_scheduler_adaptive_verification(self.vllm_config):
+            bonus = self.decode_query_len - self.vllm_config.num_speculative_tokens
+            decode_query_lens = [
+                k + bonus
+                for k in verification_lengths(self.vllm_config.num_speculative_tokens)
+            ]
+        elif (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
         ):
@@ -322,6 +337,35 @@ class CudaGraphManager:
                 )
                 descs_by_mode[mixed_mode].append(desc)
 
+        if (
+            uses_scheduler_adaptive_verification(self.vllm_config)
+            and not self.fixed_decode_query_len
+            and separate_decode_routine
+            and decode_mode
+            and not self.varlen_decode
+        ):
+            # Keep the maximum budget's request grid when K shrinks. A token
+            # grid alone needlessly pads (or misses) small intermediate budgets.
+            request_counts = {
+                round_up(size, self.decode_query_len) // self.decode_query_len
+                for size in capture_sizes
+            }
+            for requests, query_len, loras in product(
+                sorted(request_counts), decode_query_lens, self.lora_capture_cases
+            ):
+                tokens = requests * query_len
+                if requests > self.max_num_reqs or tokens > max_cg_capture_size:
+                    continue
+                desc = BatchExecutionDescriptor(
+                    cg_mode=decode_mode,
+                    num_tokens=tokens,
+                    num_reqs=requests,
+                    uniform_token_count=query_len,
+                    num_active_loras=loras,
+                )
+                if desc not in descs_by_mode[decode_mode]:
+                    descs_by_mode[decode_mode].append(desc)
+
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
@@ -332,15 +376,20 @@ class CudaGraphManager:
                 lora_descs = [
                     d for d in mode_descs if d.num_active_loras == num_active_loras
                 ]
-                current_range_start = 0
-                # Dynamic speculative decoding can produce multiple graphs with the same
-                # num_tokens. Group them so each graph covers the same candidate range.
+                range_starts: dict[tuple[int | None, int | None, int], int] = {}
+                # Each query shape needs its own padding ranges. A smaller
+                # graph for another K must not hide a larger compatible one.
                 for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
-                    matching = list(group)
-                    for i in range(current_range_start, num_tokens + 1):
-                        key = (i, num_active_loras)
-                        self._candidates.setdefault(key, []).extend(matching)
-                    current_range_start = num_tokens + 1
+                    for desc in group:
+                        shape = (
+                            desc.uniform_token_count,
+                            desc.max_query_len,
+                            desc.num_ubatches,
+                        )
+                        for i in range(range_starts.get(shape, 0), num_tokens + 1):
+                            key = (i, num_active_loras)
+                            self._candidates.setdefault(key, []).append(desc)
+                        range_starts[shape] = num_tokens + 1
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0

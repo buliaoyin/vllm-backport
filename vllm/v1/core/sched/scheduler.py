@@ -70,6 +70,10 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.adaptive import (
+    ConfidenceDraftBudget,
+    uses_scheduler_adaptive_verification,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -287,6 +291,12 @@ class Scheduler(SchedulerInterface):
         # reserve between a chunk boundary and the prefill end.
         self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self.adaptive_draft_budget = (
+            ConfidenceDraftBudget(self.num_spec_tokens)
+            if uses_scheduler_adaptive_verification(vllm_config)
+            else None
+        )
+        self._last_draft_budget_log = 0.0
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -611,6 +621,40 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.recycle_sliding_windows(request)
 
         self.current_step += 1
+        adaptive_mixed = False
+        adaptive_requests: set[str] = set()
+        adaptive_drafts = self.num_spec_tokens
+        if self.adaptive_draft_budget is not None:
+            adaptive_budget = self.adaptive_draft_budget
+            adaptive_budget.retain_requests(self.requests.keys())
+            eligible = [
+                request
+                for request in self.running
+                if not request.is_prefill_chunk
+                and request.spec_token_ids
+                and self.current_step >= request.next_decode_eligible_step
+            ]
+            adaptive_requests = {r.request_id for r in eligible}
+            adaptive_mixed = bool(self.waiting) or any(
+                r.is_prefill_chunk for r in self.running
+            )
+            adaptive_drafts = adaptive_budget.choose(
+                [r.request_id for r in eligible],
+                max((r.num_tokens for r in eligible), default=0),
+                adaptive_mixed,
+            )
+            now = time.monotonic()
+            if eligible and now - self._last_draft_budget_log >= 5:
+                logger.info(
+                    "Adaptive DSpark drafting: requests=%d, next K=%d/%d, "
+                    "mixed=%s, completed verification rounds=%s",
+                    len(eligible),
+                    adaptive_drafts,
+                    self.num_spec_tokens,
+                    adaptive_mixed,
+                    dict(sorted(adaptive_budget.counts.items())),
+                )
+                self._last_draft_budget_log = now
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1466,7 +1510,9 @@ class Scheduler(SchedulerInterface):
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+        if self.adaptive_draft_budget is not None:
+            num_spec_tokens_to_schedule = adaptive_drafts
+        elif self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
@@ -1505,6 +1551,20 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+
+        if self.adaptive_draft_budget is not None:
+            drafts = {
+                req_id: len(tokens)
+                for req_id, tokens in scheduled_spec_decode_tokens.items()
+                if req_id in adaptive_requests
+            }
+            self.adaptive_draft_budget.scheduled(
+                self.current_step,
+                scheduled_timestamp,
+                max((self.requests[r].num_tokens for r in drafts), default=0),
+                adaptive_mixed,
+                drafts,
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1995,6 +2055,30 @@ class Scheduler(SchedulerInterface):
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
             )
+
+        if self.adaptive_draft_budget is not None:
+            valid_outputs = {
+                req_id: len(sampled_token_ids[index])
+                for req_id, index in model_runner_output.req_id_to_index.items()
+                if sampled_token_ids
+                and (request := self.requests.get(req_id)) is not None
+                and not request.is_finished()
+                and request.num_stale_output_tokens == 0
+                and not (failed_kv_load_req_ids and req_id in failed_kv_load_req_ids)
+            }
+            self.adaptive_draft_budget.complete(
+                scheduler_output.scheduler_step_id, time.monotonic(), valid_outputs
+            )
+            confidences = model_runner_output.draft_token_confidences
+            if confidences is not None:
+                for req_id, values in zip(model_runner_output.req_ids, confidences):
+                    if (
+                        valid_outputs.get(req_id, 0) > 0
+                        and req_id in scheduler_output.scheduled_spec_decode_tokens
+                    ):
+                        self.adaptive_draft_budget.observe_confidences(
+                            req_id, scheduler_output.scheduler_step_id, values
+                        )
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -2501,15 +2585,14 @@ class Scheduler(SchedulerInterface):
     def _validate_draft_token_ids(
         self, request: Request, spec_token_ids: list[int]
     ) -> list[int]:
-        spec_token_ids = list(spec_token_ids)
+        # Padding is not a draft, including while a structured request reasons.
+        spec_token_ids = strip_speculative_padding(list(spec_token_ids))
         if self.structured_output_manager.should_advance(request):
             metadata = request.structured_output_request
             assert metadata is not None
             grammar = metadata.grammar
             assert grammar is not None and not isinstance(grammar, Exception)
-            spec_token_ids = grammar.validate_tokens(
-                strip_speculative_padding(spec_token_ids)
-            )
+            spec_token_ids = grammar.validate_tokens(spec_token_ids)
         return spec_token_ids
 
     def _cache_pending_draft_token_ids(

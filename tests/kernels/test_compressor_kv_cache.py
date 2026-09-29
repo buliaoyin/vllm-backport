@@ -1848,6 +1848,37 @@ def test_kv_increment_cuda_graph_reuses_slots_and_rejected_positions():
                     )
 
 
+@pytest.mark.parametrize("device_id", [0, 3])
+def test_kv_increment_mixed_batch_lengths_reuse_loaded_kernels(device_id, monkeypatch):
+    """Changing mixed-batch lengths must not load modules behind pending PP work."""
+    from triton import knobs
+
+    if torch.accelerator.device_count() <= device_id:
+        pytest.skip("Requested GPU is unavailable")
+    with torch.accelerator.device_index(device_id):
+        source = torch.randint(
+            0, 256, (16, 128, 584), dtype=torch.uint8, device=f"cuda:{device_id}"
+        )
+        replica = torch.zeros_like(source)
+        slots = torch.arange(2048, dtype=torch.int64, device=source.device)
+        slots[::13] = -1
+        rows = pack_kv_rows(source, slots[:1], 3)
+        scatter_kv_rows(rows, replica, slots[:1])
+
+        def unexpected_compile(*args, **kwargs):
+            pytest.fail(
+                "KV transfer compiled a new kernel for a different batch length"
+            )
+
+        monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
+        for length in (3, 4, 16, 17, 128, 2036, 2040, 2044, 2048):
+            rows = pack_kv_rows(source, slots[:length], length + 2)
+            scatter_kv_rows(rows, replica, slots[:length])
+            actual = pack_kv_rows(replica, slots[:length], length + 2)
+            torch.testing.assert_close(actual, rows, rtol=0, atol=0)
+            assert not actual[length:].any()
+
+
 def test_kv_increment_offsets_above_two_gib_do_not_wrap():
     if not torch.cuda.is_available():
         pytest.skip("Requires CUDA")

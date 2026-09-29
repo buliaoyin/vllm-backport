@@ -375,6 +375,40 @@ def test_fp8_paged_mqa_logits_triton_matches_torch(
         )
 
 
+@pytest.mark.parametrize("device_id", [0, 3])
+def test_paged_logits_context_growth_reuses_loaded_kernel(device_id, monkeypatch):
+    """Active context lengths must not load modules behind pending PP work."""
+    from triton import knobs
+
+    if torch.accelerator.device_count() <= device_id:
+        pytest.skip("Requested GPU is unavailable")
+    with torch.accelerator.device_index(device_id):
+        device = f"cuda:{device_id}"
+        torch.manual_seed(0)
+        kv = _pack_paged_kv(
+            torch.randn(8, 64, 128, dtype=torch.bfloat16, device=device)
+        )
+        q = torch.randn(2, 1, 16, 128, device=device).to(torch.float8_e4m3fn)
+        weights = torch.randn(2, 16, device=device)
+        lengths = torch.full((2,), 128, dtype=torch.int32, device=device)
+        tables = torch.arange(8, dtype=torch.int32, device=device).view(2, 4)
+        fp8_paged_mqa_logits_triton(q, kv, weights, lengths, tables, 128)
+
+        def unexpected_compile(*args, **kwargs):
+            pytest.fail("Context growth compiled a new paged logits kernel")
+
+        monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
+        for length in (129, 144, 145):
+            lengths.fill_(length)
+            actual = fp8_paged_mqa_logits_triton(
+                q, kv, weights, lengths, tables, length, clean_logits=False
+            )
+            expected = _fp8_paged_mqa_logits_ref(
+                q, kv, weights, lengths, tables, length
+            )
+            torch.testing.assert_close(actual, expected, atol=_ATOL, rtol=_RTOL)
+
+
 def test_fp8_paged_mqa_logits_triton_strided_pool_no_int32_overflow():
     """Unified-KV-pool layer views have a large block stride; with enough
     blocks, int32 `block_idx * stride` exceeds 2**31 and wraps to a negative

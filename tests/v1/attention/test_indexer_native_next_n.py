@@ -7,7 +7,10 @@ asserts both that the architecture implements the requested `next_n` and that
 the schedule metadata was sized for the matching slot count.
 """
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import _paged_mqa_logits_schedule_slots
@@ -73,3 +76,52 @@ def test_multicast_is_sm90_only(monkeypatch, family):
     _set_arch(monkeypatch, family)
     for next_n in (1, 2, 3, 4):
         assert _paged_mqa_logits_schedule_slots(NUM_SMS, next_n) == NUM_SMS
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "hybrid,cpu_lengths,gpu_lengths",
+    [(True, [4, 4], [4, 4]), (True, [2, 6], [2, 6]), (False, [4, 4], [2, 6])],
+)
+def test_adaptive_decode_metadata_preserves_actual_query_lengths(
+    hybrid, cpu_lengths, gpu_lengths
+):
+    """Scheduler lengths are exact; device trimming may invalidate CPU uniformity."""
+    builder = indexer.DeepseekV32IndexerMetadataBuilder.__new__(
+        indexer.DeepseekV32IndexerMetadataBuilder
+    )
+    builder.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enable_adaptive_verification=True),
+        additional_config={"deepseek_v41_hybrid": {}} if hybrid else {},
+    )
+    builder.supports_varlen = False
+    builder.decode_seq_lens_buffer = torch.zeros(16, dtype=torch.int32, device="cuda")
+    builder.expanded_block_table_buffer = torch.zeros(
+        (16, 3), dtype=torch.int32, device="cuda"
+    )
+    builder.decode_lens_buffer = torch.zeros(16, dtype=torch.int32, device="cuda")
+    builder.arange_buffer = torch.arange(16, dtype=torch.int32, device="cuda")
+    lengths = torch.tensor(gpu_lengths, dtype=torch.int32, device="cuda")
+    blocks = torch.arange(6, dtype=torch.int32, device="cuda").view(2, 3)
+    seq_lens, block_table, decode_lens, count, padding = (
+        builder._prepare_decode_tensors(
+            seq_lens=torch.tensor([12, 25], dtype=torch.int32, device="cuda"),
+            block_table=blocks,
+            decode_lens=lengths,
+            decode_lens_cpu=torch.tensor(cpu_lengths, dtype=torch.int32),
+            query_start_loc=torch.tensor([0, gpu_lengths[0]], device="cuda"),
+            num_decodes=2,
+            num_decode_tokens=8,
+            use_native=False,
+            next_n=8,
+            max_decode_len=max(cpu_lengths),
+        )
+    )
+    expected = [
+        i for end, n in zip((12, 25), gpu_lengths) for i in range(end - n + 1, end + 1)
+    ]
+    assert seq_lens.tolist() == expected
+    torch.testing.assert_close(block_table, blocks.repeat_interleave(lengths, dim=0))
+    assert decode_lens.tolist() == [1] * 8
+    assert count == 8 and not padding
+    assert builder.decode_seq_lens_buffer[8:].count_nonzero() == 0

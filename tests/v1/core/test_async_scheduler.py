@@ -19,6 +19,47 @@ from .utils import create_requests, create_scheduler
 pytestmark = pytest.mark.cpu_test
 
 
+def test_hybrid_adaptive_budget_changes_preserve_pp_output_fences(monkeypatch):
+    from vllm.v1.spec_decode.dynamic.adaptive import AdaptiveDraftBudget
+
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        use_v2_model_runner=True,
+        num_speculative_tokens=7,
+        speculative_method="ngram_gpu",
+    )
+    scheduler.pp_size = 4
+    budget = scheduler.adaptive_draft_budget = AdaptiveDraftBudget(7)
+    requests = create_requests(num_requests=1, num_tokens=32, max_tokens=128)
+    request = requests[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(output))
+    previous_drafts = output.num_spec_tokens_to_schedule
+    for drafts, accepted in ((2, 1), (6, 0), (4, 4), (3, 2), (1, 0), (7, 1)):
+        monkeypatch.setattr(budget, "choose", lambda *_, count=drafts: count)
+        earliest = request.next_decode_eligible_step
+        while True:
+            output = scheduler.schedule()
+            if output.num_scheduled_tokens:
+                break
+            assert output.scheduler_step_id < earliest
+        assert output.scheduler_step_id >= earliest
+        assert (
+            len(output.scheduled_spec_decode_tokens[request.request_id])
+            == previous_drafts
+        )
+        assert output.num_scheduled_tokens[request.request_id] == previous_drafts + 1
+        assert output.num_spec_tokens_to_schedule == drafts
+        assert len(request.spec_token_ids) == drafts
+        sampled = _make_model_runner_output(output)
+        sampled.sampled_token_ids = [[10] * (accepted + 1)]
+        scheduler.update_from_output(output, sampled)
+        assert request.num_output_placeholders == 0
+        assert request.num_computed_tokens == request.num_tokens - 1
+        previous_drafts = drafts
+
+
 def _make_model_runner_output(
     scheduler_output: SchedulerOutput,
 ) -> ModelRunnerOutput:
@@ -454,8 +495,36 @@ def test_legacy_draft_handoff_remains_supported():
     assert request.spec_token_ids == [1, 2, 3]
 
 
+@pytest.mark.parametrize("advance_grammar", [False, True])
+@pytest.mark.parametrize("producer_step_id", [None, 10])
+def test_short_drafts_do_not_restore_max_budget_during_reasoning(
+    advance_grammar, producer_step_id
+):
+    """Unused GPU draft slots must never expand the next verification batch."""
+    scheduler, (request,) = _make_structured_draft_scheduler()
+    scheduler.structured_output_manager.should_advance.return_value = advance_grammar
+    request.spec_token_ids = [-1] * 3
+    request.spec_token_ids_step_id = producer_step_id
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            [request.request_id],
+            [[10, 11, 12, -1, -1, -1, -1]],
+            producer_step_id=producer_step_id,
+        )
+    )
+
+    assert request.spec_token_ids == [10, 11, 12]
+    grammar = request.structured_output_request.grammar
+    if advance_grammar:
+        grammar.validate_tokens.assert_called_once_with([10, 11, 12])
+    else:
+        grammar.validate_tokens.assert_not_called()
+
+
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(AsyncScheduler)
+    scheduler.adaptive_draft_budget = None
     request = create_requests(num_requests=1, num_tokens=1)[0]
     request.structured_output_request = Mock()
     request.structured_output_request.grammar = Mock(spec=StructuredOutputGrammar)
@@ -702,7 +771,57 @@ def _assert_positions_consistent(req, engine: PipelinedEngine) -> None:
 
 
 @pytest.mark.parametrize("num_spec", [0, 3])
-def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
+def test_hybrid_decode_batches_join_after_the_pipeline_output_fence(num_spec):
+    scheduler = _create_async_pp_scheduler(num_spec, pp_size=4, num_blocks=100)
+    scheduler.align_hybrid_decodes = True
+    scheduler.max_num_scheduled_tokens = 64
+    requests = [
+        create_requests(
+            num_requests=1,
+            num_tokens=n,
+            max_tokens=24,
+            req_ids=[str(i)],
+            ignore_eos=True,
+        )[0]
+        for i, n in enumerate((8, 192, 8))
+    ]
+    scheduler.add_request(requests[0])
+    decode_batches = []
+    previous_steps: dict[str, int] = {}
+    schedule = scheduler.schedule
+
+    def observe_schedule():
+        decoding = {r.request_id for r in scheduler.running if not r.is_prefill_chunk}
+        output = schedule()
+        batch = decoding.intersection(output.num_scheduled_tokens)
+        if batch:
+            decode_batches.append(batch)
+        for req_id in batch:
+            if req_id in previous_steps:
+                assert output.scheduler_step_id - previous_steps[req_id] >= 4
+            previous_steps[req_id] = output.scheduler_step_id
+        return output
+
+    scheduler.schedule = observe_schedule
+
+    def arrive(step, engine):
+        if step in (3, 5):
+            scheduler.add_request(requests[1 if step == 3 else 2])
+
+    engine = PipelinedEngine(scheduler, queue_size=5)
+    engine.run(before_step=arrive)
+    assert {"0", "1", "2"} in decode_batches
+    for request in requests:
+        assert request.num_output_tokens == 24
+        assert list(request.output_token_ids) == engine.emitted[request.request_id][:24]
+        _assert_positions_consistent(request, engine)
+
+
+@pytest.mark.parametrize("num_spec", [0, 3, 7])
+@pytest.mark.parametrize("align_hybrid_decodes", [False, True])
+def test_kv_pressure_preemption_with_inflight_output(
+    num_spec: int, align_hybrid_decodes: bool
+):
     """KV-pressure preemption of requests with in-flight async output.
 
     PP=3 + async scheduling (batch queue of 4), a block pool small enough
@@ -719,6 +838,18 @@ def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
     """
     max_tokens = 24
     scheduler = _create_async_pp_scheduler(num_spec)
+    scheduler.align_hybrid_decodes = align_hybrid_decodes
+    if num_spec == 7:
+        from vllm.v1.spec_decode.dynamic.adaptive import AdaptiveDraftBudget
+
+        budget = scheduler.adaptive_draft_budget = AdaptiveDraftBudget(7)
+        choose = budget.choose
+
+        def varying_budget(*args):
+            choose(*args)
+            return (1, 2, 3, 4, 5, 6, 7)[scheduler.current_step % 7]
+
+        budget.choose = varying_budget
     requests = create_requests(
         num_requests=8, num_tokens=8, max_tokens=max_tokens, ignore_eos=True
     )
@@ -765,7 +896,10 @@ def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
-def test_reset_prefix_cache_with_inflight_output_under_kv_pressure(pp_size: int):
+@pytest.mark.parametrize("align_hybrid_decodes", [False, True])
+def test_reset_prefix_cache_with_inflight_output_under_kv_pressure(
+    pp_size: int, align_hybrid_decodes: bool
+):
     """reset_prefix_cache(reset_running_requests=True) resumes requests in
     the same step it preempts them, so in-flight output must be dropped (the
     resume resamples those positions).
@@ -779,6 +913,7 @@ def test_reset_prefix_cache_with_inflight_output_under_kv_pressure(pp_size: int)
     """
     max_tokens = 24
     scheduler = _create_async_pp_scheduler(num_spec=3, pp_size=pp_size)
+    scheduler.align_hybrid_decodes = align_hybrid_decodes
     requests = create_requests(
         num_requests=8, num_tokens=8, max_tokens=max_tokens, ignore_eos=True
     )

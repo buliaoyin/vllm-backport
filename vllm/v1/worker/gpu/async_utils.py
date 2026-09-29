@@ -123,6 +123,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
+        draft_confidences: torch.Tensor | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -141,6 +142,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self._draft_req_ids: list[str] = []
         self._draft_req_indices: list[int] = []
         self._draft_producer_step_id: int | None = None
+        self._draft_confidence_cpu: np.ndarray | None = None
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -155,6 +157,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            if draft_confidences is not None:
+                self._draft_confidence_cpu = async_copy_to_np(draft_confidences)
+                draft_confidences.record_stream(copy_stream)
             self.sampling_mask_tensors: SamplingMaskTensors | None = None
             if sampler_output.sampling_mask_tensors is not None:
                 self.sampling_mask_tensors = (
@@ -201,6 +206,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
+        if self._draft_confidence_cpu is not None:
+            self.model_runner_output.draft_token_confidences = (
+                self._draft_confidence_cpu.tolist()
+            )
         if self._draft_copy_event is not None:
             self._draft_copy_event.synchronize()
             assert self._draft_token_ids is not None

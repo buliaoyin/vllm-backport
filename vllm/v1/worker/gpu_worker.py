@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
+    from vllm.v1.worker.gpu.pp_utils import PPSendStaging
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -234,8 +235,9 @@ class Worker(WorkerBase):
         self._pp_recv_buffer_debug = (
             self._reuse_pp_recv_buffer and envs.VLLM_PP_REUSE_RECV_BUFFER_DEBUG
         )
-        # Device handles of the previous step's PP intermediate-tensor send.
+        # Completion handles protecting the previous PP send's source tensors.
         self._pp_send_work: list[Handle] = []
+        self._pp_send_staging: PPSendStaging | None = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -816,6 +818,7 @@ class Worker(WorkerBase):
         from vllm.models.deepseek_v4_1.hybrid_runtime import (
             activate_hybrid_cache,
             initialize_hybrid_cache,
+            warmup_hybrid_input_kernels,
         )
 
         warmup_sizes: list[int] = []
@@ -860,10 +863,17 @@ class Worker(WorkerBase):
         if pp_group.world_size > 1:
             primer = torch.zeros(1, dtype=torch.int32, device=self.device)
             if not pp_group.is_first_rank:
-                pp_group.recv(primer.shape, primer.dtype)
+                torch.distributed.recv(
+                    primer, src=pp_group.prev_rank, group=pp_group.device_group
+                )
             if not pp_group.is_last_rank:
-                pp_group.send(primer)
+                torch.distributed.send(
+                    primer, dst=pp_group.next_rank, group=pp_group.device_group
+                )
             torch.accelerator.synchronize()
+            torch.distributed.barrier(group=pp_group.cpu_group)
+
+        warmup_hybrid_input_kernels(self)
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
@@ -1208,8 +1218,7 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # Wait for the previous step's sends so this forward pass cannot
-        # overwrite buffers they are still reading.
+        # Protect reused model outputs until their send or staging copy completes.
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
@@ -1311,14 +1320,19 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # Non-blocking send of the intermediate tensors. The metadata handle
-        # is reaped lazily by the GroupCoordinator; the device handles are
-        # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
+        # GroupCoordinator owns metadata handles. Source completion is waited
+        # next step; staging slots retain their real device-send handles.
+        send = partial(
+            get_pp_group().isend_tensor_dict,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
+        staging = self._pp_send_staging
+        hidden = output.tensors.get("hidden_states")
+        if staging is not None and hidden is not None and hidden.shape[0] >= 1024:
+            handles = staging.isend(output.tensors, send)
+        else:
+            handles = send(output.tensors)
         self._pp_send_work = handles[1:]
 
         return None
