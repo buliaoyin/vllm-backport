@@ -64,6 +64,82 @@ MTP remains opt-in. Draft acceptance and the size of the target verification
 batch both affect throughput; increasing the number of draft tokens can reduce
 performance.
 
+With the V2 model runner and pipeline parallelism, GLM5Next EXL3 joins decode
+requests into a common pipeline phase once their preceding outputs are available.
+This prevents chunked prefill from leaving concurrent requests in permanently
+separate small decode batches. It applies with or without MTP. Set
+`VLLM_EXL3_PP_DECODE_BATCHING=0` before startup to restore independent phases.
+
+### Adaptive GLM5Next MTP
+
+Single-layer GLM5Next MTP supports a scheduler-selected draft length:
+
+```bash
+--speculative-config '{"method": "mtp", "num_speculative_tokens": 3, "enable_adaptive_verification": true}'
+```
+
+The configured token count is the maximum. The scheduler chooses a common
+length from 1 through that maximum for each pipeline batch, using observed
+acceptance and elapsed step costs. GLM does not need a confidence head: this
+path learns from verified drafts. Single-request decoding smooths rejection
+bursts and requires stronger evidence to shorten a budget than to lengthen it.
+Concurrent batches track acceptance faster, require a larger predicted gain to
+grow than to shrink, and start by measuring budgets 1 through 3 (up to the
+configured maximum).
+
+With a maximum above 3, ordinary decoding uses the same three-draft policy.
+Longer budgets require observed acceptance of the preceding prefix and enough
+predicted marginal benefit to justify a bounded trial. Each trial collects
+three matching proposal/verification timings, with at most 12 decisions.
+Trial cost predictions use measured longer-budget timings when available.
+A promising completed K=4 trial can immediately test K=5 with a 1% predicted
+gain; retaining the longer budget still requires a measured 3% gain.
+Unprofitable trials back off from 128 to at most 1024 decisions; improving
+prefix acceptance can reopen exploration. Longer budgets require a 3% gain to
+grow, but drop when the shorter policy predicts a 1% advantage, with a two-step
+hold. Recent excess trial and transition costs also penalize subsequent trials.
+Longer shapes never supply timing samples to the three-draft policy.
+Each prefix position retains its own last 32 observations, so shorter rounds
+cannot evict evidence needed for the next longer trial. Suffix observations
+expire after 1024 decisions involving their request, matching the maximum retry
+interval; other requests do not age them. A recovery from low prefix acceptance
+also clears stale suffix observations before probing again.
+If stale K=4 acceptance blocks a K=5 trial, the next retry remeasures K=4
+instead of repeatedly applying the same stale estimate. A substantial rise in
+prefix acceptance can reopen this retry after 64 decisions without K=4
+observations, when the predicted trial cost is still plausible. A profitable
+selected K=5 does not trigger these refresh trials.
+The periodic scheduler log reports prefix acceptance estimates, matching
+per-budget median step costs, trial budget, cooldown and amortized excess cost.
+Unknown prefix estimates appear as `None`. The general speculative decoding
+log divides each position's accepted count by all draft rounds, including rounds
+that never proposed that position; it is not that position's conditional rate.
+
+Acceptance and selection state are independent for each single request. Timing
+samples are reused within the engine for the same batch size, context-length
+bucket and prefill/decode mix, so new requests do not repeat every measurement.
+The selected length controls actual draft model calls as well as verification.
+An in-flight proposal retains its original length when the next budget changes.
+The policy uses the requests eligible for the current pipeline batch, rather
+than the total number of submitted or queued requests. Merely raising the
+configured maximum from 3 to 5 does not change the policy within budgets 1–3.
+
+This mode requires the V2 model runner, async scheduling, CUDA Graphs, and data
+parallel size 1. Pipeline parallelism is supported. Do not combine it with
+`num_speculative_tokens_per_batch_size`; LoRA and eager mode are rejected.
+CUDA Graphs, recurrent state slots and cache reservations still cover the
+configured maximum. Selecting fewer drafts saves compute, not reserved memory.
+
+It remains opt-in. Acceptance varies with the task and batching, and collecting
+cost samples takes real decode steps, so it need not beat a well-chosen fixed
+length on every workload. Compare fixed and adaptive budgets using the same
+reasoning effort, input lengths, pipeline partition, and cache budget. Count
+reasoning tokens in total decode throughput and report end-to-end latency as
+well. A larger maximum also reserves more recurrent state and can reduce the
+number of requests that fit in the cache.
+
+### Image input
+
 GLM5Next image input is supported with EXL3 vision weights. For the validated
 checkpoint, replace the text-only modality limit with the following serving
 options:

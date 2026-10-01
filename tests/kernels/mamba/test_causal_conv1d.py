@@ -421,3 +421,59 @@ def test_causal_conv1d_update_invalid_accepted_count_is_fail_closed(
 
     torch.testing.assert_close(result, torch.zeros_like(result))
     torch.testing.assert_close(conv_state, state_before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("width", [2, 4, 6])
+@pytest.mark.parametrize("max_query_len", [4, 6])
+@torch.inference_mode()
+def test_causal_conv1d_update_rolls_back_across_draft_budget_changes(
+    varlen, width, max_query_len
+):
+    """Previous accepted length can exceed the next query's shorter draft budget."""
+    torch.manual_seed(42)
+    device = DEVICE
+    dim = 257
+    weight = torch.randn(dim, width, device=device)
+    state = torch.randn(3, dim, width - 2 + max_query_len, device=device)
+    expected_state = state.clone()
+    indices = torch.tensor([1], dtype=torch.int32, device=device)
+    for query_len, accepted in (
+        (2, max_query_len),
+        (max_query_len, 1),
+        (3, max_query_len),
+        (2, 2),
+        (max_query_len, 1),
+    ):
+        x = torch.randn(1, dim, query_len, device=device)
+        history = expected_state[1:2, :, accepted - 1 : accepted + width - 2].clone()
+        expected, _ = causal_conv1d_ref(
+            x, weight, initial_states=history, activation="silu"
+        )
+        rolling = torch.cat([history[..., 1:], x], dim=-1)
+        expected_state[1:2, :, : rolling.shape[-1]] = rolling
+        kwargs = {}
+        if varlen:
+            x = x[0].T.contiguous()
+            kwargs = {
+                "query_start_loc": torch.tensor(
+                    [0, query_len], dtype=torch.int32, device=device
+                ),
+                "max_query_len": max_query_len,
+            }
+        actual = causal_conv1d_update(
+            x,
+            state,
+            weight,
+            activation="silu",
+            conv_state_indices=indices,
+            num_accepted_tokens=torch.tensor(
+                [accepted], dtype=torch.int32, device=device
+            ),
+            **kwargs,
+        )
+        if varlen:
+            actual = actual.T.unsqueeze(0)
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(state, expected_state, rtol=0, atol=0)

@@ -777,6 +777,7 @@ def _causal_conv1d_update_kernel(
     dim: tl.constexpr,
     seqlen: tl.constexpr,
     state_len: tl.constexpr,
+    conv_state_capacity: tl.constexpr,
     num_cache_lines,  # added to support vLLM larger cache lines
     # Strides
     stride_x_seq: tl.constexpr,
@@ -872,7 +873,8 @@ def _causal_conv1d_update_kernel(
         # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
         # - and so on.
         num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
-        if (num_accepted < 1) | (num_accepted > seqlen):
+        # Roll back within the reserved history, even when this query shrinks.
+        if (num_accepted < 1) | (num_accepted > conv_state_capacity - KERNEL_WIDTH + 2):
             zero = tl.zeros((BLOCK_N,), dtype=tl.float32)
             for idx_token in tl.range(seqlen):
                 o_ptrs = (
@@ -1196,6 +1198,7 @@ def causal_conv1d_update(
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
+    conv_state_capacity = state_len
 
     if validate_data:
         assert dim == weight.size(0)
@@ -1258,6 +1261,7 @@ def causal_conv1d_update(
         dim,
         seqlen,
         state_len,
+        conv_state_capacity,
         num_cache_lines,
         # stride
         stride_x_seq,

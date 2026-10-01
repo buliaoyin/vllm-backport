@@ -160,6 +160,59 @@ def test_fused_recurrent_kda_strided_inputs_bit_identical_to_contiguous(
     torch.testing.assert_close(state, state_ref, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("use_graph", [False, True])
+@pytest.mark.parametrize("max_query_len", [4, 6])
+@torch.inference_mode()
+def test_kda_budget_changes_preserve_previous_accepted_state(use_graph, max_query_len):
+    """A shorter query must still roll back to a longer prior accepted prefix."""
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    initial, state = make_inputs(2, max_query_len, device)
+    indices = initial["ssm_state_indices"]
+    expected_state = state.clone()
+    for query_len, accepted in (
+        (2, max_query_len),
+        (max_query_len, 1),
+        (3, max_query_len),
+        (2, 2),
+        (max_query_len, 1),
+    ):
+        inputs, _ = make_inputs(2, query_len, device)
+        inputs["ssm_state_indices"] = indices
+        inputs["num_accepted_tokens"] = torch.full(
+            (2,), accepted, dtype=torch.int32, device=device
+        )
+        if use_graph:
+            run_kernel(inputs, state.clone())
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = run_kernel(inputs, state)
+            state.copy_(expected_state)
+            graph.replay()
+        else:
+            out = run_kernel(inputs, state)
+        expected = torch.empty_like(out[0], dtype=torch.float32)
+        for request in range(2):
+            recurrent = expected_state[indices[request, accepted - 1]].clone()
+            for token in range(query_len):
+                row = slice(
+                    request * query_len + token, request * query_len + token + 1
+                )
+                expected[row], recurrent = naive_recurrent_kda(
+                    inputs["q"][0, row],
+                    inputs["k"][0, row],
+                    inputs["v"][0, row],
+                    inputs["g"][0, row],
+                    inputs["beta"][0, row],
+                    inputs["a_log"],
+                    inputs["g_bias"].view(H, D),
+                    recurrent,
+                )
+                expected_state[indices[request, token]] = recurrent
+        torch.testing.assert_close(out[0].float(), expected, rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(state, expected_state, rtol=1e-5, atol=1e-5)
+
+
 @torch.inference_mode()
 def test_fused_recurrent_kda_rejects_unaddressable_layouts():
     """Layouts the token-stride addressing cannot express must fail loudly

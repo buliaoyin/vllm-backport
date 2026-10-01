@@ -152,8 +152,9 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
 
 
 @pytest.mark.parametrize("sparse,hybrid", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("mtp", [False, True])
 def test_adaptive_budgets_keep_full_graphs_with_sparse_capture_sizes(
-    monkeypatch, sparse, hybrid
+    monkeypatch, sparse, hybrid, mtp
 ):
     """A smaller graph for another K must not hide this K's compatible graph."""
     monkeypatch.setattr(
@@ -168,6 +169,12 @@ def test_adaptive_budgets_keep_full_graphs_with_sparse_capture_sizes(
     if hybrid:
         config.additional_config = {"deepseek_v41_hybrid": {}}
         config.speculative_config.enable_adaptive_verification = True
+        if mtp:
+            config.additional_config = {}
+            config.speculative_config.method = "mtp"
+            config.speculative_config.draft_model_config.hf_config = SimpleNamespace(
+                model_type="glm5_next_mtp", num_nextn_predict_layers=1
+            )
     if sparse:
         config.compilation_config.cudagraph_capture_sizes = [
             1,
@@ -196,12 +203,13 @@ def test_adaptive_budgets_keep_full_graphs_with_sparse_capture_sizes(
             if not sparse or hybrid:
                 assert desc.num_tokens == requests * length
 
-    # Each parallel draft manager captures its own fixed query shape.
+    # Each draft decode manager captures its own fixed query shape.
+    draft_query_length = 1 if mtp else 7
     draft_manager = gpu_cudagraph_utils.CudaGraphManager(
         config,
         torch.device("cpu"),
         CUDAGraphMode.FULL_DECODE_ONLY,
-        decode_query_len=7,
+        decode_query_len=draft_query_length,
         fixed_decode_query_len=True,
     )
     draft_manager._graphs_captured = True
@@ -212,7 +220,7 @@ def test_adaptive_budgets_keep_full_graphs_with_sparse_capture_sizes(
             uniform_token_count=length,
             num_active_loras=0,
         )
-        assert (desc.cg_mode == CUDAGraphMode.FULL) == (length == 7)
+        assert (desc.cg_mode == CUDAGraphMode.FULL) == (length == draft_query_length)
 
 
 def test_dynamic_sd_cudagraphs_use_clamped_query_length(monkeypatch):

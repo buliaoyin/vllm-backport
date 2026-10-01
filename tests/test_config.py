@@ -1172,6 +1172,46 @@ def test_dspark_query_prefix_reserves_full_backbone_slots(
     assert spec.max_num_new_slots_for_drafting == query_tokens - 1
 
 
+@pytest.mark.parametrize("layers", [1, 2])
+def test_glm_mtp_adaptive_scheduler_validates_execution_mode(layers):
+    from vllm.v1.spec_decode.dynamic.adaptive import (
+        uses_scheduler_adaptive_verification,
+    )
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            enable_adaptive_verification=True,
+            num_speculative_tokens_per_batch_size=None,
+            dspark_num_query_tokens=None,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    model_type="glm5_next_mtp", num_nextn_predict_layers=layers
+                )
+            ),
+        ),
+        lora_config=None,
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=3, data_parallel_size=1),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        use_v2_model_runner=True,
+        additional_config={},
+    )
+    assert uses_scheduler_adaptive_verification(config) == (layers == 1)
+    if layers != 1:
+        with pytest.raises(ValueError, match="pipeline parallelism"):
+            VllmConfig._validate_adaptive_verification(config)
+        return
+    VllmConfig._validate_adaptive_verification(config)
+    config.parallel_config.data_parallel_size = 2
+    with pytest.raises(ValueError, match="data parallel size 1"):
+        VllmConfig._validate_adaptive_verification(config)
+    config.parallel_config.data_parallel_size = 1
+    config.scheduler_config.async_scheduling = False
+    with pytest.raises(ValueError, match="async MRv2"):
+        VllmConfig._validate_adaptive_verification(config)
+
+
 def test_adaptive_verification_pipeline_support_requires_hybrid_scheduler():
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -1183,7 +1223,7 @@ def test_adaptive_verification_pipeline_support_requires_hybrid_scheduler():
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
         ),
-        parallel_config=SimpleNamespace(pipeline_parallel_size=4),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=4, data_parallel_size=1),
         scheduler_config=SimpleNamespace(async_scheduling=True),
         use_v2_model_runner=True,
         additional_config={},

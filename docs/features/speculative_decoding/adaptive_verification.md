@@ -12,7 +12,13 @@ The practical effect is that one configuration holds up across the whole load ra
 
 ## Support
 
-Adaptive verification needs per-position acceptance estimates, so today it is only supported for DSpark with a **confidence head**.
+The GPU budget described on this page supports DSpark with a **confidence
+head**. A separate scheduler policy supports single-layer GLM5Next MTP without
+a confidence head, including pipeline parallelism. It uses observed acceptance
+and runtime step costs, and changes the number of draft model calls. See
+[adaptive GLM5Next MTP](../quantization/exl3.md#adaptive-glm5next-mtp) for its
+configuration and limitations. DeepSeek V4.1 CPU hybrid deployments also use a
+[scheduler policy](../deepseek_v41_adaptive_verification.md).
 
 ## Usage
 
@@ -33,6 +39,8 @@ vllm serve deepseek-ai/DeepSeek-V4-Flash-DSpark \
 Set `enable_adaptive_verification: false` to verify the full block for every request.
 
 ## Requirements and limitations
+
+The following requirements apply to the DSpark GPU budget.
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.
 - Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.

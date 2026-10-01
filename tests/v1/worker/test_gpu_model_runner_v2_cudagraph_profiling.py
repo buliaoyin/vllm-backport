@@ -322,7 +322,9 @@ def test_profile_cudagraph_memory_swaps_and_drops_speculator_managers(monkeypatc
         # (which profiling has already pointed at the throwaway pool).
         manager = cgu.CudaGraphManager.__new__(cgu.CudaGraphManager)
         manager.pool = cgu.current_platform.get_global_graph_pool()
-        r.speculator = SimpleNamespace(cudagraph_manager=manager)
+        r.speculator = SimpleNamespace(
+            cudagraph_manager=manager, decode_managers={2: manager, 3: manager}
+        )
 
     monkeypatch.setattr(cgu, "_init_minimal_kv_cache_for_profiling", _init)
 
@@ -339,6 +341,7 @@ def test_profile_cudagraph_memory_swaps_and_drops_speculator_managers(monkeypatc
 
     assert pools_seen == [THROWAWAY_POOL]
     assert runner.speculator.cudagraph_manager is None
+    assert not runner.speculator.decode_managers
     # The real global pool is restored afterwards.
     assert _FakePlatform._global_graph_pool == GLOBAL_POOL
 
@@ -378,7 +381,9 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch):
         }
         manager = cgu.CudaGraphManager.__new__(cgu.CudaGraphManager)
         manager.pool = cgu.current_platform.get_global_graph_pool()
-        r.speculator = SimpleNamespace(cudagraph_manager=manager)
+        r.speculator = SimpleNamespace(
+            cudagraph_manager=manager, decode_managers={2: manager, 3: manager}
+        )
 
     def _capture_model(*, profile_only: bool = False) -> int:
         for owner in (

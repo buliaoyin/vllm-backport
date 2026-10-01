@@ -894,6 +894,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         original_pools: dict[int, Any] = {}
         speculator = getattr(runner, "speculator", None)
         spec_manager_names: list[str] = []
+        spec_manager_dicts: list[dict] = []
         try:
             if not manager.needs_capture():
                 return 0
@@ -913,6 +914,13 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
                     name
                     for name, value in vars(speculator).items()
                     if isinstance(value, CudaGraphManager)
+                ]
+                spec_manager_dicts = [
+                    value
+                    for value in vars(speculator).values()
+                    if isinstance(value, dict)
+                    and value
+                    and all(isinstance(m, CudaGraphManager) for m in value.values())
                 ]
             manager._max_full_descs_to_capture = _FULL_GRAPH_PROFILING_SAMPLES
             mem_samples: list[int] = []
@@ -941,6 +949,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             # release the throwaway pool here rather than after the real init.
             for name in spec_manager_names:
                 setattr(speculator, name, None)
+            for managers in spec_manager_dicts:
+                managers.clear()
             # Drop local references before teardown detaches the runner's
             # manager and flushes the allocator.
             del manager

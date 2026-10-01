@@ -10,6 +10,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.spec_decode.dynamic.adaptive import (
     AdaptiveDraftBudget,
     ConfidenceDraftBudget,
+    MTPDraftBudget,
 )
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
@@ -110,6 +111,266 @@ def test_scheduler_confidence_rejects_stale_and_invalid_feedback(budget_cls):
     assert budget.confidences["request"] == (8, [0.8, 0.7, 0.6])
     budget.retain_requests(set())
     assert not budget.confidences
+
+
+@pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, MTPDraftBudget])
+def test_mtp_budget_transition_updates_acceptance_without_mixing_costs(budget_cls):
+    budget = budget_cls(3)
+    budget.choose(["request"], 4096, False)
+    budget.scheduled(1, 0, 4096, False, {"request": 3}, proposal_drafts=1)
+    budget.complete(1, 0.03, {"request": 1})
+    assert budget.requests["request"].conditional[0] < 0.75
+    assert budget.counts[3] == 1
+    costs = budget._costs(["request"], budget.key(1, 4096, False))
+    assert not costs.samples
+    budget.scheduled(2, 1, 4096, False, {"request": 1}, proposal_drafts=1)
+    budget.complete(2, 1.02, {"request": 2})
+    assert list(costs.samples[1]) == pytest.approx([0.02])
+
+
+def test_mtp_budget_does_not_stay_short_after_rejection_bursts():
+    """K=3 has the best average yield, despite periodic runs of rejections."""
+    budget = MTPDraftBudget(3)
+    pattern = [3] * 8 + [2] * 4 + [0] * 6
+    selected = []
+    now = 0.0
+    for step in range(360):
+        k = budget.choose(["request"], 32768, False)
+        selected.append(k)
+        budget.scheduled(step, now, 32768, False, {"request": k}, proposal_drafts=k)
+        now += 0.028 + 0.006 * k
+        budget.complete(
+            step, now, {"request": 1 + min(k, pattern[step % len(pattern)])}
+        )
+    assert selected[-180:].count(3) >= 160
+
+
+@pytest.mark.parametrize("num_reqs", [1, 8])
+def test_mtp_budget_still_adapts_when_acceptance_changes(num_reqs):
+    budget = MTPDraftBudget(5)
+    req_ids = [str(i) for i in range(num_reqs)]
+    now = 0.0
+    for phase, accepted in enumerate((5, 0, 5)):
+        choices = []
+        for iteration in range(160):
+            k = budget.choose(req_ids, 32768, False)
+            choices.append(k)
+            step = phase * 160 + iteration
+            budget.scheduled(
+                step, now, 32768, False, dict.fromkeys(req_ids, k), proposal_drafts=k
+            )
+            now += 0.02 + 0.002 * k
+            budget.complete(step, now, dict.fromkeys(req_ids, 1 + min(k, accepted)))
+        assert choices[-32:].count(5 if accepted else 1) >= 30
+
+
+def test_mtp_reuses_shape_costs_but_resets_request_acceptance():
+    budget = MTPDraftBudget(3)
+    budget.choose(["old"], 32768, False)
+    for step in range(12):
+        k = step % 3 + 1
+        budget.scheduled(step, 0.0, 32768, False, {"old": k}, proposal_drafts=k)
+        budget.complete(step, 0.02 + 0.04 * k, {"old": k + 1})
+    budget.retain_requests(set())
+    assert not budget.requests and not budget.request_costs
+    # The expensive longer shapes need not be measured again on a new request.
+    assert budget.choose(["new"], 32768, False) == 1
+    assert budget.requests["new"].conditional == [0.75] * 3
+    # Different contexts, batches and prefill overlap still need measurements.
+    assert budget.choose(["long"], 65536, False) == 3
+    assert budget.choose(["mixed"], 32768, True) == 3
+    assert budget.choose(["a", "b"], 32768, False) == 1
+
+
+def test_mtp_batch_feedback_uses_verified_batch_size():
+    """A future single-request proposal must not slow the pending batch feedback."""
+    budget = MTPDraftBudget(5)
+    budget.choose(["a", "b"], 4096, False)
+    for step in range(20):
+        budget.scheduled(step, float(step), 4096, False, {"a": 3, "b": 3})
+        budget.choose(["a"], 4096, False)
+        budget.complete(step, step + 0.05, {"a": 1, "b": 1})
+    assert budget.requests["a"].expected(1) < 1.1
+    assert budget.requests["b"].expected(1) < 1.1
+
+
+def test_mtp_batch_probes_measure_shapes_with_nonlinear_costs():
+    """A probe must outlast the old-K verification to discover a cheap shape."""
+    budget = MTPDraftBudget(5)
+    req_ids = [str(i) for i in range(8)]
+    now, previous, choices = 0.0, 3, []
+    latencies = {1: 0.03, 2: 0.06, 3: 0.10, 4: 0.03, 5: 0.13}
+    for step in range(400):
+        k = budget.choose(req_ids, 4096, False)
+        choices.append(k)
+        budget.scheduled(
+            step, now, 4096, False, dict.fromkeys(req_ids, previous), proposal_drafts=k
+        )
+        now += latencies[k]
+        budget.complete(step, now, dict.fromkeys(req_ids, min(previous, 4) + 1))
+        previous = k
+    assert choices[-64:].count(4) >= 58
+
+
+def test_mtp_batch_rejecting_drafts_starts_with_short_calibration():
+    budget = MTPDraftBudget(5)
+    req_ids = [str(i) for i in range(8)]
+    choices = []
+    for step in range(16):
+        k = budget.choose(req_ids, 4096, False)
+        choices.append(k)
+        budget.scheduled(step, float(step), 4096, False, dict.fromkeys(req_ids, k))
+        budget.complete(step, step + 0.01 + 0.005 * k, dict.fromkeys(req_ids, 1))
+    assert set(choices) == {1, 2, 3}
+    assert choices[-4:] == [1] * 4
+
+
+@pytest.mark.parametrize("num_reqs", [1, 8])
+def test_mtp_long_budget_matches_three_drafts_without_prefix_evidence(num_reqs):
+    """A larger maximum must not force suffix work on rejecting requests."""
+    budgets = [MTPDraftBudget(3), MTPDraftBudget(5)]
+    now, previous = 0.0, 3
+    for step in range(384):
+        req_ids = [f"{step // 96}-{i}" for i in range(num_reqs)]
+        context, mixed = 32768 * (step % 2), step % 17 < 3
+        for budget in budgets:
+            budget.retain_requests(set(req_ids))
+        choices = [budget.choose(req_ids, context, mixed) for budget in budgets]
+        assert choices[0] == choices[1]
+        for budget in budgets:
+            budget.scheduled(
+                step,
+                now,
+                context,
+                mixed,
+                dict.fromkeys(req_ids, previous),
+                proposal_drafts=choices[0],
+            )
+            budget.complete(step, now + 0.03, dict.fromkeys(req_ids, 1))
+        now += 0.03
+        previous = choices[0]
+
+
+@pytest.mark.parametrize("num_reqs", [1, 8])
+def test_mtp_expensive_long_trials_back_off(num_reqs):
+    """High acceptance alone cannot justify recurring expensive suffix work."""
+    budget = MTPDraftBudget(5)
+    req_ids = [str(i) for i in range(num_reqs)]
+    latencies = {1: 0.03, 2: 0.034, 3: 0.038, 4: 0.095, 5: 0.15}
+    now, previous, choices = 0.0, 3, []
+    for step in range(768):
+        k = budget.choose(req_ids, 32768, False)
+        choices.append(k)
+        budget.scheduled(
+            step, now, 32768, False, dict.fromkeys(req_ids, previous), proposal_drafts=k
+        )
+        now += (latencies[k] + latencies[previous]) / 2
+        budget.complete(step, now, dict.fromkeys(req_ids, previous + 1))
+        previous = k
+    assert sum(k > 3 for k in choices) < 16
+    assert choices[-128:].count(3) > 120
+
+
+@pytest.mark.parametrize("num_reqs", [1, 8])
+def test_mtp_keeps_suffix_evidence_until_next_long_trial(num_reqs):
+    """Short rounds must not hide a profitable K5 after a marginal K4 trial."""
+    budget = MTPDraftBudget(5)
+    req_ids = [str(i) for i in range(num_reqs)]
+    latencies = {1: 0.035, 2: 0.041, 3: 0.048, 4: 0.058, 5: 0.065}
+    now, previous, choices = 0.0, 3, []
+    for step in range(384):
+        k = budget.choose(req_ids, 32768, False)
+        choices.append(k)
+        budget.scheduled(
+            step, now, 32768, False, dict.fromkeys(req_ids, previous), proposal_drafts=k
+        )
+        now += (latencies[k] + latencies[previous]) / 2
+        budget.complete(step, now, dict.fromkeys(req_ids, previous + 1))
+        previous = k
+    assert choices[-64:].count(5) >= 60
+    assert choices.index(5) < 64
+
+
+@pytest.mark.parametrize("num_reqs", [1, 8])
+def test_mtp_remeasures_early_suffix_rejection_before_retrying_longer_drafts(num_reqs):
+    """Two early K4 rejections must not strand a later profitable K5 at K3."""
+    budget = MTPDraftBudget(5)
+    req_ids = [str(i) for i in range(num_reqs)]
+    latencies = {1: 0.064, 2: 0.075, 3: 0.089, 4: 0.107, 5: 0.118}
+    now, previous, rejections, choices = 0.0, 3, 2, []
+    for step in range(384):
+        k = budget.choose(req_ids, 32768, False)
+        choices.append(k)
+        budget.scheduled(
+            step, now, 32768, False, dict.fromkeys(req_ids, previous), proposal_drafts=k
+        )
+        now += (latencies[k] + latencies[previous]) / 2
+        accepted = previous
+        if previous == 4 and rejections:
+            accepted = 3
+            rejections -= 1
+        budget.complete(step, now, dict.fromkeys(req_ids, accepted + 1))
+        previous = k
+    assert 5 in choices[:320]
+    assert choices[-64:].count(5) >= 60
+
+
+@pytest.mark.parametrize("num_reqs", [1, 8])
+def test_mtp_refreshes_suffix_when_only_later_acceptance_changes(num_reqs):
+    """Stale suffix rejection must not prevent recovery with a reliable prefix."""
+    budget = MTPDraftBudget(5)
+    req_ids = [str(i) for i in range(num_reqs)]
+    latencies = {1: 0.035, 2: 0.041, 3: 0.048, 4: 0.054, 5: 0.060}
+    now, previous, step = 0.0, 3, 0
+    for accepted, length in ((5, 160), (3, 1536), (5, 1536)):
+        choices = []
+        for _ in range(length):
+            k = budget.choose(req_ids, 32768, False)
+            choices.append(k)
+            budget.scheduled(
+                step,
+                now,
+                32768,
+                False,
+                dict.fromkeys(req_ids, previous),
+                proposal_drafts=k,
+            )
+            now += (latencies[k] + latencies[previous]) / 2
+            budget.complete(
+                step, now, dict.fromkeys(req_ids, min(previous, accepted) + 1)
+            )
+            previous = k
+            step += 1
+        assert choices[-32:].count(5 if accepted == 5 else 3) >= 30
+
+
+@pytest.mark.parametrize("verified,proposal", [(4, 3), (3, 4), (5, 5)])
+def test_mtp_long_shapes_preserve_short_policy_timing(verified, proposal):
+    budget = MTPDraftBudget(5)
+    budget.choose(["request"], 4096, False)
+    budget.scheduled(0, 0.0, 4096, False, {"request": 3}, proposal_drafts=3)
+    budget.complete(0, 0.03, {"request": 4})
+    core = budget._extension.core
+    costs = core._costs(["request"], budget.key(1, 4096, False))
+    before = list(costs.samples[3])
+    budget.scheduled(
+        1, 1.0, 4096, False, {"request": verified}, proposal_drafts=proposal
+    )
+    budget.complete(1, 1.8, {"request": verified + 1})
+    assert list(costs.samples[3]) == before
+    assert core.requests["request"].conditional[0] > 0.75
+
+
+def test_mtp_cancelled_long_request_cannot_recreate_feedback():
+    budget = MTPDraftBudget(5)
+    budget.choose(["request"], 4096, False)
+    budget.scheduled(0, 0.0, 4096, False, {"request": 5}, proposal_drafts=5)
+    budget.retain_requests(set())
+    budget.complete(0, 0.5, {})
+    assert not budget.requests and not budget.counts
+    assert not budget._extension.observed and not budget._extension.extensions
+    assert not budget._extension.clocks
+    assert not budget._extension.core.requests
 
 
 def test_calibrated_budget_follows_high_low_high_acceptance():

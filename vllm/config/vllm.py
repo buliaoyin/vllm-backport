@@ -2752,10 +2752,14 @@ class VllmConfig:
                 not self.use_v2_model_runner
                 or not self.scheduler_config.async_scheduling
             ):
-                raise ValueError("Hybrid adaptive verification requires async MRv2")
+                raise ValueError("Scheduler adaptive drafting requires async MRv2")
+            if self.parallel_config.data_parallel_size > 1:
+                raise ValueError(
+                    "Scheduler adaptive drafting requires data parallel size 1"
+                )
             if spec_config.num_speculative_tokens_per_batch_size is not None:
                 raise ValueError(
-                    "Use either hybrid adaptive verification or a fixed batch-size "
+                    "Use either scheduler adaptive drafting or a fixed batch-size "
                     "schedule, not both"
                 )
             return

@@ -548,7 +548,8 @@ class SpeculativeConfig:
     confidence. DeepSeek V4.1 CPU hybrid uses observed acceptance and step costs
     on the scheduler to size each proposal, keeping exact query boundaries
     across PP ranks and verifying existing drafts at their producer's length.
-    Currently only supported for method="dspark"."""
+    GLM5Next MTP uses observed acceptance and costs without a confidence head.
+    Supported for DSpark and single-layer GLM5Next MTP."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -1578,8 +1579,14 @@ class SpeculativeConfig:
                 self.index_share_for_mtp_iteration
             )
 
-        if self.method != "dspark" and self.enable_adaptive_verification:
-            raise ValueError("Adaptive verification only supported with DSpark")
+        if self.enable_adaptive_verification:
+            from vllm.v1.spec_decode.dynamic.adaptive import supports_adaptive_mtp
+
+            if self.method != "dspark" and not supports_adaptive_mtp(self):
+                raise ValueError(
+                    "Adaptive verification only supports DSpark or single-layer "
+                    "GLM5Next MTP"
+                )
 
         return self
 

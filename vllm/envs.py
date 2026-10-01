@@ -190,6 +190,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_M_TILE: int = 32
     VLLM_EXL3_MOE_DECODE: str = "hybrid"
     VLLM_EXL3_MOE_BATCHED_DECODE: bool = True
+    VLLM_EXL3_PP_DECODE_BATCHING: bool = True
     VLLM_EXL3_MOE_PREFILL: str = "native"
     VLLM_EXL3_MOE_INT8_MIN_TOKENS: int = 4096
     VLLM_EXL3_PREFILL_EXPERTS_PER_GROUP: int | None = None
@@ -1592,6 +1593,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Route sparse experts to INT8 and reuse M32 for batched SM80 decode.
     "VLLM_EXL3_MOE_BATCHED_DECODE": lambda: (
         os.getenv("VLLM_EXL3_MOE_BATCHED_DECODE", "1") == "1"
+    ),
+    # Join GLM5Next EXL3 pipeline decodes after their producer output fences.
+    "VLLM_EXL3_PP_DECODE_BATCHING": lambda: (
+        os.getenv("VLLM_EXL3_PP_DECODE_BATCHING", "1") == "1"
     ),
     # Opt-in adaptive SM80 INT8 prefill; native avoids added quantization error.
     "VLLM_EXL3_MOE_PREFILL": lambda: os.getenv("VLLM_EXL3_MOE_PREFILL", "native"),

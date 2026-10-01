@@ -377,6 +377,94 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
     assert run_fullgraph.call_count == expected_graph_replays
 
 
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("max_drafts", [3, 5])
+def test_adaptive_mtp_changes_work_and_clears_unused_drafts(
+    monkeypatch, fused, max_drafts
+):
+    """Switching K must skip model calls and never return a previous draft tail."""
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    spec = object.__new__(MTPSpeculator)
+    spec.num_speculative_steps = max_drafts
+    spec.dynamic_draft = True
+    spec._decode_managers = {}
+    spec.max_model_len = 32
+    spec.max_num_reqs = 1
+    spec.dp_size, spec.dp_rank = 1, 0
+    spec.hidden_states = torch.zeros(2, 3)
+    spec.draft_tokens = torch.full((1, max_drafts), 999, dtype=torch.int64)
+    spec.last_token_indices = torch.zeros(1, dtype=torch.int64)
+    spec.idx_mapping = torch.zeros(1, dtype=torch.int64)
+    spec.current_draft_step = torch.tensor(0)
+    spec.sample_src_positions = torch.zeros(1, dtype=torch.int64)
+    spec.input_buffers = SimpleNamespace(
+        positions=torch.zeros(1), query_start_loc=torch.tensor([0, 1])
+    )
+    spec.use_fused_multi_step_decode = fused
+    spec.prefill_cudagraph_manager = spec.decode_cudagraph_manager = None
+    spec._copy_request_inputs = spec._prepare_eplb_forward = lambda *args: None
+    spec.share_mtp_topk_indices = True
+    hooks = SimpleNamespace(set_skip_topk=Mock(), compact_topk_indices=Mock())
+    spec.model = SimpleNamespace(model=hooks)
+    steps = []
+
+    def generate(step):
+        steps.append(step)
+        spec.draft_tokens[0, step] = 100 + step
+
+    spec._prefill = lambda *args, **kwargs: generate(0)
+    spec._generate_draft = lambda *args, **kwargs: generate(
+        spec.current_draft_step.item()
+    )
+    for name in ("prepare_prefill_inputs", "prepare_decode_inputs"):
+        monkeypatch.setattr(spec_module, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        spec_module,
+        "dispatch_cg_and_sync_dp",
+        lambda manager, reqs, tokens, *args, **kwargs: (
+            BatchExecutionDescriptor(CUDAGraphMode.NONE, tokens, reqs),
+            None,
+        ),
+    )
+    batch = SimpleNamespace(
+        num_tokens=2,
+        num_tokens_after_padding=2,
+        num_reqs=1,
+        num_scheduled_tokens=torch.tensor([2]),
+        seq_lens_cpu_upper_bound=torch.tensor([4]),
+        seq_lens=torch.tensor([4]),
+        has_prefill=False,
+        idx_mapping=spec.idx_mapping,
+    )
+    for budget in (max_drafts, 1, 2, max_drafts - 1, max_drafts, 1):
+        spec.set_draft_budget(budget)
+        steps.clear()
+        hooks.set_skip_topk.reset_mock()
+        hooks.compact_topk_indices.reset_mock()
+        result = spec.propose(
+            batch,
+            {},
+            {},
+            torch.ones(2, 3),
+            None,
+            *[torch.ones(1, dtype=torch.int64) for _ in range(6)],
+            skip_attn_for_dummy_run=True,
+            dummy_run=True,
+        )
+        assert steps == list(range(budget))
+        assert result.tolist() == [
+            list(range(100, 100 + budget)) + [-1] * (max_drafts - budget)
+        ]
+        assert hooks.compact_topk_indices.call_count == int(budget > 1)
+        assert [call.args[0] for call in hooks.set_skip_topk.call_args_list] == (
+            [False, True, False] if budget > 1 else [False]
+        )
+    for invalid in (0, max_drafts + 1):
+        with pytest.raises(ValueError, match="budget"):
+            spec.set_draft_budget(invalid)
+
+
 def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(
     monkeypatch,
 ):

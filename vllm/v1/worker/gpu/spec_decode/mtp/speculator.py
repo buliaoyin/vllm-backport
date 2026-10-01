@@ -1,8 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import torch
 import torch.nn as nn
 
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.spec_decode.dynamic.adaptive import (
+    uses_scheduler_adaptive_verification,
+)
+from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+    SpeculatorCudaGraphManager,
+)
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
@@ -11,6 +20,51 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        self.dynamic_draft = uses_scheduler_adaptive_verification(vllm_config)
+        self._active_draft_tokens = self.num_speculative_steps
+        self._decode_managers: dict[int, SpeculatorCudaGraphManager] = {}
+
+    @property
+    def num_draft_tokens(self) -> int:
+        return getattr(self, "_active_draft_tokens", self.num_speculative_steps)
+
+    def set_draft_budget(self, drafts: int) -> None:
+        if not self.dynamic_draft:
+            return
+        if not 1 <= drafts <= self.num_speculative_steps:
+            raise ValueError("MTP draft budget exceeds the configured maximum")
+        self._active_draft_tokens = drafts
+        if self._decode_managers and drafts > 1:
+            self.decode_cudagraph_manager = self._decode_managers[drafts]
+
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        super().init_cudagraph_manager(cudagraph_mode)
+        if not self.dynamic_draft or not self.use_fused_multi_step_decode:
+            return
+        manager = self.decode_cudagraph_manager
+        assert manager is not None
+        self._decode_managers[self.num_speculative_steps] = manager
+        for drafts in range(2, self.num_speculative_steps):
+            self._decode_managers[drafts] = SpeculatorCudaGraphManager(
+                self.vllm_config,
+                self.device,
+                manager.cudagraph_mode,
+                decode_query_len=1,
+                fixed_decode_query_len=True,
+            )
+
+    def capture(self) -> None:
+        super().capture()
+        try:
+            for drafts in sorted(self._decode_managers, reverse=True):
+                if drafts != self.num_speculative_steps:
+                    self.set_draft_budget(drafts)
+                    self._capture_decode()
+        finally:
+            self.set_draft_budget(self.num_speculative_steps)
 
     def load_draft_model(
         self,
@@ -44,7 +98,7 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         # Step 0 (prefill) wrote topk indices for every query token in the
         # multi-token batch. Compact them down to each request's last token so
         # steps 1+ can reuse them from the shared buffer.
-        if self.share_mtp_topk_indices and self.num_speculative_steps > 1:
+        if self.share_mtp_topk_indices and self.num_draft_tokens > 1:
             self.model.model.compact_topk_indices(self.last_token_indices[:num_reqs])
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None:

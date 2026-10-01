@@ -72,6 +72,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     def on_multi_step_decode_end(self, num_reqs: int) -> None: ...
 
     @property
+    def num_draft_tokens(self) -> int:
+        return self.num_speculative_steps
+
+    @property
     def advance_draft_positions(self) -> bool:
         """
         Whether to increment positions and seq_lens between draft steps.
@@ -145,6 +149,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=1,
+            fixed_decode_query_len=True,
         )
 
     def capture(self) -> None:
@@ -178,7 +183,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self.on_prefill_end(self.max_num_reqs)
 
-        if self.num_speculative_steps == 1:
+        self._capture_decode()
+
+    def _capture_decode(self) -> None:
+        if self.num_draft_tokens == 1:
             return
 
         self.on_multi_step_decode_begin(self.max_num_reqs)
@@ -234,8 +242,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         max_query_len = input_batch.num_scheduled_tokens.max()
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
-            max_seq_len + self.num_speculative_steps, self.max_model_len
+            max_seq_len + self.num_draft_tokens, self.max_model_len
         )
+        if self.num_draft_tokens < self.num_speculative_steps:
+            self.draft_tokens[:num_reqs, self.num_draft_tokens :].fill_(-1)
 
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
@@ -320,9 +330,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
         self.on_prefill_end(num_reqs)
 
-        if self.num_speculative_steps == 1:
-            # Early exit.
-            return self.draft_tokens[:num_reqs, :1]
+        if self.num_draft_tokens == 1:
+            return self.draft_tokens[:num_reqs]
 
         # Prepare the inputs for the decode steps.
         prepare_decode_inputs(
@@ -506,7 +515,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         attn_metadata = None
         slot_mappings_by_layer = None
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, self.num_draft_tokens):
             # Rebuild every step when positions advance, or just once
             # on the first step when positions are constant (Gemma4 MTP).
             if not skip_attn and (self.advance_draft_positions or step == 1):
@@ -609,7 +618,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             else []
         )
 
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, self.num_draft_tokens):
             self.current_draft_step.fill_(step)
             self._generate_draft(
                 num_reqs,
@@ -620,7 +629,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode,
             )
             if (
-                step < self.num_speculative_steps - 1
+                step < self.num_draft_tokens - 1
                 and attn_metadata is not None
                 and self.advance_draft_positions
             ):
@@ -678,7 +687,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.sample_src_positions,
             num_reqs,
             self.max_model_len,
-            self.num_speculative_steps,
+            self.num_draft_tokens,
             advance_draft_positions=self.advance_draft_positions,
         )
         self._fence_draft_inputs()

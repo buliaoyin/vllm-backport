@@ -19,7 +19,10 @@ from .utils import create_requests, create_scheduler
 pytestmark = pytest.mark.cpu_test
 
 
-def test_hybrid_adaptive_budget_changes_preserve_pp_output_fences(monkeypatch):
+@pytest.mark.parametrize("align_decodes", [False, True])
+def test_hybrid_adaptive_budget_changes_preserve_pp_output_fences(
+    monkeypatch, align_decodes
+):
     from vllm.v1.spec_decode.dynamic.adaptive import AdaptiveDraftBudget
 
     scheduler = create_scheduler(
@@ -29,6 +32,7 @@ def test_hybrid_adaptive_budget_changes_preserve_pp_output_fences(monkeypatch):
         speculative_method="ngram_gpu",
     )
     scheduler.pp_size = 4
+    scheduler.align_hybrid_decodes = align_decodes
     budget = scheduler.adaptive_draft_budget = AdaptiveDraftBudget(7)
     requests = create_requests(num_requests=1, num_tokens=32, max_tokens=128)
     request = requests[0]
@@ -770,7 +774,7 @@ def _assert_positions_consistent(req, engine: PipelinedEngine) -> None:
         )
 
 
-@pytest.mark.parametrize("num_spec", [0, 3])
+@pytest.mark.parametrize("num_spec", [0, 1, 3, 5])
 def test_hybrid_decode_batches_join_after_the_pipeline_output_fence(num_spec):
     scheduler = _create_async_pp_scheduler(num_spec, pp_size=4, num_blocks=100)
     scheduler.align_hybrid_decodes = True

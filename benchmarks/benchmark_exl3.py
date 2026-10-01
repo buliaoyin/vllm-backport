@@ -46,7 +46,11 @@ class VllmBackend:
             max_num_batched_tokens=args.chunk_size,
             enforce_eager=args.eager,
             speculative_config=(
-                {"method": "mtp", "num_speculative_tokens": args.mtp}
+                {
+                    "method": "mtp",
+                    "num_speculative_tokens": args.mtp,
+                    "enable_adaptive_verification": args.adaptive_mtp,
+                }
                 if args.mtp
                 else None
             ),
@@ -302,6 +306,7 @@ def main():
     parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--mtp", type=int, default=0, help="vLLM MTP draft tokens")
+    parser.add_argument("--adaptive-mtp", action="store_true")
     parser.add_argument(
         "--synchronize-inputs",
         action="store_true",
@@ -329,6 +334,8 @@ def main():
         parser.error("--synchronize-inputs requires the vllm backend")
     if args.mtp < 0 or (args.mtp and args.backend != "vllm"):
         parser.error("--mtp requires a nonnegative count and the vllm backend")
+    if args.adaptive_mtp and not args.mtp:
+        parser.error("--adaptive-mtp requires --mtp")
     if args.eval_batch_size is None:
         args.eval_batch_size = args.batch_size
     if not 1 <= args.eval_batch_size <= args.batch_size:
@@ -620,6 +627,8 @@ def main():
         result["runtime_after"] = backend.llm.collective_rpc("get_exl3_runtime_state")
         save()
     print("SAVED", args.output, flush=True)
+    if args.backend == "vllm":
+        backend.llm.llm_engine.engine_core.shutdown(timeout=20)
 
 
 if __name__ == "__main__":

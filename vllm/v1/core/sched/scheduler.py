@@ -72,6 +72,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.adaptive import (
     ConfidenceDraftBudget,
+    MTPDraftBudget,
     uses_scheduler_adaptive_verification,
 )
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -292,8 +293,13 @@ class Scheduler(SchedulerInterface):
         self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
         self.adaptive_draft_budget = (
-            ConfidenceDraftBudget(self.num_spec_tokens)
-            if uses_scheduler_adaptive_verification(vllm_config)
+            (
+                MTPDraftBudget(self.num_spec_tokens)
+                if speculative_config.method == "mtp"
+                else ConfidenceDraftBudget(self.num_spec_tokens)
+            )
+            if speculative_config is not None
+            and uses_scheduler_adaptive_verification(vllm_config)
             else None
         )
         self._last_draft_budget_log = 0.0
@@ -625,6 +631,7 @@ class Scheduler(SchedulerInterface):
         adaptive_requests: set[str] = set()
         adaptive_drafts = self.num_spec_tokens
         if self.adaptive_draft_budget is not None:
+            assert self.vllm_config.speculative_config is not None
             adaptive_budget = self.adaptive_draft_budget
             adaptive_budget.retain_requests(self.requests.keys())
             eligible = [
@@ -646,14 +653,23 @@ class Scheduler(SchedulerInterface):
             now = time.monotonic()
             if eligible and now - self._last_draft_budget_log >= 5:
                 logger.info(
-                    "Adaptive DSpark drafting: requests=%d, next K=%d/%d, "
+                    "Adaptive %s drafting: requests=%d, next K=%d/%d, "
                     "mixed=%s, completed verification rounds=%s",
+                    self.vllm_config.speculative_config.method,
                     len(eligible),
                     adaptive_drafts,
                     self.num_spec_tokens,
                     adaptive_mixed,
                     dict(sorted(adaptive_budget.counts.items())),
                 )
+                if isinstance(adaptive_budget, MTPDraftBudget):
+                    extension_stats = adaptive_budget.extension_stats(
+                        [r.request_id for r in eligible],
+                        max(r.num_tokens for r in eligible),
+                        adaptive_mixed,
+                    )
+                    if extension_stats:
+                        logger.info("Adaptive mtp extension: %s", extension_stats)
                 self._last_draft_budget_log = now
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1553,6 +1569,7 @@ class Scheduler(SchedulerInterface):
         )
 
         if self.adaptive_draft_budget is not None:
+            assert self.vllm_config.speculative_config is not None
             drafts = {
                 req_id: len(tokens)
                 for req_id, tokens in scheduled_spec_decode_tokens.items()
@@ -1564,6 +1581,11 @@ class Scheduler(SchedulerInterface):
                 max((self.requests[r].num_tokens for r in drafts), default=0),
                 adaptive_mixed,
                 drafts,
+                proposal_drafts=(
+                    num_spec_tokens_to_schedule
+                    if self.vllm_config.speculative_config.method == "mtp"
+                    else None
+                ),
             )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

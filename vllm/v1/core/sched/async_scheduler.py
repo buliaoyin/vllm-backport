@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -16,13 +17,22 @@ class AsyncScheduler(Scheduler):
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size
         extra = self.vllm_config.additional_config
-        self.align_hybrid_decodes = (
-            self.pp_size > 1
-            and self.use_v2_model_runner
-            and isinstance(extra, dict)
+        cpu_hybrid = (
+            isinstance(extra, dict)
             and extra.get("ced_prefill", False)
             and "deepseek_v41_hybrid" in extra
         )
+        model = self.vllm_config.model_config
+        exl3_glm = (
+            envs.VLLM_EXL3_PP_DECODE_BATCHING
+            and model.quantization == "exl3"
+            and model.hf_config.model_type in ("glm5_next", "glm5_next_text")
+        )
+        self.align_hybrid_decodes = (
+            self.pp_size > 1 and self.use_v2_model_runner and (cpu_hybrid or exl3_glm)
+        )
+        if exl3_glm and self.align_hybrid_decodes:
+            logger.info("Batching EXL3 GLM5Next pipeline decodes after output fences.")
         self._decode_phase: int | None = None
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
