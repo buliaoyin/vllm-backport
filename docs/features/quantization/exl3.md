@@ -46,6 +46,11 @@ checkpoint directory does not need modification. MTP runs on the final pipeline
 rank and shares the target output head; under PP it loads an additional embedding
 on that rank.
 
+Qwen3.5 MTP also loads EXL3 `mtp.*` weights from the main shards, including the
+Qwen3.8-27B dense checkpoint. The draft reads its own quantization metadata so
+the target's multimodal weight-name mapping cannot discard its MTP projections
+or rename its output head. It then shares the loaded target head.
+
 For the three-CMP-170HX GLM checkpoint used in validation, start with one draft
 token and an explicit KV budget:
 
@@ -70,9 +75,11 @@ This prevents chunked prefill from leaving concurrent requests in permanently
 separate small decode batches. It applies with or without MTP. Set
 `VLLM_EXL3_PP_DECODE_BATCHING=0` before startup to restore independent phases.
 
-### Adaptive GLM5Next MTP
+### Adaptive GLM5Next and Qwen3.5 MTP
 
-Single-layer GLM5Next MTP supports a scheduler-selected draft length:
+Single-layer GLM5Next and Qwen3.5 MTP support a scheduler-selected draft length.
+This includes Qwen3.8-27B checkpoints with the `Qwen3_5ForConditionalGeneration`
+architecture and one `text_config.mtp_num_hidden_layers` layer:
 
 ```bash
 --speculative-config '{"method": "mtp", "num_speculative_tokens": 3, "enable_adaptive_verification": true}'
@@ -80,7 +87,7 @@ Single-layer GLM5Next MTP supports a scheduler-selected draft length:
 
 The configured token count is the maximum. The scheduler chooses a common
 length from 1 through that maximum for each pipeline batch, using observed
-acceptance and elapsed step costs. GLM does not need a confidence head: this
+acceptance and elapsed step costs. These models do not need a confidence head: this
 path learns from verified drafts. Single-request decoding smooths rejection
 bursts and requires stronger evidence to shorten a budget than to lengthen it.
 Concurrent batches track acceptance faster, require a larger predicted gain to
@@ -93,7 +100,7 @@ predicted marginal benefit to justify a bounded trial. Each trial collects
 three matching proposal/verification timings, with at most 12 decisions.
 Trial cost predictions use measured longer-budget timings when available.
 A promising completed K=4 trial can immediately test K=5 with a 1% predicted
-gain; retaining the longer budget still requires a measured 3% gain.
+gain; promoting the longer budget still requires a measured 3% gain.
 Unprofitable trials back off from 128 to at most 1024 decisions; improving
 prefix acceptance can reopen exploration. Longer budgets require a 3% gain to
 grow, but drop when the shorter policy predicts a 1% advantage, with a two-step
@@ -101,6 +108,10 @@ hold. Recent excess trial and transition costs also penalize subsequent trials.
 Longer shapes never supply timing samples to the three-draft policy.
 Each prefix position retains its own last 32 observations, so shorter rounds
 cannot evict evidence needed for the next longer trial. Suffix observations
+estimate acceptance conditioned on the preceding position being accepted.
+The scheduler multiplies these rates by the current request's prefix probability
+before averaging across requests, so a declining prefix reduces the predicted
+suffix benefit even while older suffix observations remain available. Observations
 expire after 1024 decisions involving their request, matching the maximum retry
 interval; other requests do not age them. A recovery from low prefix acceptance
 also clears stale suffix observations before probing again.
@@ -187,12 +198,21 @@ extends the two tested checkpoints to 65536 input tokens with one or four
 submitted requests. The report records hardware, cache capacity, timing and
 basic retrieval checks; this does not establish a general context limit.
 Multimodal generation outside the validated GLM5Next image path (including
-video), speculative decoding outside GLM5Next MTP, LoRA, CPU offload, sleep mode,
+video), speculative decoding outside GLM5Next and single-layer Qwen3.5 MTP,
+LoRA, CPU offload, sleep mode,
 expert load balancing, and distributed
 tensor/expert sharding are not validated.
 Shared experts run serially because upstream GEMMs share a device-wide lock
 workspace. Dual batch overlap is explicitly rejected.
 Do not infer support for those features from model architecture support alone.
+
+Qwen3.8-27B EXL3 MTP text validation covers fixed K=3 and adaptive maximum
+K=3/5 on one GPU, plus adaptive maximum K=5 with three CMP 170HX GPUs in PP.
+The scheduler changes actual draft calls and preserves accepted GDN states when
+the next verification is shorter. Prefix-cache reuse with Qwen MTP is not
+validated; the current hybrid cache-group fallback can disable reuse. These
+MTP checks use prefix caching disabled and do not establish multimodal MTP
+support or a general throughput advantage over fixed drafting.
 
 Native prefill computes EXL3 products with FP16 operands; BF16 inputs and
 outputs are converted at the operation boundary. Supported large SM80 MoE

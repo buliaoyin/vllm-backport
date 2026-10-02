@@ -128,6 +128,14 @@ class Exl3Config(QuantizationConfig):
         self.prefill_workspaces: dict[tuple, list[torch.Tensor]] = {}
         self.prefill_disabled: set[torch.device] = set()
 
+    def share_workspaces(self, source: "Exl3Config") -> None:
+        """Reuse serialized target/draft buffers with independent weight metadata."""
+        self.workspaces = source.workspaces
+        self.m32_locks = source.m32_locks
+        self.decode_workspaces = source.decode_workspaces
+        self.prefill_workspaces = source.prefill_workspaces
+        self.prefill_disabled = source.prefill_disabled
+
     @classmethod
     def get_name(cls):
         return "exl3"

@@ -14,13 +14,20 @@ if TYPE_CHECKING:
 
 
 def supports_adaptive_mtp(spec: "SpeculativeConfig") -> bool:
+    if getattr(spec, "method", None) != "mtp":
+        return False
     draft = getattr(spec, "draft_model_config", None)
     hf_config = getattr(draft, "hf_config", None)
-    return (
-        getattr(spec, "method", None) == "mtp"
-        and getattr(hf_config, "model_type", None) == "glm5_next_mtp"
-        and getattr(hf_config, "num_nextn_predict_layers", 1) == 1
-    )
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type == "glm5_next_mtp":
+        return getattr(hf_config, "num_nextn_predict_layers", 1) == 1
+    if model_type == "qwen3_5_mtp":
+        architectures = getattr(hf_config, "architectures", None) or []
+        return (
+            architectures in (["Qwen3_5MTP"], ["Qwen3_5MoeMTP"])
+            and getattr(hf_config, "n_predict", None) == 1
+        )
+    return False
 
 
 def uses_scheduler_adaptive_verification(config: "VllmConfig") -> bool:
@@ -554,7 +561,7 @@ class MTPDraftExtension:
     def __init__(self, parent: MTPDraftBudget) -> None:
         self.parent = parent
         self.core = MTPDraftBudget(3)
-        self.observed: dict[str, dict[int, deque[tuple[int, bool]]]] = {}
+        self.observed: dict[str, dict[int, deque[tuple[int, int]]]] = {}
         self.clocks: dict[str, int] = {}
         self.extensions: dict[
             tuple[str | None, tuple[int, int, bool]], MTPExtensionCosts
@@ -576,19 +583,20 @@ class MTPDraftExtension:
                     observed.popleft()
             if len(observed) < (self.prefix_samples if position <= 3 else 3):
                 return None
-            values.append(sum(value for _, value in observed) / (len(observed) + 1))
-        value = sum(values) / len(values)
-        if position == 3:
-            prefix = sum(
-                math.prod(self.core.requests[r].conditional[:3]) for r in req_ids
-            ) / len(req_ids)
-            value = min(value, prefix)
-        if position > 3:
-            earlier = self.probability(req_ids, position - 1)
-            if earlier is None:
-                return None
-            value = min(value, earlier)
-        return value
+            successes = sum(accepted >= position for _, accepted in observed)
+            if position == 3:
+                prefix = math.prod(self.core.requests[req_id].conditional[:3])
+                values.append(min(successes / (len(observed) + 1), prefix))
+            else:
+                preceding = self.probability([req_id], position - 1)
+                if preceding is None:
+                    return None
+                # A stale marginal rate must not overvalue a changing prefix.
+                opportunities = sum(
+                    accepted >= position - 1 for _, accepted in observed
+                )
+                values.append(preceding * successes / max(1, opportunities))
+        return sum(values) / len(values)
 
     def yields(self, req_ids: list[str], k: int) -> float | None:
         value = sum(self.core.requests[r].expected(min(k, 3)) for r in req_ids)
@@ -801,7 +809,7 @@ class MTPDraftExtension:
                     # Short rounds must not evict evidence for unverified suffixes.
                     for position in range(3, k + 1):
                         observed.setdefault(position, deque(maxlen=32)).append(
-                            (self.clocks.get(r, 0), accepted >= position)
+                            (self.clocks.get(r, 0), accepted)
                         )
             if all(
                 r in self.parent.requests and sampled.get(r, 0) > 0 for r in req_ids

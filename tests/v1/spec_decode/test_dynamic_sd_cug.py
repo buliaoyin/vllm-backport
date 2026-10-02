@@ -152,9 +152,9 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
 
 
 @pytest.mark.parametrize("sparse,hybrid", [(False, True), (True, True), (True, False)])
-@pytest.mark.parametrize("mtp", [False, True])
+@pytest.mark.parametrize("mtp_type", [None, "glm5_next_mtp", "qwen3_5_mtp"])
 def test_adaptive_budgets_keep_full_graphs_with_sparse_capture_sizes(
-    monkeypatch, sparse, hybrid, mtp
+    monkeypatch, sparse, hybrid, mtp_type
 ):
     """A smaller graph for another K must not hide this K's compatible graph."""
     monkeypatch.setattr(
@@ -169,11 +169,14 @@ def test_adaptive_budgets_keep_full_graphs_with_sparse_capture_sizes(
     if hybrid:
         config.additional_config = {"deepseek_v41_hybrid": {}}
         config.speculative_config.enable_adaptive_verification = True
-        if mtp:
+        if mtp_type:
             config.additional_config = {}
             config.speculative_config.method = "mtp"
             config.speculative_config.draft_model_config.hf_config = SimpleNamespace(
-                model_type="glm5_next_mtp", num_nextn_predict_layers=1
+                model_type=mtp_type,
+                architectures=["Qwen3_5MTP"],
+                num_nextn_predict_layers=1,
+                n_predict=1,
             )
     if sparse:
         config.compilation_config.cudagraph_capture_sizes = [
@@ -204,7 +207,7 @@ def test_adaptive_budgets_keep_full_graphs_with_sparse_capture_sizes(
                 assert desc.num_tokens == requests * length
 
     # Each draft decode manager captures its own fixed query shape.
-    draft_query_length = 1 if mtp else 7
+    draft_query_length = 1 if mtp_type else 7
     draft_manager = gpu_cudagraph_utils.CudaGraphManager(
         config,
         torch.device("cpu"),

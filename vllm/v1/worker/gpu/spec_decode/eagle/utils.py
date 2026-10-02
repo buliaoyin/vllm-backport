@@ -75,6 +75,17 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    if getattr(draft_model_config, "quantization", None) == "exl3":
+        from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+        from vllm.model_executor.models.utils import get_draft_quant_config
+
+        # The target mapper may rename the output head and discard MTP tensors.
+        draft_quant_config = get_draft_quant_config(vllm_config)
+        if isinstance(draft_quant_config, Exl3Config) and isinstance(
+            vllm_config.quant_config, Exl3Config
+        ):
+            draft_quant_config.share_workspaces(vllm_config.quant_config)
+        vllm_config = replace(vllm_config, quant_config=draft_quant_config)
     if speculative_config.moe_backend is not None:
         # Otherwise the draft inherits the target's --moe-backend, which
         # fails when the draft is unquantized and that backend is not.

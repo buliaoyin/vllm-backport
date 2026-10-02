@@ -3,6 +3,7 @@
 """EXL3 loading preserves independently rotated matrices and expert identities."""
 
 import json
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +73,80 @@ def test_header_metadata_preserves_per_projection_bits(tmp_path):
                 getattr(layer, key)[offset : offset + size].view(shape), tensor
             )
     assert layer.trellis.numel() == a["trellis"].numel() + b["trellis"].numel()
+
+
+def test_draft_loading_keeps_target_and_mtp_metadata_independent(tmp_path, monkeypatch):
+    """A target mapper must not drop the drafter's quantized head or MTP weights."""
+    from vllm.config import CompilationMode, LoadConfig
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils
+
+    weights = _weights()
+    save_file(
+        {
+            f"{name}.{k}": v.clone()
+            for name in ("lm_head", "mtp.fc")
+            for k, v in weights.items()
+        },
+        tmp_path / "model.safetensors",
+    )
+    target = Exl3Config({})
+    target.maybe_update_config(str(tmp_path))
+    target.apply_vllm_mapper(
+        WeightsMapper(
+            orig_to_new_prefix={"lm_head.": "language_model.lm_head.", "mtp.": None}
+        )
+    )
+    draft_config = SimpleNamespace(quantization="exl3", model=str(tmp_path))
+    spec = SimpleNamespace(
+        draft_model_config=draft_config,
+        moe_backend=None,
+        kv_cache_dtype=None,
+        attention_backend=None,
+        enforce_eager=False,
+    )
+
+    @dataclass
+    class Config:
+        quant_config: Exl3Config
+        speculative_config: object
+        load_config: object
+        compilation_config: object
+
+    config = Config(
+        quant_config=target,
+        speculative_config=spec,
+        load_config=LoadConfig(),
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+    )
+
+    class Loaded(Exception):
+        pass
+
+    def fresh_quant(model_config, load_config):
+        draft = Exl3Config({})
+        draft.maybe_update_config(model_config.model)
+        return draft
+
+    def load(*, vllm_config, model_config):
+        quant = vllm_config.quant_config
+        configure_quant_config(quant, Qwen3_5MTP)
+        assert quant.resolve("lm_head")[0].quantized
+        assert quant.resolve("mtp.fc")[0].quantized
+        assert quant.workspaces is target.workspaces
+        assert quant.prefill_workspaces is target.prefill_workspaces
+        assert quant.decode_workspaces is target.decode_workspaces
+        assert quant.m32_locks is target.m32_locks
+        assert quant.prefill_disabled is target.prefill_disabled
+        raise Loaded
+
+    monkeypatch.setattr(utils.VllmConfig, "get_quantization_config", fresh_quant)
+    monkeypatch.setattr(utils, "get_model", load)
+    with pytest.raises(Loaded):
+        utils.load_eagle_model(nn.Module(), config)
+    assert config.quant_config is target
+    assert set(target.matrices) == {"language_model.lm_head"}
 
 
 @pytest.mark.parametrize("indexed_mtp", [False, True])

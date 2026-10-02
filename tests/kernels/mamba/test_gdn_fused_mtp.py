@@ -237,18 +237,20 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
 
 
 @pytest.mark.parametrize(
-    "seq_lens,query_lens,draft_tokens,expected_fused_calls",
+    "seq_lens,query_lens,draft_tokens,accepted,expected_fused_calls",
     [
-        pytest.param([128], [SPEC_TOKENS], [NUM_SPEC], 1, id="pure-mtp"),
+        pytest.param([128], [SPEC_TOKENS], [NUM_SPEC], 1, 1, id="pure-mtp"),
+        pytest.param([128], [2], [1], 4, 1, id="adaptive-shrink-after-acceptance"),
         pytest.param(
             [128, 96],
             [SPEC_TOKENS, 64],
             [NUM_SPEC, -1],
+            1,
             0,
             id="mixed-mtp-falls-back",
         ),
-        pytest.param([96], [64], [-1], 0, id="pure-prefill"),
-        pytest.param([128], [1], [-1], 0, id="pure-decode"),
+        pytest.param([96], [64], [-1], 1, 0, id="pure-prefill"),
+        pytest.param([128], [1], [-1], 1, 0, id="pure-decode"),
     ],
 )
 @pytest.mark.parametrize("output_gate_activation", ["silu", "sigmoid"])
@@ -257,6 +259,7 @@ def test_fused_model_path_matches_reference(
     seq_lens: list[int],
     query_lens: list[int],
     draft_tokens: list[int],
+    accepted: int,
     expected_fused_calls: int,
     output_gate_activation: str,
 ) -> None:
@@ -284,8 +287,8 @@ def test_fused_model_path_matches_reference(
         metadata = builder.build(
             common_prefix_len=0,
             common_attn_metadata=common,
-            num_accepted_tokens=torch.ones(
-                batch.batch_size, dtype=torch.int32, device=device
+            num_accepted_tokens=torch.full(
+                (batch.batch_size,), accepted, dtype=torch.int32, device=device
             ),
             num_decode_draft_tokens_cpu=torch.tensor(draft_tokens, dtype=torch.int32),
         )

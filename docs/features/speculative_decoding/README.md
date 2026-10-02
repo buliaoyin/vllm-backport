@@ -37,7 +37,7 @@ depend on your model family, traffic pattern, hardware, and sampling settings.
 | Suffix decoding | Low to medium gain | Medium gain | No extra draft model; dynamic speculation depth. |
 | Custom Proposer | Varies | Varies | Bring your own proposer class (experimental). |
 | Dynamic Speculative Decoding | High gain | Higher than base SD method | Useful for RL or workload with fluctuating QPS |
-| Adaptive Verification | High gain | Higher than base SD method | Sizes verification per request from drafter confidence; currently DSpark only. |
+| Adaptive Verification | Workload dependent | Higher than base SD method | DSpark uses drafter confidence; single-layer GLM5Next/Qwen3.5 MTP uses observed acceptance and step costs. |
 
 For reproducible measurements in your environment, use
 [`examples/features/speculative_decoding/spec_decode_offline.py`](../../../examples/features/speculative_decoding/spec_decode_offline.py)

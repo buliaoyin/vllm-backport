@@ -1173,7 +1173,8 @@ def test_dspark_query_prefix_reserves_full_backbone_slots(
 
 
 @pytest.mark.parametrize("layers", [1, 2])
-def test_glm_mtp_adaptive_scheduler_validates_execution_mode(layers):
+@pytest.mark.parametrize("model_type", ["glm5_next_mtp", "qwen3_5_mtp"])
+def test_mtp_adaptive_scheduler_validates_execution_mode(layers, model_type):
     from vllm.v1.spec_decode.dynamic.adaptive import (
         uses_scheduler_adaptive_verification,
     )
@@ -1186,7 +1187,10 @@ def test_glm_mtp_adaptive_scheduler_validates_execution_mode(layers):
             dspark_num_query_tokens=None,
             draft_model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(
-                    model_type="glm5_next_mtp", num_nextn_predict_layers=layers
+                    model_type=model_type,
+                    architectures=["Qwen3_5MTP"],
+                    num_nextn_predict_layers=layers,
+                    n_predict=layers,
                 )
             ),
         ),

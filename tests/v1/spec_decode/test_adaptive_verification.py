@@ -361,6 +361,57 @@ def test_mtp_long_shapes_preserve_short_policy_timing(verified, proposal):
     assert core.requests["request"].conditional[0] > 0.75
 
 
+@pytest.mark.parametrize("num_reqs", [1, 8])
+def test_mtp_suffix_yield_follows_current_prefix_acceptance(num_reqs):
+    """A changing prefix must not turn 50% suffix acceptance into certainty."""
+    budget = MTPDraftBudget(5)
+    req_ids = [str(i) for i in range(num_reqs)]
+    for step in range(48):
+        budget.choose(req_ids, 4096, False)
+        k = 1 if 32 <= step < 40 else 5
+        accepted = (3 if step % 2 else 5) if step < 32 else 0
+        budget.scheduled(
+            step,
+            float(step),
+            4096,
+            False,
+            dict.fromkeys(req_ids, k),
+            proposal_drafts=k,
+        )
+        budget.complete(step, step + 0.05, dict.fromkeys(req_ids, accepted + 1))
+        if step in (39, 47):
+            prefix = budget.extension_stats(req_ids, 4096, False)["prefix_acceptance"]
+            assert prefix[4] == pytest.approx(prefix[3] * 0.5, abs=0.002)
+            assert prefix[5] == pytest.approx(prefix[4], abs=0.002)
+
+
+def test_mtp_batch_suffix_score_averages_request_survival_probabilities():
+    """A reliable request's suffix must not inherit another request's prefix."""
+    budget = MTPDraftBudget(5)
+    req_ids = ["stable", "changing"]
+    for step in range(48):
+        budget.choose(req_ids, 4096, False)
+        if step < 32:
+            drafts = dict.fromkeys(req_ids, 5)
+            sampled = {"stable": 4 if step % 2 else 6, "changing": 6}
+        else:
+            drafts = {"stable": 3, "changing": 1}
+            sampled = {"stable": 4, "changing": 1}
+        budget.scheduled(step, float(step), 4096, False, drafts)
+        budget.complete(step, step + 0.05, sampled)
+    batched = budget.extension_stats(req_ids, 4096, False)["prefix_acceptance"]
+    individual = []
+    for req_id in req_ids:
+        budget.choose([req_id], 4096, False)
+        individual.append(
+            budget.extension_stats([req_id], 4096, False)["prefix_acceptance"]
+        )
+    for position in (4, 5):
+        assert batched[position] == pytest.approx(
+            sum(p[position] for p in individual) / len(individual), abs=0.002
+        )
+
+
 def test_mtp_cancelled_long_request_cannot_recreate_feedback():
     budget = MTPDraftBudget(5)
     budget.choose(["request"], 4096, False)

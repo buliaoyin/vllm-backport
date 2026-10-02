@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only tests for Qwen3.5 MTP speculative decoding config overrides."""
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from transformers import AutoConfig, PretrainedConfig
 
 from vllm.config.speculative import SpeculativeConfig
+from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+from vllm.v1.spec_decode.dynamic.adaptive import supports_adaptive_mtp
 
 _CHECKPOINTS = {
     "qwen3_5": "Qwen/Qwen3.8-27B",
@@ -60,6 +63,35 @@ def test_mtp_override_recognizes_text_only_types(
     assert cfg.model_type == "qwen3_5_mtp"
     assert cfg.architectures == [expected_arch]
     assert cfg.n_predict == 1
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("layers", [0, 1, 2])
+def test_adaptive_mtp_requires_one_resolved_qwen_layer(wrapped, layers):
+    """The scheduler accepts a single MTP layer in text and wrapper configs."""
+    if wrapped:
+        cfg = Qwen3_5Config(
+            text_config={"mtp_num_hidden_layers": layers},
+            architectures=["Qwen3_5ForConditionalGeneration"],
+        )
+    else:
+        cfg = _mtp_config("qwen3_5_text")
+        cfg.mtp_num_hidden_layers = layers
+    draft = SpeculativeConfig.hf_config_override(cfg)
+    spec = SimpleNamespace(
+        method="mtp", draft_model_config=SimpleNamespace(hf_config=draft)
+    )
+    assert supports_adaptive_mtp(spec) == (layers == 1)
+
+
+def test_adaptive_mtp_excludes_other_models_using_qwen_draft_type():
+    """A shared model_type must not enable an unvalidated MTP architecture."""
+    draft = SpeculativeConfig.hf_config_override(_mtp_config("qwen3_5"))
+    draft.architectures = ["InternS2MobiusMTP"]
+    spec = SimpleNamespace(
+        method="mtp", draft_model_config=SimpleNamespace(hf_config=draft)
+    )
+    assert not supports_adaptive_mtp(spec)
 
 
 @pytest.mark.parametrize(

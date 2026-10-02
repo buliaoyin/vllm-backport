@@ -13,10 +13,10 @@ The practical effect is that one configuration holds up across the whole load ra
 ## Support
 
 The GPU budget described on this page supports DSpark with a **confidence
-head**. A separate scheduler policy supports single-layer GLM5Next MTP without
+head**. A separate scheduler policy supports single-layer GLM5Next and Qwen3.5 MTP without
 a confidence head, including pipeline parallelism. It uses observed acceptance
 and runtime step costs, and changes the number of draft model calls. See
-[adaptive GLM5Next MTP](../quantization/exl3.md#adaptive-glm5next-mtp) for its
+[adaptive MTP](../quantization/exl3.md#adaptive-glm5next-and-qwen35-mtp) for its
 configuration and limitations. DeepSeek V4.1 CPU hybrid deployments also use a
 [scheduler policy](../deepseek_v41_adaptive_verification.md).
 
