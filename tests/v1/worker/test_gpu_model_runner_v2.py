@@ -22,6 +22,36 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
+@pytest.mark.parametrize("with_drafter", [False, True])
+def test_kv_cache_specs_carry_draft_ownership(monkeypatch, with_drafter):
+    """The worker RPC must retain ownership for attention and QSA side caches."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
+    runner.speculator = None
+    if with_drafter:
+        runner.speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+        runner.speculator.draft_attn_layer_names = {"b", "c", "uncached"}
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    ring = CircularBufferSpec(
+        block_size=8, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    specs = {"a": attention, "b": attention, "c": ring}
+    monkeypatch.setattr(
+        model_runner_module, "get_kv_cache_spec", lambda _: specs.copy()
+    )
+
+    result = runner.get_kv_cache_spec()
+
+    assert {name for name, spec in result.items() if spec.is_draft} == (
+        {"b", "c"} if with_drafter else set()
+    )
+    assert result == specs
+    assert not attention.is_draft
+    assert not ring.is_draft
+
+
 @pytest.mark.parametrize("spec_kind", ["circular", "kpool_tail"])
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch, spec_kind):
     """Ring-buffer caches (QSA circular buffer, GLM-5.3 kpool tail) hold one

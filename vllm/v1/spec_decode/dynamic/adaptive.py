@@ -27,6 +27,11 @@ def supports_adaptive_mtp(spec: "SpeculativeConfig") -> bool:
             architectures in (["Qwen3_5MTP"], ["Qwen3_5MoeMTP"])
             and getattr(hf_config, "n_predict", None) == 1
         )
+    if model_type == "qwen4_exp_mtp":
+        return (
+            getattr(hf_config, "architectures", None) == ["Qwen4ExpMTP"]
+            and getattr(hf_config, "n_predict", None) == 1
+        )
     return False
 
 
@@ -50,12 +55,27 @@ def verification_lengths(max_drafts: int) -> tuple[int, ...]:
     return tuple(range(1, max_drafts + 1))
 
 
+def prefers_default_mtp_budget(config: "VllmConfig") -> bool:
+    return bool(
+        uses_scheduler_adaptive_verification(config)
+        and getattr(config.model_config.hf_text_config, "model_type", None)
+        == "qwen4_exp_text"
+        and config.model_config.quantization == "exl3"
+    )
+
+
 @dataclass
 class Acceptance:
     conditional: list[float]
     weight: float = 0.15
+    observations: int = 0
+    verified_prefixes: list[deque[int]] | None = None
 
     def observe(self, verified: int, accepted: int) -> None:
+        self.observations += 1
+        if self.verified_prefixes is not None:
+            for index in range(min(verified, len(self.verified_prefixes))):
+                self.verified_prefixes[index].append(min(index + 1, accepted))
         # Only the accepted prefix and first rejection were actually observed.
         for index in range(min(verified, accepted + 1)):
             self.conditional[index] += self.weight * (
@@ -63,6 +83,10 @@ class Acceptance:
             )
 
     def expected(self, drafts: int) -> float:
+        if self.verified_prefixes is not None and drafts:
+            observed = self.verified_prefixes[drafts - 1]
+            if len(observed) >= 4:
+                return 1 + sum(observed) / len(observed)
         probability = 1.0
         result = 1.0
         for value in self.conditional[:drafts]:
@@ -78,6 +102,7 @@ class BudgetCosts:
     selected: int = 3
     changed: int = -8
     probing: int | None = None
+    refresh_remaining: int = 0
 
 
 class AdaptiveDraftBudget:
@@ -245,15 +270,18 @@ class MTPDraftBudget(AdaptiveDraftBudget):
 
     acceptance_weight = 0.05
 
-    def __init__(self, max_drafts: int):
+    def __init__(self, max_drafts: int, *, prefer_default: bool = False):
         super().__init__(max_drafts)
         self._num_reqs = 1
+        self.prefer_default = prefer_default
         self._extension = MTPDraftExtension(self) if max_drafts > 3 else None
 
     def choose(self, req_ids: list[str], context: int, mixed: bool) -> int:
         self._num_reqs = len(req_ids)
         if self._extension is not None:
             return self._extension.choose(req_ids, context, mixed)
+        if self.prefer_default:
+            return self._choose_from_default(req_ids, context, mixed)
         if self._num_reqs <= 1:
             return super().choose(req_ids, context, mixed)
         for req_id in req_ids:
@@ -283,6 +311,57 @@ class MTPDraftBudget(AdaptiveDraftBudget):
             if drafts not in measured:
                 costs.probing = drafts
             return drafts
+        return self._select(scores, costs)
+
+    def _choose_from_default(
+        self, req_ids: list[str], context: int, mixed: bool
+    ) -> int:
+        if not req_ids:
+            return self.default
+        for req_id in req_ids:
+            if req_id not in self.requests:
+                self.requests[req_id] = Acceptance(
+                    [0.75] * self.max_drafts,
+                    self.acceptance_weight,
+                    verified_prefixes=[deque(maxlen=32) for _ in self.lengths],
+                )
+        costs = self._costs(req_ids, self.key(len(req_ids), context, mixed))
+        costs.decisions += 1
+        if (
+            mixed
+            or len(costs.samples.get(self.default, ())) < 3
+            or min(self.requests[r].observations for r in req_ids) < 32
+        ):
+            return self.default
+        if (
+            costs.selected != self.default
+            and costs.decisions % 32 == 0
+            and sum(self.requests[r].conditional[0] for r in req_ids)
+            >= 0.5 * len(req_ids)
+        ):
+            costs.refresh_remaining = 6
+        if costs.refresh_remaining:
+            costs.refresh_remaining -= 1
+            return self.default
+        measured = {
+            k: statistics.median(v) for k, v in costs.samples.items() if len(v) >= 3
+        }
+        baseline = measured[self.default]
+        scores = {
+            k: sum(self.requests[r].expected(k) for r in req_ids)
+            / measured.get(k, baseline * (1 - 0.10 * (self.default - k)))
+            for k in self.lengths
+        }
+        if costs.probing is not None:
+            if costs.probing not in measured:
+                return costs.probing
+            costs.probing = None
+        best = max(scores, key=scores.__getitem__)
+        if best not in measured:
+            if scores[best] > scores[self.default] * 1.08:
+                costs.probing = best
+                return best
+            return self.default
         return self._select(scores, costs)
 
     def scheduled(
@@ -349,7 +428,12 @@ class MTPDraftBudget(AdaptiveDraftBudget):
 
     def _select(self, scores: dict[int, float], costs: BudgetCosts) -> int:
         best = max(scores, key=scores.__getitem__)
-        if self._num_reqs > 1:
+        if self.prefer_default:
+            if scores[best] <= scores[self.default] * 1.05:
+                best = self.default
+            margin = 1.0 if best == self.default else 1.08
+            hold = 2 if best == self.default else 4
+        elif self._num_reqs > 1:
             margin = 1.03 if best > costs.selected else 1.01
             hold = 2
         else:
@@ -357,8 +441,12 @@ class MTPDraftBudget(AdaptiveDraftBudget):
             margin = 1.005 if best > costs.selected else 1.05
             hold = 8
         if (
-            costs.decisions - costs.changed >= hold
-            and scores[best] > scores[costs.selected] * margin
+            best != costs.selected
+            and (
+                (self.prefer_default and best == self.default)
+                or scores[best] > scores[costs.selected] * margin
+            )
+            and costs.decisions - costs.changed >= hold
         ):
             costs.selected = best
             costs.changed = costs.decisions
@@ -560,7 +648,7 @@ class MTPDraftExtension:
 
     def __init__(self, parent: MTPDraftBudget) -> None:
         self.parent = parent
-        self.core = MTPDraftBudget(3)
+        self.core = MTPDraftBudget(3, prefer_default=parent.prefer_default)
         self.observed: dict[str, dict[int, deque[tuple[int, int]]]] = {}
         self.clocks: dict[str, int] = {}
         self.extensions: dict[
@@ -586,6 +674,8 @@ class MTPDraftExtension:
             successes = sum(accepted >= position for _, accepted in observed)
             if position == 3:
                 prefix = math.prod(self.core.requests[req_id].conditional[:3])
+                if self.parent.prefer_default:
+                    prefix = self.core.requests[req_id].conditional[0]
                 values.append(min(successes / (len(observed) + 1), prefix))
             else:
                 preceding = self.probability([req_id], position - 1)
@@ -619,7 +709,10 @@ class MTPDraftExtension:
         prefix = self.probability(req_ids, drafts - 1)
         if previous is None or prefix is None:
             return 0.0
-        increment = max(measured[3] - measured[2], 0.03 * measured[3])
+        increment = max(
+            measured[3] - measured.get(2, measured[3] * 0.9),
+            0.03 * measured[3],
+        )
         anchor = next(
             (k for k in range(drafts, 3, -1) if len(costs.samples.get(k, ())) >= 3),
             3,
@@ -651,21 +744,37 @@ class MTPDraftExtension:
             state.probing = None
             state.selected = 0
             state.attempts = 0
+        if self.parent.prefer_default and (
+            mixed
+            or any(
+                r not in self.core.requests or self.core.requests[r].observations < 32
+                for r in req_ids
+            )
+        ):
+            state.probing = None
+            return self.core.choose(req_ids, context, mixed)
         if state.probing is not None and state.stable < 3 and state.attempts < 12:
             state.attempts += 1
             return state.probing
         finished = state.probing
         state.probing = None
         fallback = self.core.choose(req_ids, context, mixed)
+        if self.parent.prefer_default and not state.attempts:
+            p3 = self.probability(req_ids, 3)
+            if p3 is not None and p3 < self.prefix_threshold:
+                state.prefix_floor = min(state.prefix_floor, p3)
+                return fallback
         costs = self.core._costs(req_ids, key)
         required = 4 if len(req_ids) == 1 else 3
-        if any(len(costs.samples.get(k, ())) < required for k in self.core.lengths):
+        lengths = (3,) if self.parent.prefer_default else self.core.lengths
+        if any(len(costs.samples.get(k, ())) < required for k in lengths):
             return fallback
-        measured = {k: statistics.median(costs.samples[k]) for k in self.core.lengths}
-        baseline = max(
-            sum(self.core.requests[r].expected(k) for r in req_ids) / measured[k]
-            for k in measured
-        )
+        measured = {
+            k: statistics.median(v)
+            for k, v in costs.samples.items()
+            if k in self.core.lengths and len(v) >= 3
+        }
+        baseline = max((self.yields(req_ids, k) or 0.0) / measured[k] for k in measured)
         parent = self.parent._costs(req_ids, key)
         high: dict[int, float] = {}
         for k in range(4, self.parent.max_drafts + 1):
@@ -675,9 +784,11 @@ class MTPDraftExtension:
                 high[k] = y / (
                     statistics.median(samples) + state.debt / self.amortization
                 )
+        prefer_default = self.parent.prefer_default and len(req_ids) == 1
+        growth = 1.08 if prefer_default else 1.03
+        minimum_score = baseline * 1.05 if prefer_default else baseline / 1.01
         if state.selected in high and (
-            baseline > high[state.selected] * 1.01
-            or self.probability(req_ids, 3) is None
+            high[state.selected] < minimum_score or self.probability(req_ids, 3) is None
         ):
             state.selected = 0
             state.changed = state.decisions
@@ -687,7 +798,7 @@ class MTPDraftExtension:
         margin = 1.03 if best > state.selected else 1.01
         if (
             best
-            and high[best] > baseline * 1.03
+            and high[best] > baseline * growth
             and high[best] > current * margin
             and state.decisions - state.changed >= 2
         ):
@@ -695,7 +806,7 @@ class MTPDraftExtension:
             state.selected = best
             state.changed = state.decisions
         if finished:
-            profitable = finished in high and high[finished] > baseline * 1.03
+            profitable = finished in high and high[finished] > baseline * growth
             state.interval = 128 if profitable else min(1024, state.interval * 2)
             state.next_probe = state.decisions + state.interval
         if promoted:
@@ -745,7 +856,7 @@ class MTPDraftExtension:
                 and p3 >= self.prefix_threshold
             )
             if ready or followup:
-                margin = 1.01 if followup else 1.03
+                margin = 1.01 if followup else growth
                 refresh = (
                     ready
                     and candidate > max(4, state.selected)
@@ -758,7 +869,10 @@ class MTPDraftExtension:
                     )
                 # A rare high-prefix probe can discover a non-linear cheap shape.
                 nonlinear = (
-                    ready and candidate == 4 and p3 >= 0.75 and state.decisions >= 128
+                    ready
+                    and candidate == 4
+                    and p3 >= 0.75
+                    and state.decisions >= (256 if prefer_default else 128)
                 )
                 if candidate != state.selected and (
                     ceiling > reference * margin or nonlinear
@@ -833,7 +947,7 @@ class MTPDraftExtension:
                     }
                     if measured and math.isfinite(elapsed) and elapsed > 0:
                         rate = max(
-                            sum(self.core.requests[r].expected(k) for r in req_ids) / c
+                            (self.yields(req_ids, k) or 0.0) / c
                             for k, c in measured.items()
                         )
                         state.debt = max(

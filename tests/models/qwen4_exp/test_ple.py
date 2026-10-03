@@ -17,6 +17,7 @@ import vllm.models.qwen4_exp.nvidia.ngram_embedding as ngram_embedding_module
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
 )
+from vllm.model_executor.layers.quantization.exl3 import Exl3Tensor
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
@@ -31,6 +32,7 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
+    Qwen4ExpPLEExl3EmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
@@ -58,6 +60,91 @@ def _mock_etp_group(
         "get_tp_group",
         lambda: SimpleNamespace(world_size=world_size),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_exl3_ple_row_lookup_preserves_codec_and_graph_replay(
+    monkeypatch, pinned, bits
+):
+    """Compressed lookups must match ring decoding, including UVA and changed IDs."""
+    _mock_etp_group(monkeypatch)
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    rows, heads = 33, 2
+    packed = torch.randint(-32768, 32767, (rows, 1 + 10 * bits), dtype=torch.int16)
+    scales = torch.linspace(0.01, 0.2, rows, dtype=torch.float16)
+    packed[:, 0] = scales.view(torch.int16)
+    bias = torch.randn(heads, 160, dtype=torch.float16) * 0.1
+    table = {
+        "trellis": Exl3Tensor(tuple(packed.shape), packed.dtype),
+        "head_bias": Exl3Tensor(tuple(bias.shape), bias.dtype),
+        "head_offsets": Exl3Tensor((heads,), torch.int64),
+        "head_vocab_sizes": Exl3Tensor((heads,), torch.int64),
+        "layer_multipliers": Exl3Tensor((3,), torch.int64),
+    }
+    with torch.device("cuda:0"):
+        method = Qwen4ExpPLEExl3EmbeddingMethod(table)
+        cls = Qwen4ExpPLEPinnedHostEmbedding if pinned else Qwen4ExpPLEDeviceEmbedding
+        embedding = cls(
+            rows,
+            160,
+            params_dtype=torch.bfloat16,
+            padding_size=1,
+            prefix="test.ngram_embedding",
+            embedding_method=method,
+            num_ngram_heads=heads,
+            max_total_tokens=3,
+        )
+    embedding.weight.data.copy_(packed)
+    embedding.head_bias.data.copy_(bias)
+
+    stream = (
+        (packed[:, 1:].to(torch.int64) & 65535).unsqueeze(-1) >> torch.arange(16)
+    ) & 1
+    stream = stream.reshape(rows, 160 * bits)
+    columns = torch.arange(160).unsqueeze(-1)
+    state_bits = torch.arange(16).unsqueeze(0)
+    source = ((columns - state_bits // bits) % 160) * bits + state_bits % bits
+    states = (stream[:, source] << state_bits).sum(-1)
+    product = states * 0x83DCD12D & 0xFFFFFFFF
+    total = sum((product >> shift) & 255 for shift in (0, 8, 16, 24)) + 1024
+    inverse = torch.tensor(0x1EEE, dtype=torch.uint16).view(torch.float16).float()
+    offset = torch.tensor(0xC931, dtype=torch.uint16).view(torch.float16).float()
+    codes = (total.float() * inverse + offset).half().float()
+    decoded = codes * scales.float().unsqueeze(-1)
+    ids = torch.tensor([[32, 0], [2, 2], [1, 17]], device="cuda:0")
+
+    def expected():
+        return (decoded[ids.cpu()] + bias.float()).half().cuda()
+
+    lookup = (
+        embedding._lookup
+        if pinned
+        else lambda value: method.embedding(embedding, value)
+    )
+    actual = lookup(ids)
+    torch.testing.assert_close(actual, expected(), rtol=0, atol=0)
+    assert actual.dtype == torch.float16
+    assert embedding.weight.numel() == rows * (1 + 10 * bits)
+    if pinned:
+        assert embedding.weight.is_pinned()
+        embedding.start_prefetch(torch.zeros(3, 1, device="cuda:0"), ids)
+        prefetched = embedding(torch.zeros(3, 1, device="cuda:0"))
+        torch.testing.assert_close(prefetched, actual.flatten(-2), rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = lookup(ids)
+    ids.copy_(torch.tensor([[0, 31], [1, 2], [32, 32]], device="cuda:0"))
+    graph.replay()
+    torch.testing.assert_close(output, expected(), rtol=0, atol=0)
+    for invalid in (-1, rows):
+        ids.fill_(invalid)
+        graph.replay()
+        torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
 
 
 def _make_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:

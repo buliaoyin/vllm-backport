@@ -54,6 +54,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KpoolTailSpec,
@@ -2594,7 +2595,9 @@ def test_get_kv_cache_config_mamba_hybrid_sharing_pp_group_count_bump(monkeypatc
     on instead of silently falling back on stage 0."""
     from vllm.config import ParallelConfig
     from vllm.distributed.utils import get_pp_indices
+    from vllm.platforms import current_platform
 
+    monkeypatch.setattr(current_platform, "device_count", lambda: 4)
     monkeypatch.setattr(ModelConfig, "get_total_num_hidden_layers", lambda self: 45)
     vllm_config = VllmConfig(
         model_config=ModelConfig(max_model_len=8192),
@@ -2624,7 +2627,9 @@ def test_get_kv_cache_config_mamba_hybrid_sharing_pp_group_count_bump(monkeypatc
 def test_get_kv_cache_config_mamba_hybrid_sharing_pp_starved_stage(monkeypatch):
     """Reject PP stages whose Mamba layers have no MLA slot to share."""
     from vllm.config import ParallelConfig
+    from vllm.platforms import current_platform
 
+    monkeypatch.setattr(current_platform, "device_count", lambda: 2)
     monkeypatch.setattr(ModelConfig, "get_total_num_hidden_layers", lambda self: 45)
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "3,42")
     vllm_config = VllmConfig(
@@ -3929,9 +3934,7 @@ def test_draft_group_not_annotated_without_spec_decode():
 
 
 def test_unidentifiable_draft_with_mamba_warns(caplog_vllm):
-    # No group carries the draft marker, so every consumer falls back to
-    # flagging all groups -- including Mamba ones, which then can never report
-    # a hit. That is silent today; it must at least be visible.
+    # Missing ownership triggers conservative handling for every group.
     groups = get_kv_cache_groups(
         _spec_decode_grouping_config(), _hybrid_specs_with_draft(draft=False)
     )
@@ -3949,6 +3952,110 @@ def test_no_warning_when_draft_group_is_identified(caplog_vllm):
     )
 
     assert "could be identified as the draft model's" not in caplog_vllm.text
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("attention_type", [FullAttentionSpec, MLAAttentionSpec])
+def test_draft_ownership_preserves_cache_group_layout(
+    packed, hybrid, attention_type, caplog_vllm
+):
+    """Worker ownership survives merging without splitting identical formats."""
+    config = _spec_decode_grouping_config(method="mtp")
+    config.cache_config.get_resolved_kv_cache_layout = lambda: SimpleNamespace(
+        is_block_outermost=packed
+    )
+    attention = attention_type(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    specs = {"a": attention, "b": attention, "c": attention}
+    if hybrid:
+        specs["d"] = new_mamba_spec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            page_size_padded=attention.page_size_bytes,
+        )
+    baseline = get_kv_cache_groups(config, specs.copy())
+    caplog_vllm.clear()
+    specs["b"] = replace(attention, is_draft=True)
+    groups = get_kv_cache_groups(config, specs.copy())
+
+    assert specs["b"] == attention
+    assert hash(specs["b"]) == hash(attention)
+    assert [g.layer_names for g in groups] == [g.layer_names for g in baseline]
+    assert [g.kv_cache_spec for g in groups] == [g.kv_cache_spec for g in baseline]
+    assert [g.is_eagle_group for g in groups] == ["b" in g.layer_names for g in groups]
+    assert "could be identified as the draft model's" not in caplog_vllm.text
+
+
+def test_identified_mtp_group_keeps_recurrent_prefix_replayable():
+    """Draft tail handling must leave the target's recurrent checkpoint usable."""
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    specs = {
+        "a": attention,
+        "b": replace(attention, is_draft=True),
+        "c": new_mamba_spec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            page_size_padded=attention.page_size_bytes,
+        ),
+        "d": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            tokens_per_state=4,
+            is_draft=True,
+        ),
+        "e": CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            is_draft=True,
+        ),
+    }
+    groups = get_kv_cache_groups(_spec_decode_grouping_config(method="mtp"), specs)
+    config = generate_scheduler_kv_cache_config(
+        [KVCacheConfig(num_blocks=40, kv_cache_tensors=[], kv_cache_groups=groups)]
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=16,
+        scheduler_block_size=16,
+        use_eagle=True,
+    )
+    request = make_request("replay", list(range(71)), 16, sha256)
+    pool = manager.block_pool
+    for group_id, group in enumerate(groups):
+        if "a" in group.layer_names:
+            for i in range(4):
+                pool.cached_block_hash_to_block.insert(
+                    make_block_hash_with_group_id(request.block_hashes[i], group_id),
+                    pool.blocks[i + 1],
+                )
+        elif "c" in group.layer_names:
+            pool.cached_block_hash_to_block.insert(
+                make_block_hash_with_group_id(request.block_hashes[2], group_id),
+                pool.blocks[20],
+            )
+
+    _, hit_tokens, _ = manager.get_computed_blocks(request)
+
+    assert hit_tokens == 48
+    assert manager.coordinator.eagle_group_ids == {
+        i
+        for i, group in enumerate(groups)
+        if "b" in group.layer_names or "e" in group.layer_names
+    }
 
 
 def _deepseek_v4_specs(model_version="deepseek_v4"):

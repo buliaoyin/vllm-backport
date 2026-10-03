@@ -22,6 +22,7 @@ import gc
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -613,7 +614,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return encoder_runner.get_encoder_timing_stats()
 
     def get_kv_cache_spec(self):
-        return get_kv_cache_spec(self.vllm_config)
+        specs = get_kv_cache_spec(self.vllm_config)
+        if isinstance(self.speculator, DraftModelSpeculator):
+            for name in self.speculator.draft_attn_layer_names:
+                if name in specs:
+                    specs[name] = replace(specs[name], is_draft=True)
+        return specs
 
     def initialize_kv_cache(
         self,

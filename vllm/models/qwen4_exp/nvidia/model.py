@@ -3,6 +3,7 @@
 """Inference-only Qwen4Exp model."""
 
 from collections.abc import Iterable
+from copy import deepcopy
 from itertools import islice
 
 import torch
@@ -25,6 +26,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.exl3 import Exl3Config
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -661,6 +663,8 @@ class Qwen4ExpForCausalLM(
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.quant_config = vllm_config.quant_config
+        if self.quant_config is not None and self.quant_config.get_name() == "exl3":
+            self.extra_safetensors_files = ("ngram_embedding.safetensors",)
         self.config = config
         self.scheduler_config = vllm_config.scheduler_config
         if vllm_config.cache_config.mamba_cache_mode == "all":
@@ -674,6 +678,7 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -863,6 +868,41 @@ class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
         return self.ctx.get_hf_config(Qwen4ExpConfig)
 
 
+class Qwen4ExpVisionTransformer(Qwen3_VisionTransformer):
+    hf_to_vllm_mapper = Qwen3_VisionTransformer.hf_to_vllm_mapper | WeightsMapper(
+        orig_to_new_stacked={
+            "attn.q_proj.": ("attn.qkv.", "q"),
+            "attn.k_proj.": ("attn.qkv.", "k"),
+            "attn.v_proj.": ("attn.qkv.", "v"),
+        }
+    )
+
+    def __init__(self, vision_config, norm_eps=1e-6, quant_config=None, prefix=""):
+        if isinstance(quant_config, Exl3Config):
+            projection = quant_config.matrices.get(f"{prefix}.blocks.0.mlp.linear_fc1")
+            if projection is not None and projection.quantized:
+                padded = (vision_config.intermediate_size + 127) // 128 * 128
+                if projection.dimensions != (vision_config.hidden_size, padded):
+                    raise ValueError("Invalid EXL3 Qwen4Exp vision MLP dimensions")
+                vision_config = deepcopy(vision_config)
+                vision_config.intermediate_size = padded
+        super().__init__(vision_config, norm_eps, quant_config, prefix)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm.model_executor.layers.quantization.exl3 import Exl3LinearMethod
+
+        ignored = {
+            f"blocks.{i}.attn.qkv.{component}"
+            for i, block in enumerate(self.blocks)
+            if isinstance(block.attn.qkv.quant_method, Exl3LinearMethod)
+            and len(block.attn.qkv.quant_method.parts) == 3
+            for component in ("weight", "bias")
+        }
+        return super().load_weights(
+            (name, value) for name, value in weights if name not in ignored
+        )
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3VLMultiModalProcessor,
     info=Qwen4ExpProcessingInfo,
@@ -878,6 +918,7 @@ class Qwen4ExpForConditionalGeneration(
     requires_raw_input_tokens = True
 
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
+        "qkv": ["q_proj", "k_proj", "v_proj"],
         "kv_proj": ["key_proj", "value_proj"],
         "input_mix_weight_down_block_inject": [
             "input_mix_weight_down",
@@ -897,6 +938,11 @@ class Qwen4ExpForConditionalGeneration(
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        if isinstance(quant_config, Exl3Config):
+            self.extra_safetensors_files = (
+                "ngram_embedding.safetensors",
+                *quant_config.vision_safetensors_files,
+            )
         if multimodal_config is None:
             raise ValueError(
                 "Qwen4ExpForConditionalGeneration requires multimodal_config"
@@ -920,7 +966,7 @@ class Qwen4ExpForConditionalGeneration(
             self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
 
             with self._mark_tower_model(vllm_config, {"image", "video"}):
-                self.visual = Qwen3_VisionTransformer(
+                self.visual = Qwen4ExpVisionTransformer(
                     config.vision_config,
                     norm_eps=config.text_config.rms_norm_eps,
                     quant_config=quant_config,

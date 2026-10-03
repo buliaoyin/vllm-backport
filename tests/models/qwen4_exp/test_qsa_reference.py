@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -405,6 +406,54 @@ def test_qsa_ring_capacity_covers_one_speculative_step(
         block_size=48, compress_ratio=compress_ratio
     ).get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=num_spec))
     assert spec.block_size == expected
+
+
+@pytest.mark.parametrize("drafts", [0, 3, 5])
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_qsa_hybrid_pages_align_backend_and_speculative_ring(monkeypatch, drafts, mode):
+    """MTP5's 12-slot ring must coexist with 16-token attention alignment."""
+    from vllm.config import CacheConfig
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.platforms.cuda import CudaPlatform
+
+    monkeypatch.setattr(
+        "vllm.config.vllm.set_current_vllm_config", lambda _: nullcontext()
+    )
+    model_cls = SimpleNamespace(
+        get_mamba_specs_from_config=lambda _: [
+            SimpleNamespace(page_size_bytes=1616 * 256)
+        ]
+    )
+    monkeypatch.setattr(
+        ModelRegistry, "resolve_model_cls", lambda *a, **kw: (model_cls, "")
+    )
+    model_config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        use_mla=False,
+        architecture="Qwen4ExpForCausalLM",
+        hf_text_config=SimpleNamespace(
+            model_type="qwen4_exp_text", indexer_compress_ratio=4
+        ),
+        get_num_kv_heads=lambda _: 1,
+        get_head_size=lambda: 64,
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=16, mamba_cache_mode=mode),
+        parallel_config=SimpleNamespace(),
+        num_speculative_tokens=drafts,
+    )
+    backend = SimpleNamespace(
+        customize_spec=lambda spec: spec,
+        get_supported_kernel_block_sizes=lambda: [16],
+    )
+    CudaPlatform._align_hybrid_block_size(config, backend)
+    ring = 4 * -(-(4 + drafts) // 4)
+    assert config.cache_config.block_size % 16 == 0
+    assert config.cache_config.block_size % ring == 0
+    assert config.cache_config.block_size >= 1616
+    if mode == "align":
+        assert config.cache_config.mamba_block_size == config.cache_config.block_size
 
 
 @requires_qsa_kernels

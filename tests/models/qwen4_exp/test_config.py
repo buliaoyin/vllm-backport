@@ -18,6 +18,7 @@ from vllm.models.qwen4_exp.config import (
     Qwen4ExpTextConfig,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+from vllm.v1.spec_decode.dynamic.adaptive import supports_adaptive_mtp
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from ...utils import spawn_new_process_for_each_test
@@ -46,6 +47,22 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("layers", [0, 1, 2])
+def test_adaptive_qwen4_exp_mtp_requires_one_resolved_layer(wrapped, layers):
+    """Only the validated single-layer HC drafter may use adaptive budgets."""
+    text = _text_config(mtp_num_hidden_layers=layers)
+    config = Qwen4ExpConfig(text_config=text) if wrapped else text
+    config.architectures = [
+        "Qwen4ExpForConditionalGeneration" if wrapped else "Qwen4ExpForCausalLM"
+    ]
+    draft = SpeculativeConfig.hf_config_override(config)
+    spec = SimpleNamespace(
+        method="mtp", draft_model_config=SimpleNamespace(hf_config=draft)
+    )
+    assert supports_adaptive_mtp(spec) == (layers == 1)
 
 
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:

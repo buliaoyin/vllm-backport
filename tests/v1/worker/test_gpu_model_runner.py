@@ -1073,6 +1073,11 @@ def test_init_kv_cache_without_kv_sharing(default_vllm_config):
     kv_cache_spec = runner.get_kv_cache_spec()
     assert len(kv_cache_spec) == 2
     assert len(runner.shared_kv_cache_layers) == 0
+    runner.drafter = SimpleNamespace(_draft_attn_layer_names={layer_1})
+    draft_specs = runner.get_kv_cache_spec()
+    assert draft_specs[layer_1].is_draft
+    assert not draft_specs[layer_0].is_draft
+    assert not kv_cache_spec[layer_1].is_draft
 
     available_memory = 20 * GiB_bytes
     # page size for layer 0's kv_cache_spec is 32KB

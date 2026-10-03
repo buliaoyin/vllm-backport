@@ -146,8 +146,9 @@ def test_mtp_budget_does_not_stay_short_after_rejection_bursts():
 
 
 @pytest.mark.parametrize("num_reqs", [1, 8])
-def test_mtp_budget_still_adapts_when_acceptance_changes(num_reqs):
-    budget = MTPDraftBudget(5)
+@pytest.mark.parametrize("prefer_default", [False, True])
+def test_mtp_budget_still_adapts_when_acceptance_changes(num_reqs, prefer_default):
+    budget = MTPDraftBudget(5, prefer_default=prefer_default)
     req_ids = [str(i) for i in range(num_reqs)]
     now = 0.0
     for phase, accepted in enumerate((5, 0, 5)):
@@ -225,6 +226,142 @@ def test_mtp_batch_rejecting_drafts_starts_with_short_calibration():
     assert choices[-4:] == [1] * 4
 
 
+@pytest.mark.parametrize("num_reqs", [1, 4])
+def test_mtp_default_policy_preserves_short_request_budget(num_reqs):
+    """Short requests must not pay to calibrate every available draft length."""
+    budget = MTPDraftBudget(5, prefer_default=True)
+    req_ids = [str(i) for i in range(num_reqs)]
+    for step in range(32):
+        k = budget.choose(req_ids, 4096, False)
+        assert k == 3
+        budget.scheduled(
+            step,
+            float(step),
+            4096,
+            False,
+            dict.fromkeys(req_ids, k),
+            proposal_drafts=k,
+        )
+        budget.complete(step, step + 0.03, dict.fromkeys(req_ids, 4))
+
+
+def test_mtp_default_policy_avoids_trials_during_prefill_overlap():
+    """Queued work must not cause extra exploratory drafting on active requests."""
+    budget = MTPDraftBudget(5, prefer_default=True)
+    for step in range(160):
+        k = budget.choose(["request"], 4096, True)
+        assert k == 3
+        budget.scheduled(
+            step, float(step), 4096, True, {"request": k}, proposal_drafts=k
+        )
+        budget.complete(step, step + 0.03, {"request": 4})
+
+
+def test_mtp_default_policy_measures_short_shape_before_promoting_it():
+    """Low acceptance cannot justify a slower small-M kernel."""
+    budget = MTPDraftBudget(5, prefer_default=True)
+    choices = []
+    for step in range(160):
+        k = budget.choose(["request"], 4096, False)
+        choices.append(k)
+        budget.scheduled(
+            step, float(step), 4096, False, {"request": k}, proposal_drafts=k
+        )
+        budget.complete(step, step + (0.06 if k < 3 else 0.03), {"request": 1})
+    assert choices.count(1) >= 3
+    assert choices[-32:] == [3] * 32
+
+
+def test_mtp_default_policy_refreshes_censored_third_position():
+    """A good first two drafts must not hide recovery of the third draft."""
+    budget = MTPDraftBudget(3, prefer_default=True)
+    latencies = {1: 0.04, 2: 0.032, 3: 0.036}
+    for phase, accepted in enumerate((2, 3)):
+        choices = []
+        for iteration in range(192):
+            step = phase * 192 + iteration
+            k = budget.choose(["request"], 4096, False)
+            choices.append(k)
+            budget.scheduled(
+                step, float(step), 4096, False, {"request": k}, proposal_drafts=k
+            )
+            budget.complete(
+                step, step + latencies[k], {"request": min(k, accepted) + 1}
+            )
+        assert choices[-64:].count(2 if accepted == 2 else 3) >= 48
+
+
+def test_mtp_default_policy_scores_observed_prefix_yield():
+    """Rejection bursts must not distort the fixed-three throughput reference."""
+    budget = MTPDraftBudget(5, prefer_default=True)
+    extension = budget._extension
+    assert extension is not None
+    for step in range(32):
+        budget.choose(["request"], 4096, False)
+        budget.scheduled(
+            step, float(step), 4096, False, {"request": 3}, proposal_drafts=3
+        )
+        budget.complete(step, step + 0.03, {"request": 4 if step % 2 else 1})
+    assert extension.yields(["request"], 3) == pytest.approx(2.5)
+    assert extension.yields(["request"], 2) == pytest.approx(2.0)
+    assert extension.core.requests["request"].expected(3) == pytest.approx(2.5)
+    assert extension.core.requests["request"].expected(2) == pytest.approx(2.0)
+
+
+def test_mtp_default_policy_retains_unverified_prefix_yields():
+    """Short proposals must not bias the measured yield of longer budgets."""
+    budget = MTPDraftBudget(3, prefer_default=True)
+    budget.choose(["request"], 4096, False)
+    for step in range(40):
+        k = 3 if step < 8 else 1
+        budget.scheduled(
+            step, float(step), 4096, False, {"request": k}, proposal_drafts=k
+        )
+        budget.complete(step, step + 0.03, {"request": k + 1})
+    acceptance = budget.requests["request"]
+    assert acceptance.expected(1) == pytest.approx(2.0)
+    assert acceptance.expected(3) == pytest.approx(4.0)
+
+
+def test_mtp_default_policy_returns_to_three_when_short_gain_is_marginal():
+    """A measured short budget must also yield to the default within the margin."""
+    budget = MTPDraftBudget(3, prefer_default=True)
+    latencies = {1: 0.04, 2: 0.032, 3: 0.036}
+    for phase in range(2):
+        choices = []
+        for iteration in range(192):
+            step = phase * 192 + iteration
+            k = budget.choose(["request"], 4096, False)
+            choices.append(k)
+            accepted = 2 if not phase or iteration % 3 else 3
+            budget.scheduled(
+                step, float(step), 4096, False, {"request": k}, proposal_drafts=k
+            )
+            budget.complete(
+                step, step + latencies[k], {"request": min(k, accepted) + 1}
+            )
+        assert choices[-64:].count(2 if not phase else 3) >= 48
+
+
+@pytest.mark.parametrize("prefer_default", [False, True])
+def test_mtp_default_policy_avoids_marginal_long_budget_gains(prefer_default):
+    """A four-percent estimate must not displace the preferred three drafts."""
+    budget = MTPDraftBudget(5, prefer_default=prefer_default)
+    latencies = {1: 0.022, 2: 0.024, 3: 0.026, 4: 0.03125, 5: 0.0375}
+    previous, now, choices = 3, 0.0, []
+    for step in range(400):
+        k = budget.choose(["request"], 4096, False)
+        choices.append(k)
+        budget.scheduled(
+            step, now, 4096, False, {"request": previous}, proposal_drafts=k
+        )
+        now += (latencies[previous] + latencies[k]) / 2
+        budget.complete(step, now, {"request": previous + 1})
+        previous = k
+    expected = {3} if prefer_default else {4, 5}
+    assert sum(k in expected for k in choices[-64:]) >= 60
+
+
 @pytest.mark.parametrize("num_reqs", [1, 8])
 def test_mtp_long_budget_matches_three_drafts_without_prefix_evidence(num_reqs):
     """A larger maximum must not force suffix work on rejecting requests."""
@@ -252,9 +389,10 @@ def test_mtp_long_budget_matches_three_drafts_without_prefix_evidence(num_reqs):
 
 
 @pytest.mark.parametrize("num_reqs", [1, 8])
-def test_mtp_expensive_long_trials_back_off(num_reqs):
+@pytest.mark.parametrize("prefer_default", [False, True])
+def test_mtp_expensive_long_trials_back_off(num_reqs, prefer_default):
     """High acceptance alone cannot justify recurring expensive suffix work."""
-    budget = MTPDraftBudget(5)
+    budget = MTPDraftBudget(5, prefer_default=prefer_default)
     req_ids = [str(i) for i in range(num_reqs)]
     latencies = {1: 0.03, 2: 0.034, 3: 0.038, 4: 0.095, 5: 0.15}
     now, previous, choices = 0.0, 3, []
@@ -272,9 +410,10 @@ def test_mtp_expensive_long_trials_back_off(num_reqs):
 
 
 @pytest.mark.parametrize("num_reqs", [1, 8])
-def test_mtp_keeps_suffix_evidence_until_next_long_trial(num_reqs):
+@pytest.mark.parametrize("prefer_default", [False, True])
+def test_mtp_keeps_suffix_evidence_until_next_long_trial(num_reqs, prefer_default):
     """Short rounds must not hide a profitable K5 after a marginal K4 trial."""
-    budget = MTPDraftBudget(5)
+    budget = MTPDraftBudget(5, prefer_default=prefer_default)
     req_ids = [str(i) for i in range(num_reqs)]
     latencies = {1: 0.035, 2: 0.041, 3: 0.048, 4: 0.058, 5: 0.065}
     now, previous, choices = 0.0, 3, []

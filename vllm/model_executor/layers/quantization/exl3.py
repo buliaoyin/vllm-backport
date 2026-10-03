@@ -35,6 +35,7 @@ logger = init_logger(__name__)
 _M32_LOCK_INTS = 1024 * 1024 + 2 * 1024 + 2 + 64
 
 _DTYPES = {
+    "I64": torch.int64,
     "I16": torch.int16,
     "I32": torch.int32,
     "F16": torch.float16,
@@ -122,6 +123,8 @@ class Exl3Config(QuantizationConfig):
         super().__init__()
         self.config = config
         self.matrices: dict[str, Exl3Matrix] = {}
+        self.ngram_tables: dict[str, dict[str, Exl3Tensor]] = {}
+        self.vision_safetensors_files: tuple[str, ...] = ()
         self.workspaces: dict[tuple, list[torch.Tensor]] = {}
         self.m32_locks: dict[torch.device, torch.Tensor] = {}
         self.decode_workspaces: dict[tuple, torch.Tensor] = {}
@@ -163,6 +166,13 @@ class Exl3Config(QuantizationConfig):
         if not root.is_dir():
             raise ValueError("EXL3 currently requires a local safetensors checkpoint.")
         files = sorted(root.glob("*.safetensors"))
+        self.vision_safetensors_files = tuple(
+            sorted(
+                file.name
+                for file in files
+                if file.name == "vision.safetensors" or file.name.startswith("vision_k")
+            )
+        )
         index = root / "model.safetensors.index.json"
         if index.exists():
             file_names = set(json.loads(index.read_text())["weight_map"].values())
@@ -171,6 +181,13 @@ class Exl3Config(QuantizationConfig):
             mtp_file = root / "mtp.safetensors"
             if mtp_file.is_file() and mtp_file not in files:
                 files.append(mtp_file)
+            ngram_file = root / "ngram_embedding.safetensors"
+            if ngram_file.is_file() and ngram_file not in files:
+                files.append(ngram_file)
+            for name in self.vision_safetensors_files:
+                vision_file = root / name
+                if vision_file not in files:
+                    files.append(vision_file)
         for file in files:
             with file.open("rb") as stream:
                 size = struct.unpack("<Q", stream.read(8))[0]
@@ -179,6 +196,18 @@ class Exl3Config(QuantizationConfig):
                 header = json.loads(stream.read(size))
             for key, value in header.items():
                 if "." not in key or key == "__metadata__":
+                    continue
+                if ".ngram_embedding." in key:
+                    parent, component = key.split(".ngram_embedding.", 1)
+                    if value["dtype"] in _DTYPES:
+                        table = self.ngram_tables.setdefault(
+                            parent + ".ngram_embedding", {}
+                        )
+                        if component in table:
+                            raise ValueError(f"Duplicate checkpoint tensor: {key}")
+                        table[component] = Exl3Tensor(
+                            tuple(value["shape"]), _DTYPES[value["dtype"]]
+                        )
                     continue
                 name, component = key.rsplit(".", 1)
                 if component not in _COMPONENTS or value["dtype"] not in _DTYPES:
@@ -208,15 +237,23 @@ class Exl3Config(QuantizationConfig):
                 new_name = new_name.removesuffix(".trellis")
                 mapped[new_name] = Exl3Matrix(new_name, spec.tensors)
         self.matrices = mapped
+        self.ngram_tables = {
+            mapped_name.removesuffix(".trellis"): tensors
+            for name, tensors in self.ngram_tables.items()
+            if (mapped_name := hf_to_vllm_mapper._map_name(name + ".trellis"))
+            is not None
+        }
 
     def resolve(self, prefix):
-        if prefix in self.matrices:
+        if prefix in self.matrices and self.matrices[prefix].quantized:
             return [self.matrices[prefix]]
         parent, _, leaf = prefix.rpartition(".")
         parts = self.packed_modules_mapping.get(leaf, [])
         names = [f"{parent}.{part}" if parent else part for part in parts]
         if names and all(name in self.matrices for name in names):
             return [self.matrices[name] for name in names]
+        if prefix in self.matrices:
+            return [self.matrices[prefix]]
         return []
 
     def get_quant_method(self, layer, prefix):
@@ -409,6 +446,10 @@ direct_register_custom_op("exl3_linear", _exl3_linear, fake_impl=_exl3_linear_fa
 
 
 class Exl3MoEMethod(FusedMoEMethodBase):
+    def is_fused_checkpoint_weight(self, weight: torch.Tensor) -> bool:
+        """EXL3 checkpoints serialize each expert's three-dimensional trellis."""
+        return False
+
     def __init__(self, config, moe, prefix):
         super().__init__(moe)
         self.config = config
@@ -501,7 +542,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     def _loader(self, component):
         def load(
             param,
-            tensor,
+            loaded_weight,
             weight_name=None,
             shard_id=None,
             expert_id=None,
@@ -511,12 +552,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             if expert_id is None or not 0 <= expert_id < self.num_experts:
                 raise ValueError(f"Invalid EXL3 expert id: {expert_id}")
             if (
-                tensor.shape != shape
-                or tensor.dtype != self.parts[shard_id].tensors[component].dtype
+                loaded_weight.shape != shape
+                or loaded_weight.dtype != self.parts[shard_id].tensors[component].dtype
             ):
                 raise ValueError(f"Unexpected EXL3 expert tensor: {weight_name}")
             param.data.narrow(0, offset + expert_id * size, size).copy_(
-                tensor.reshape(-1)
+                loaded_weight.reshape(-1)
             )
             self.loaded.add((shard_id, component, expert_id))
             return True if return_success else None
@@ -918,6 +959,7 @@ def _exl3_moe_fused(
     for start in range(0, x.shape[0], capacity):
         hidden = x[start : start + capacity].to(torch.float16).contiguous()
         ids = topk_ids[start : start + capacity].to(torch.int64).flatten()
+        ids = torch.where(ids < 0, experts, ids)
         weights = topk_weights[start : start + capacity].to(torch.float16).flatten()
         counts = torch.zeros(experts + 1, dtype=torch.int64, device=x.device)
         counts.scatter_add_(0, ids, torch.ones_like(ids))
@@ -928,7 +970,7 @@ def _exl3_moe_fused(
             and experts > workspace[0].shape[0]
         ):
             permutation = torch.argsort(counts[:-1], descending=True, stable=True)
-            inverse = torch.empty_like(permutation)
+            inverse = torch.arange(experts + 1, device=x.device)
             inverse.scatter_(0, permutation, torch.arange(experts, device=x.device))
             ids = inverse[ids]
             counts = torch.cat((counts[:-1][permutation], counts[-1:]))

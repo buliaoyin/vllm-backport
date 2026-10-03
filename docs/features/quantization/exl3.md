@@ -51,6 +51,34 @@ Qwen3.8-27B dense checkpoint. The draft reads its own quantization metadata so
 the target's multimodal weight-name mapping cannot discard its MTP projections
 or rename its output head. It then shares the loaded target head.
 
+Qwen3.8-Flash-Next checkpoints using `Qwen4ExpForConditionalGeneration` load
+compressed PLE n-gram rows from `ngram_embedding.safetensors`, even when the
+main shard index omits that file. Rows retain their packed EXL3 representation;
+lookup decodes only the selected 160-dimensional rows, including the exported
+head bias and hash layout. Set `--engram-config '{"cpu_offload": true}'` to
+keep this table in pinned host memory and gather it through CUDA UVA. This
+offloads the PLE table only. The validated 6-bit table requires about 36.36 GiB
+of host memory. This format currently requires embedding tensor parallelism 1.
+Its recursive MTP layer loads independent EXL3 metadata and shares target/draft
+expert workspaces and the loaded output head.
+
+The Qwen3.8-Flash-Next checkpoint can run on three CMP 170HX GPUs with 16
+layers per pipeline stage, or on one 96 GiB GPU with the PLE table offloaded.
+For the tested three-GPU configuration:
+
+```bash
+NCCL_P2P_DISABLE=1 vllm serve /path/to/qwen3.8-flash-next-exl3 \
+    --pipeline-parallel-size 3 \
+    --engram-config '{"cpu_offload": true}' \
+    --max-model-len 8192 --max-num-seqs 4 --max-num-batched-tokens 512 \
+    --kv-cache-memory-bytes 2147483648 --no-enable-prefix-caching \
+    --limit-mm-per-prompt '{"image": 1, "video": 0}' \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 5, "enable_adaptive_verification": true}'
+```
+
+Select the intended devices with `CUDA_VISIBLE_DEVICES`. Use
+`--language-model-only` instead of the modality limit for text-only serving.
+
 For the three-CMP-170HX GLM checkpoint used in validation, start with one draft
 token and an explicit KV budget:
 
@@ -69,17 +97,19 @@ MTP remains opt-in. Draft acceptance and the size of the target verification
 batch both affect throughput; increasing the number of draft tokens can reduce
 performance.
 
-With the V2 model runner and pipeline parallelism, GLM5Next EXL3 joins decode
+With the V2 model runner and pipeline parallelism, GLM5Next and Qwen4Exp EXL3 join decode
 requests into a common pipeline phase once their preceding outputs are available.
 This prevents chunked prefill from leaving concurrent requests in permanently
 separate small decode batches. It applies with or without MTP. Set
 `VLLM_EXL3_PP_DECODE_BATCHING=0` before startup to restore independent phases.
 
-### Adaptive GLM5Next and Qwen3.5 MTP
+### Adaptive GLM5Next and Qwen MTP
 
-Single-layer GLM5Next and Qwen3.5 MTP support a scheduler-selected draft length.
+Single-layer GLM5Next, Qwen3.5 and Qwen4Exp MTP support a scheduler-selected
+draft length.
 This includes Qwen3.8-27B checkpoints with the `Qwen3_5ForConditionalGeneration`
-architecture and one `text_config.mtp_num_hidden_layers` layer:
+architecture, and Qwen3.8-Flash-Next with `Qwen4ExpForConditionalGeneration`,
+when they have one `text_config.mtp_num_hidden_layers` layer:
 
 ```bash
 --speculative-config '{"method": "mtp", "num_speculative_tokens": 3, "enable_adaptive_verification": true}'
@@ -94,6 +124,18 @@ Concurrent batches track acceptance faster, require a larger predicted gain to
 grow than to shrink, and start by measuring budgets 1 through 3 (up to the
 configured maximum).
 
+Qwen4Exp EXL3 starts with K=3 (or the configured maximum if lower). Each
+request supplies 32 verification observations before exploratory changes;
+prefill overlap also keeps this default. A shorter unmeasured shape requires
+an estimated 8% gain and three matching timings before selection. Scores
+within 5% of K=3 prefer K=3. After shortening, six K=3 rounds refresh censored
+positions every 32 decisions while the first draft's acceptance remains
+healthy. This allows recovery without repeatedly probing fully rejecting
+requests. Each budget retains its last 32 fully verified prefix yields;
+shorter proposals do not overwrite longer-prefix observations. Core and
+longer-budget comparisons use these measured yields, avoiding compounded
+conditional rate estimates during rejection bursts.
+
 With a maximum above 3, ordinary decoding uses the same three-draft policy.
 Longer budgets require observed acceptance of the preceding prefix and enough
 predicted marginal benefit to justify a bounded trial. Each trial collects
@@ -106,15 +148,20 @@ prefix acceptance can reopen exploration. Longer budgets require a 3% gain to
 grow, but drop when the shorter policy predicts a 1% advantage, with a two-step
 hold. Recent excess trial and transition costs also penalize subsequent trials.
 Longer shapes never supply timing samples to the three-draft policy.
+For single Qwen4Exp EXL3 requests, initial longer-budget trials and promotions
+require an 8% advantage over the core policy. Longer budgets return to the
+core when their measured advantage falls below 5%. Rare nonlinear trials wait
+until decision 256. The measured K=4-to-K=5 follow-up keeps its 1% trial gate;
+concurrent batches keep the general longer-budget thresholds above.
 Each prefix position retains its own last 32 observations, so shorter rounds
 cannot evict evidence needed for the next longer trial. Suffix observations
 estimate acceptance conditioned on the preceding position being accepted.
 The scheduler multiplies these rates by the current request's prefix probability
 before averaging across requests, so a declining prefix reduces the predicted
-suffix benefit even while older suffix observations remain available. Observations
-expire after 1024 decisions involving their request, matching the maximum retry
-interval; other requests do not age them. A recovery from low prefix acceptance
-also clears stale suffix observations before probing again.
+suffix benefit even while older suffix observations remain available. Suffix
+observations expire after 1024 decisions involving their request, matching the
+maximum retry interval; other requests do not age them. A recovery from low
+prefix acceptance also clears stale suffix observations before probing again.
 If stale K=4 acceptance blocks a K=5 trial, the next retry remeasures K=4
 instead of repeatedly applying the same stale estimate. A substantial rise in
 prefix acceptance can reopen this retry after 64 decisions without K=4
@@ -173,6 +220,14 @@ The three-CMP-170HX capacity run uses PP `17/15/13`, a 5.5 GiB KV budget per
 rank, and the native 1,048,576-token context limit. It completes 1,048,448-token
 input with MTP1 enabled.
 
+Qwen4Exp loads its separately exported `vision.safetensors` or
+`vision_k*.safetensors` files, including independently rotated Q/K/V and their
+biases. Quantized copies take precedence over the retained fused FP16 QKV.
+Its vision MLP preserves the export's padded intermediate width. The
+Qwen3.8-Flash-Next image smoke test works with fixed MTP3 and adaptive MTP5;
+the draft consumes text-token embeddings and target hidden states, while the
+target owns the image encoder.
+
 The safetensors headers determine individual tensor shapes and bit widths.
 The average `bits` value in `quantization_config` is not a storage-layout setting.
 Full-precision projections remain full precision. Converted calibration
@@ -197,9 +252,9 @@ Long-context validation (local archive: `docs/validation/exl3-long-context-20260
 extends the two tested checkpoints to 65536 input tokens with one or four
 submitted requests. The report records hardware, cache capacity, timing and
 basic retrieval checks; this does not establish a general context limit.
-Multimodal generation outside the validated GLM5Next image path (including
-video), speculative decoding outside GLM5Next and single-layer Qwen3.5 MTP,
-LoRA, CPU offload, sleep mode,
+Multimodal generation outside the validated GLM5Next/Qwen4Exp image paths (including
+video), speculative decoding outside GLM5Next and single-layer Qwen MTP,
+LoRA, general model-weight CPU offload, sleep mode,
 expert load balancing, and distributed
 tensor/expert sharding are not validated.
 Shared experts run serially because upstream GEMMs share a device-wide lock
@@ -209,10 +264,32 @@ Do not infer support for those features from model architecture support alone.
 Qwen3.8-27B EXL3 MTP text validation covers fixed K=3 and adaptive maximum
 K=3/5 on one GPU, plus adaptive maximum K=5 with three CMP 170HX GPUs in PP.
 The scheduler changes actual draft calls and preserves accepted GDN states when
-the next verification is shorter. Prefix-cache reuse with Qwen MTP is not
-validated; the current hybrid cache-group fallback can disable reuse. These
-MTP checks use prefix caching disabled and do not establish multimodal MTP
-support or a general throughput advantage over fixed drafting.
+the next verification is shorter. These Qwen3.8-27B MTP checks use prefix
+caching disabled and do not establish multimodal MTP support or a general
+throughput advantage over fixed drafting.
+
+Qwen4Exp compressed PLE tables support GPU-resident and pinned-host lookup,
+including CUDA Graph replay. QSA cache pages align both the attention backend
+and the ring capacity reserved for the configured maximum draft length; MTP5
+does not require a manual block-size override. The 512-expert, top-10,
+640-intermediate Qwen3.8-Flash-Next checkpoint uses native EXL3 expert kernels;
+the GLM-specific INT8/M32 kernels require other expert shapes and top-k limits.
+Model validation covers Chinese and English writing, Python code, four
+submitted requests, a 4K-token retrieval prompt, and an image with colored
+shapes. These checks do not establish the checkpoint's full context capacity,
+video support, or a throughput advantage of adaptive MTP5 over fixed MTP3.
+
+Both model runners carry draft-layer ownership in their cache specifications.
+The cache planner marks groups containing draft layers while keeping target
+GDN and PLE state groups outside draft-cache handling. Ownership does not change
+cache geometry or split otherwise compatible target and draft layers, so this
+identification does not increase the advertised KV cache capacity.
+Qwen3.8-Flash-Next prefix-reuse validation with adaptive MTP5 covers Chinese
+and English retrieval, a Python function, and four requests sharing a roughly
+6.5K-token prefix on three CMP 170HX GPUs in PP. Repeated requests reuse 4896
+tokens; all 14 final answers match the expected result. Thinking sequences
+are not generally token-identical between cold and cached runs. These checks
+do not establish general output equivalence or external KV offload support.
 
 Native prefill computes EXL3 products with FP16 operands; BF16 inputs and
 outputs are converted at the operation boundary. Supported large SM80 MoE

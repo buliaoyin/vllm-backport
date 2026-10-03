@@ -2094,16 +2094,18 @@ def _annotate_eagle_groups(
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
-    Two detection rules, in order of preference:
+    Three detection rules, in order of preference:
 
-    1. Spec-driven. ``non_causal_multi_token_decode`` is declared on
+    1. Worker-provided ``is_draft`` marks the original per-layer specs. Read
+       these before group merging can discard the ownership metadata.
+    2. Spec-driven. ``non_causal_multi_token_decode`` is declared on
        MLAAttentionSpec and set by drafter attention layers that run a
        non-causal multi-token decode (today only Kimi-K3 DSpark). It survives
        MLAAttentionSpec.merge, so it still identifies a group after per-group
        spec merging, wherever grouping happens to land. It is sufficient but
        not necessary: a drafter whose spec is indistinguishable from the
        target's cannot be found this way.
-    2. Model-scoped positional fallback for DeepseekV4/V4.1, whose MTP block
+    3. Model-scoped positional fallback for DeepseekV4/V4.1, whose MTP block
        reuses the target's own decoder layer and so carries no spec marker. Its
        draft attention layer is always the last registered layer, so flag whichever
        group holds it. This rule is only valid where the groups partition
@@ -2115,10 +2117,9 @@ def _annotate_eagle_groups(
 
     Args:
         vllm_config: Config supplying the speculative method, if any.
-        kv_cache_spec: The kv cache spec of each attention layer, in layer
-            registration order. Only read by rule 2.
+        kv_cache_spec: Original per-layer specs in registration order.
         kv_cache_groups: Groups to annotate in place.
-        use_deepseek_v4_fallback: Enable rule 2 for a DeepseekV4/V4.1 packed
+        use_deepseek_v4_fallback: Enable rule 3 for a DeepseekV4/V4.1 packed
             group.
     """
     spec_config = vllm_config.speculative_config
@@ -2126,7 +2127,7 @@ def _annotate_eagle_groups(
         return
 
     for group in kv_cache_groups:
-        if any(
+        if any(kv_cache_spec[name].is_draft for name in group.layer_names) or any(
             getattr(spec, "non_causal_multi_token_decode", False)
             for spec in iter_layer_specs(group.kv_cache_spec)
         ):
@@ -2145,12 +2146,10 @@ def _warn_if_unannotated_eagle_mamba(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> None:
-    """Warn when the flag-all eagle fallback will silently disable reuse.
+    """Warn when a hybrid model falls back to draft handling for every group.
 
-    With no group annotated, consumers flag every group as a draft group. That
-    widens a Mamba group's required lookup window to two consecutive chunks,
-    which align-mode checkpointing never produces, so reuse drops to zero with
-    no error and no metric to show it.
+    Drafter ownership is needed to distinguish volatile draft KV from target
+    state. The fallback cannot make that distinction.
 
     Args:
         vllm_config: Config supplying the speculative method, if any.
@@ -2174,10 +2173,9 @@ def _warn_if_unannotated_eagle_mamba(
     logger.warning(
         "Speculative decoding (method=%s) is enabled but no KV cache group "
         "could be identified as the draft model's, so every group -- "
-        "including Mamba groups %s -- will be treated as a draft group. A "
-        "Mamba group cannot satisfy the widened lookup window that implies, "
-        "so prefix-cache reuse across requests will be disabled and any "
-        "external KV offload tier will store without ever serving a hit.",
+        "including Mamba groups %s -- will use conservative draft-cache "
+        "handling. Explicit draft-layer ownership is needed to distinguish "
+        "target state from volatile draft KV.",
         spec_config.method,
         mamba_groups,
     )
@@ -2216,14 +2214,20 @@ def get_kv_cache_groups(
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
-        return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        groups = _get_kv_cache_groups_uniform_spec(kv_cache_spec)
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
-        return _get_kv_cache_groups_uniform_type(uniform_spec)
+        groups = _get_kv_cache_groups_uniform_type(uniform_spec)
     elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
-        return glm5_groups
+        groups = glm5_groups
+    else:
+        groups = None
+    if groups is not None:
+        _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
+        _warn_if_unannotated_eagle_mamba(vllm_config, groups)
+        return groups
 
     # Hidden-state layers use their own block table and must not be absorbed
     # into a compatible attention bucket.
@@ -2252,6 +2256,8 @@ def get_kv_cache_groups(
         fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
         if fallback_groups is None:
             raise
+        _annotate_eagle_groups(vllm_config, kv_cache_spec, fallback_groups)
+        _warn_if_unannotated_eagle_mamba(vllm_config, fallback_groups)
         return fallback_groups
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 

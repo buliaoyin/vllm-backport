@@ -69,6 +69,7 @@ def _stub(manager, block_size, hash_block_size, *, block_drop=True):
         cache_config=SimpleNamespace(block_size=block_size),
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         max_num_scheduled_tokens=1 << 20,
+        exl3_prefill_auto=False,
         use_eagle=True,
         # The EAGLE adjustments key on the block-drop bit, not plain use_eagle:
         # they exist only to compensate for the drop.

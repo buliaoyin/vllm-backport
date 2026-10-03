@@ -905,6 +905,11 @@ class Platform:
                 # For hybrid MLA/Mamba models, make the manager block size a
                 # multiple of 128 so split kernel blocks keep that invariant.
                 kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
+        indexer_align = cls._get_indexer_block_alignment(vllm_config)
+        if indexer_align:
+            kernel_block_alignment_size = lcm(
+                kernel_block_alignment_size, indexer_align
+            )
 
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf
@@ -924,9 +929,6 @@ class Platform:
                 mamba_page_size,
                 kernel_block_alignment_size * attn_page_size_1_token,
             )
-            indexer_align = cls._get_indexer_block_alignment(vllm_config)
-            if indexer_align:
-                attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size

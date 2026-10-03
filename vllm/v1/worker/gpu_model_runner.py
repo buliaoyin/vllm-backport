@@ -7566,6 +7566,9 @@ class GPUModelRunner(
         if has_ec_transfer() and not get_ec_transfer().is_consumer:
             return {}
         kv_cache_spec: dict[str, KVCacheSpec] = {}
+        draft_layer_names = getattr(
+            getattr(self, "drafter", None), "_draft_attn_layer_names", ()
+        )
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
         for layer_name, attn_module in attn_layers.items():
@@ -7585,6 +7588,8 @@ class GPUModelRunner(
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                 if isinstance(spec, AttentionSpec):
                     spec = attn_module.get_attn_backend().customize_spec(spec)
+                if layer_name in draft_layer_names:
+                    spec = replace(spec, is_draft=True)
                 kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec

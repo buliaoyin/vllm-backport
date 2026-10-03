@@ -132,6 +132,20 @@ def _make_draft_vllm_config(
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
         configure_quant_config(draft_quant_config, Qwen4ExpMTP)
+        from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+
+        if isinstance(draft_quant_config, Exl3Config):
+            draft_config = speculative_config.draft_model_config.hf_text_config
+            draft_quant_config.apply_vllm_mapper(
+                WeightsMapper(
+                    orig_to_new_prefix={
+                        f"mtp.layers.{i}.": f"mtp.layers.{mtp_start_layer_idx + i}."
+                        for i in range(draft_config.mtp_num_hidden_layers)
+                    }
+                )
+            )
+            if isinstance(vllm_config.quant_config, Exl3Config):
+                draft_quant_config.share_workspaces(vllm_config.quant_config)
         ignored_layers = getattr(draft_quant_config, "ignored_layers", None)
         if ignored_layers:
             setattr(  # noqa: B010
@@ -168,9 +182,12 @@ def _make_draft_vllm_config(
                 rf"re:.*\.layers\.{mtp_start_layer_idx + offset}\..*"
                 for offset in range(num_mtp_layers)
             ]
-            draft_quant_config.ignore = ct_ignore + [
-                pattern for pattern in extra_ignores if pattern not in ct_ignore
-            ]
+            setattr(  # noqa: B010
+                draft_quant_config,
+                "ignore",
+                ct_ignore
+                + [pattern for pattern in extra_ignores if pattern not in ct_ignore],
+            )
 
     draft_vllm_config = replace(
         vllm_config,
@@ -386,6 +403,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
 
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.lm_head.": "lm_head.",
+            "language_model.lm_head.": "lm_head.",
+            "model.lm_head.": "lm_head.",
+        }
+    )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -424,6 +448,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:

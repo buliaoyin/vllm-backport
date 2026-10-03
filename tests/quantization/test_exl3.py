@@ -75,6 +75,112 @@ def test_header_metadata_preserves_per_projection_bits(tmp_path):
     assert layer.trellis.numel() == a["trellis"].numel() + b["trellis"].numel()
 
 
+def test_ngram_sidecar_metadata_is_separate_from_linear_matrices(tmp_path):
+    """Unindexed packed embedding rows must not be validated as GEMM trellises."""
+    weights = {f"head.{k}": v for k, v in _weights().items()}
+    save_file(weights, tmp_path / "model.safetensors")
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    table = {
+        f"{prefix}.trellis": torch.zeros((4, 61), dtype=torch.int16),
+        f"{prefix}.head_bias": torch.zeros((2, 160), dtype=torch.float16),
+        f"{prefix}.head_offsets": torch.tensor([0, 2]),
+        f"{prefix}.head_vocab_sizes": torch.tensor([2, 2]),
+        f"{prefix}.layer_multipliers": torch.tensor([3, 5, 7]),
+    }
+    save_file(table, tmp_path / "ngram_embedding.safetensors")
+    vision_prefix = "model.visual.blocks.0.mlp.linear_fc1"
+    save_file(
+        {f"{vision_prefix}.{k}": v for k, v in _weights(bits=6).items()},
+        tmp_path / "vision_k6.safetensors",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(weights, "model.safetensors")})
+    )
+    config = Exl3Config({})
+    config.maybe_update_config(str(tmp_path))
+    config.apply_vllm_mapper(
+        WeightsMapper(
+            orig_to_new_prefix={"model.language_model.": "language_model.model."}
+        )
+    )
+    mapped = prefix.replace("model.language_model.", "language_model.model.")
+    assert set(config.matrices) == {"head", vision_prefix}
+    assert config.vision_safetensors_files == ("vision_k6.safetensors",)
+    assert config.ngram_tables[mapped]["trellis"] == Exl3Tensor((4, 61), torch.int16)
+
+
+def test_routed_experts_loads_individual_exl3_trellises():
+    """A 3D trellis is one expert's matrix, not a fused expert batch."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    config = Exl3Config({})
+    tensors = {}
+    for expert in range(2):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            values = _weights(k=128, n=128)
+            tensors[expert, projection] = values
+            name = f"experts.{expert}.{projection}"
+            config.matrices[name] = _spec(name, values)
+    moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(tp_size=1, ep_size=1), activation="silu"
+    )
+    layer = RoutedExperts.__new__(RoutedExperts)
+    nn.Module.__init__(layer)
+    layer.layer_name = "experts"
+    layer.quant_method = Exl3MoEMethod(config, moe, "experts")
+    layer.quant_method.create_weights(layer, 2, 128, 128, torch.bfloat16)
+    mapping = [
+        (f"experts.{base}_", f"experts.{expert}.{projection}.", expert, shard)
+        for expert in range(2)
+        for base, projection, shard in (
+            ("w13", "gate_proj", "w1"),
+            ("w13", "up_proj", "w3"),
+            ("w2", "down_proj", "w2"),
+        )
+    ]
+    layer.get_expert_mapping = lambda **kwargs: mapping
+    weights = (
+        (f"{expert}.{projection}.{component}", tensor)
+        for (expert, projection), values in tensors.items()
+        for component, tensor in values.items()
+    )
+    loaded = set(layer.load_weights(weights))
+    assert "w2_trellis" in loaded
+    assert len(layer.quant_method.loaded) == 24
+
+
+def test_qwen4_mtp_resolves_offset_layers_without_duplicating_scratch(monkeypatch):
+    """The HC drafter uses layer 48's names while preserving target storage."""
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    target, draft = Exl3Config({}), Exl3Config({})
+    layer = "mtp.layers.0.mlp.experts.0.gate_proj"
+    draft.matrices[layer] = _spec(layer, _weights())
+    target.workspaces["shared"] = [torch.empty(1)]
+    draft_model = SimpleNamespace(
+        hf_text_config=SimpleNamespace(mtp_num_hidden_layers=1)
+    )
+
+    @dataclass
+    class Config:
+        model_config: object
+        quant_config: Exl3Config
+        speculative_config: object
+
+    config = Config(
+        model_config=object(),
+        quant_config=target,
+        speculative_config=SimpleNamespace(draft_model_config=draft_model),
+    )
+    monkeypatch.setattr(mtp, "get_draft_quant_config", lambda _: draft)
+    result = mtp._make_draft_vllm_config(config, 48)
+    assert result.quant_config.resolve(layer.replace("layers.0.", "layers.48."))
+    assert result.quant_config.workspaces is target.workspaces
+    assert result.model_config is draft_model
+    assert config.quant_config is target
+    assert not target.matrices
+
+
 def test_draft_loading_keeps_target_and_mtp_metadata_independent(tmp_path, monkeypatch):
     """A target mapper must not drop the drafter's quantized head or MTP weights."""
     from vllm.config import CompilationMode, LoadConfig
@@ -190,11 +296,20 @@ def test_mtp_sidecar_loads_once_without_loading_unindexed_files(
         torch.testing.assert_close(value, expected[name])
 
 
+@pytest.mark.parametrize("model_type", ["glm5next", "qwen4_exp"])
 @pytest.mark.parametrize("layout", ["separate", "separate_with_fallback", "fused"])
-def test_glm5next_vision_loads_exl3_qkv_with_bias(layout):
+def test_vision_loads_exl3_qkv_with_bias(layout, model_type):
     """Visual QKV keeps each rotation and bias, including with obsolete weights."""
     from vllm.model_executor.layers.linear import QKVParallelLinear
     from vllm.models.glm5next.nvidia.multimodal import Glm5NextVisionTransformer
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpVisionTransformer
+
+    cls = (
+        Glm5NextVisionTransformer
+        if model_type == "glm5next"
+        else Qwen4ExpVisionTransformer
+    )
+    qkv_name = "qkv_proj" if model_type == "glm5next" else "qkv"
 
     projections = (
         {"qkv": _weights(n=384, bits=4)}
@@ -202,20 +317,24 @@ def test_glm5next_vision_loads_exl3_qkv_with_bias(layout):
         else {p: _weights(n=128, bits=b) for p, b in zip("qkv", (3, 4, 6))}
     )
     config = Exl3Config({})
-    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    config.packed_modules_mapping = {qkv_name: ["q_proj", "k_proj", "v_proj"]}
     for proj, weights in projections.items():
-        name = f"visual.blocks.0.attn.{proj}_proj"
+        projection_name = qkv_name if proj == "qkv" else f"{proj}_proj"
+        name = f"visual.blocks.0.attn.{projection_name}"
         config.matrices[name] = _spec(name, weights)
+    if layout == "separate_with_fallback":
+        name = "visual.blocks.0.attn.qkv"
+        config.matrices[name] = _spec(name, {"weight": torch.zeros(384, 128)})
     qkv = QKVParallelLinear(
         128,
         64,
         2,
         params_dtype=torch.bfloat16,
         quant_config=config,
-        prefix="visual.blocks.0.attn.qkv_proj",
+        prefix=f"visual.blocks.0.attn.{qkv_name}",
         disable_tp=True,
     )
-    model = Glm5NextVisionTransformer.__new__(Glm5NextVisionTransformer)
+    model = cls.__new__(cls)
     nn.Module.__init__(model)
     model.blocks = nn.ModuleList([nn.Module()])
     model.blocks[0].attn = nn.Module()
@@ -357,6 +476,23 @@ def test_moe_routing_and_chunk_boundaries(rows, capacity, monkeypatch):
     _check_moe_routing(rows, capacity, 128, monkeypatch)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [3, 129, 513])
+def test_native_moe_skips_graph_padding_routes(rows, monkeypatch):
+    """Padding must not count as an expert or survive graph replay as a route."""
+    _check_moe_routing(
+        rows,
+        128,
+        128,
+        monkeypatch,
+        intermediate_dim=640,
+        topk=10,
+        num_experts=32,
+        check_graph=True,
+        padded=True,
+    )
+
+
 def _check_moe_routing(
     rows,
     capacity,
@@ -371,6 +507,7 @@ def _check_moe_routing(
     num_experts=None,
     cold_routes=False,
     check_graph=False,
+    padded=False,
 ):
     if capacity is None:
         monkeypatch.delenv("VLLM_EXL3_MOE_MAX_TOKENS", raising=False)
@@ -433,6 +570,8 @@ def _check_moe_routing(
             torch.arange(topk, device="cuda")[None, :]
             + torch.arange(rows, device="cuda")[:, None]
         ) % num_experts
+    if padded:
+        ids[::2] = -1
     routing = torch.full((rows, topk), 1 / topk, device="cuda")
     if dtype == torch.bfloat16 and rows == 3:
         x[0].zero_()
@@ -452,6 +591,8 @@ def _check_moe_routing(
         )
     relative = (actual.float() - expected).norm() / expected.norm()
     assert relative < relative_limit
+    if padded:
+        torch.testing.assert_close(actual[::2], torch.zeros_like(actual[::2]))
     if check_graph or rows in (3, 513, 4097):
         for _ in range(3):
             method.apply(layer, x, routing, ids)
@@ -460,7 +601,18 @@ def _check_moe_routing(
         with torch.cuda.graph(graph):
             captured = method.apply(layer, x, routing, ids)
         x.mul_(2)
-        ids.copy_((ids + 1) % num_experts)
+        if padded:
+            ids.copy_(
+                (
+                    torch.arange(topk, device="cuda")[None, :]
+                    + torch.arange(rows, device="cuda")[:, None]
+                    + 1
+                )
+                % num_experts
+            )
+            ids[1::3] = -1
+        else:
+            ids.copy_((ids + 1) % num_experts)
         if dtype == torch.bfloat16:
             routing.copy_(routing.flip(1))
         graph.replay()

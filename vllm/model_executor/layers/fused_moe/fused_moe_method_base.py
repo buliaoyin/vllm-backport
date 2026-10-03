@@ -73,6 +73,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         """
         return False
 
+    def is_fused_checkpoint_weight(self, weight: torch.Tensor) -> bool:
+        """Whether the serialized tensor has a leading expert dimension."""
+        return weight.ndim == 3
+
     def maybe_roundup_sizes(
         self,
         hidden_size: int,

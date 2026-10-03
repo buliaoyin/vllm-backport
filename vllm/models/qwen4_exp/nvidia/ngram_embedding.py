@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
     should_ignore_layer,
 )
+from vllm.model_executor.layers.quantization.exl3 import Exl3Config, Exl3Tensor
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
@@ -207,6 +208,15 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             return Qwen4ExpPLEFp8EmbeddingMethod()
         if quant_config is None:
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if isinstance(quant_config, Exl3Config):
+            table = quant_config.ngram_tables.get(prefix)
+            if table is None:
+                raise ValueError(f"Missing EXL3 n-gram table: {prefix}")
+            if "trellis" in table:
+                return Qwen4ExpPLEExl3EmbeddingMethod(table)
+            if any(name == "weight" or name.endswith(".weight") for name in table):
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            raise ValueError(f"Unsupported EXL3 n-gram storage: {prefix}")
         if isinstance(quant_config, ModelOptMixedPrecisionConfig):
             if quant_config._resolve_quant_algo(prefix) == "FP8":
                 return Qwen4ExpPLEFp8EmbeddingMethod()
@@ -258,6 +268,10 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+    def lookup_dtype(self, weight_dtype: torch.dtype) -> torch.dtype:
+        """Return the dtype produced by the row lookup."""
+        return weight_dtype
+
     @abstractmethod
     def dequantize(
         self,
@@ -303,6 +317,93 @@ class Qwen4ExpPLEUnquantizedEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
     ) -> torch.Tensor:
         del layer, output_dtype
         return embeddings
+
+
+class Qwen4ExpPLEExl3EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
+    """Compressed n-gram rows decoded only for the requested hash IDs."""
+
+    def __init__(self, table: dict[str, Exl3Tensor]) -> None:
+        self.table = table
+        packed = table["trellis"]
+        if (
+            packed.dtype != torch.int16
+            or len(packed.shape) != 2
+            or packed.shape[1] not in range(11, 82, 10)
+        ):
+            raise ValueError("Invalid EXL3 n-gram trellis shape or dtype")
+        offsets = table.get("head_offsets")
+        if offsets is None or offsets.dtype != torch.int64 or len(offsets.shape) != 1:
+            raise ValueError("Missing EXL3 n-gram head offsets")
+        self.heads = offsets.shape[0]
+        multipliers = table.get("layer_multipliers")
+        if (
+            multipliers is None
+            or multipliers.dtype != torch.int64
+            or len(multipliers.shape) != 1
+            or not multipliers.shape[0]
+            or not self.heads
+        ):
+            raise ValueError("Invalid EXL3 n-gram hash multipliers or head count")
+        if table.get("head_vocab_sizes") != offsets:
+            raise ValueError("Invalid EXL3 n-gram head vocabulary sizes")
+        if "head_bias" in table and table["head_bias"] != Exl3Tensor(
+            (self.heads, 160), torch.float16
+        ):
+            raise ValueError("Invalid EXL3 n-gram head bias")
+
+    def create_weights(
+        self,
+        layer: Qwen4ExpPLEEmbedding,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size, params_dtype
+        if layer.tp_size != 1 or input_size_per_partition != 160:
+            raise ValueError("EXL3 n-gram lookup requires ETP=1 and 160-D rows")
+        rows, words = self.table["trellis"].shape
+        if sum(output_partition_sizes) != rows:
+            raise ValueError("EXL3 n-gram row count does not match the vocabulary")
+        weight = nn.Parameter(
+            layer.allocate_embedding_weight(rows, words, torch.int16),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(weight, extra_weight_attrs)
+        layer.register_parameter("weight", weight)
+        head_bias = torch.zeros((self.heads, 160), dtype=torch.float16)
+        if "head_bias" in self.table:
+            layer.register_parameter(
+                "head_bias", nn.Parameter(head_bias, requires_grad=False)
+            )
+        else:
+            layer.register_buffer("head_bias", head_bias)
+
+    def lookup_dtype(self, weight_dtype: torch.dtype) -> torch.dtype:
+        return torch.float16
+
+    def lookup(
+        self,
+        layer: nn.Module,
+        input_: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from .ops.exl3_ngram import exl3_ngram_lookup
+
+        return exl3_ngram_lookup(
+            getattr(layer, "_uva_weight", layer.weight), input_, layer.head_bias, output
+        )
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        return self.lookup(layer, input_)
+
+    def dequantize(
+        self, layer: nn.Module, embeddings: torch.Tensor, output_dtype: torch.dtype
+    ) -> torch.Tensor:
+        return embeddings.to(output_dtype)
 
 
 class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
@@ -465,7 +566,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             max_total_tokens * self.etp_data_parallel_size,
             num_ngram_heads,
             self.embedding_dim,
-            dtype=self.weight.dtype,
+            dtype=self.embedding_method.lookup_dtype(self.weight.dtype),
             device=self._uva_weight.device,
         )
         self._output_dim = num_ngram_heads * self.embedding_dim
@@ -492,21 +593,25 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
     ) -> torch.Tensor:
         """Look up local ETP rows while preserving the weight storage dtype."""
         expected_shape = (*input_ids.shape, self.embedding_dim)
+        output_dtype = self.embedding_method.lookup_dtype(self.weight.dtype)
         if output is None:
             output = torch.empty(
                 expected_shape,
-                dtype=self.weight.dtype,
+                dtype=output_dtype,
                 device=input_ids.device,
             )
         elif (
             tuple(output.shape) != expected_shape
-            or output.dtype != self.weight.dtype
+            or output.dtype != output_dtype
             or output.device != input_ids.device
         ):
             raise ValueError(
                 "PLE prefetch output must match the input shape, weight dtype, "
                 "and input device"
             )
+
+        if isinstance(self.embedding_method, Qwen4ExpPLEExl3EmbeddingMethod):
+            return self.embedding_method.lookup(self, input_ids, output)
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
@@ -932,6 +1037,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         shard_prefix = "ngram_embedding.shard_"
 
         for name, loaded_weight in weights:
+            name = {
+                "ngram_embedding.trellis": "ngram_embedding.weight",
+                "ngram_embedding.head_offsets": "ngram_heads_offsets",
+                "ngram_embedding.head_vocab_sizes": "ngram_heads_vocab_sizes",
+                "ngram_embedding.layer_multipliers": "layer_multipliers",
+            }.get(name, name)
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
                 continue

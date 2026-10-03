@@ -844,8 +844,7 @@ class RoutedExperts(PluggableLayer):
         expert_mapping = self.get_expert_mapping(include_fused=True)
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
-            # Fused expert weights can be identified by their 3D tensors
-            is_fused = loaded_weight.dim() == 3
+            is_fused = self.quant_method.is_fused_checkpoint_weight(loaded_weight)
             matched = False
             for param_name, weight_name, expert_id, shard_id in expert_mapping:
                 if weight_name not in qual_name:

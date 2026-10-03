@@ -23,16 +23,19 @@ class AsyncScheduler(Scheduler):
             and "deepseek_v41_hybrid" in extra
         )
         model = self.vllm_config.model_config
-        exl3_glm = (
+        exl3_moe = (
             envs.VLLM_EXL3_PP_DECODE_BATCHING
             and model.quantization == "exl3"
-            and model.hf_config.model_type in ("glm5_next", "glm5_next_text")
+            and (
+                model.hf_config.model_type in ("glm5_next", "glm5_next_text")
+                or model.hf_text_config.model_type == "qwen4_exp_text"
+            )
         )
         self.align_hybrid_decodes = (
-            self.pp_size > 1 and self.use_v2_model_runner and (cpu_hybrid or exl3_glm)
+            self.pp_size > 1 and self.use_v2_model_runner and (cpu_hybrid or exl3_moe)
         )
-        if exl3_glm and self.align_hybrid_decodes:
-            logger.info("Batching EXL3 GLM5Next pipeline decodes after output fences.")
+        if exl3_moe and self.align_hybrid_decodes:
+            logger.info("Batching EXL3 pipeline decodes after output fences.")
         self._decode_phase: int | None = None
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:

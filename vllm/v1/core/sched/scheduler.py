@@ -73,6 +73,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.adaptive import (
     ConfidenceDraftBudget,
     MTPDraftBudget,
+    prefers_default_mtp_budget,
     uses_scheduler_adaptive_verification,
 )
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -294,7 +295,10 @@ class Scheduler(SchedulerInterface):
         self.dynamic_sd_lookup: list[int] | None = None
         self.adaptive_draft_budget = (
             (
-                MTPDraftBudget(self.num_spec_tokens)
+                MTPDraftBudget(
+                    self.num_spec_tokens,
+                    prefer_default=prefers_default_mtp_budget(vllm_config),
+                )
                 if speculative_config.method == "mtp"
                 else ConfidenceDraftBudget(self.num_spec_tokens)
             )
