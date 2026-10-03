@@ -33,6 +33,7 @@ class CuteSkinnyGemm:
         k_unroll: int = 1,
         has_residual: bool = False,
         use_pdl: bool = False,
+        use_warp_elect: bool = True,
         static_k: int | None = None,
     ) -> None:
         if block_size % cute.arch.WARP_SIZE != 0:
@@ -50,6 +51,7 @@ class CuteSkinnyGemm:
         self.k_unroll = k_unroll
         self.has_residual = has_residual
         self.use_pdl = use_pdl
+        self.use_warp_elect = use_warp_elect
         self.static_k = static_k
         self.num_warps = block_size // cute.arch.WARP_SIZE
 
@@ -226,10 +228,16 @@ class CuteSkinnyGemm:
         )
         smem = cutlass.utils.SmemAllocator()
         partials = smem.allocate_tensor(cutlass.Float32, smem_layout, byte_alignment=16)
-        with cute.arch.elect_one():
-            for mi in cutlass.range_constexpr(num_rows):
-                for ni in cutlass.range_constexpr(outputs_per_block):
-                    partials[mi, ni, warp_idx] = acc[mi, ni]
+        if const_expr(self.use_warp_elect):
+            with cute.arch.elect_one():
+                for mi in cutlass.range_constexpr(num_rows):
+                    for ni in cutlass.range_constexpr(outputs_per_block):
+                        partials[mi, ni, warp_idx] = acc[mi, ni]
+        else:
+            if tidx % cute.arch.WARP_SIZE == 0:
+                for mi in cutlass.range_constexpr(num_rows):
+                    for ni in cutlass.range_constexpr(outputs_per_block):
+                        partials[mi, ni, warp_idx] = acc[mi, ni]
 
         cute.arch.sync_threads()
         if tidx == 0:

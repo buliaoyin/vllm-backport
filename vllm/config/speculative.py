@@ -432,9 +432,9 @@ class SpeculativeConfig:
     If `None`, use the value from the draft model's Hugging Face config."""
     mtp_token_map: str | None = None
     """Local torch file containing target token IDs for a reduced Qwen4Exp MTP
-    output vocabulary. Requires Model Runner V2, TP1/PP1, and a BF16 or
-    SM120 rowwise FP8 draft head. The target vocabulary and input embeddings
-    stay full size."""
+    output vocabulary. Requires Model Runner V2 and TP1/PP1, TP1/PP2 on the
+    last rank, or TP2/PP1. TP2 uses a BF16 head; TP1 also supports SM120
+    rowwise FP8. The target vocabulary and input embeddings stay full size."""
 
     # Advanced control
     disable_padded_drafter_batch: bool = False

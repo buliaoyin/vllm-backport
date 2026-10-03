@@ -109,6 +109,8 @@ class ShapeDynamicSkinnyGemm:
         import cutlass.cute as cute
         from quack.compile_utils import make_fake_tensor
 
+        from vllm.platforms import current_platform
+
         from ._skinny_gemm import CuteSkinnyGemm
 
         element_type = self._cutlass_dtype(dtype)
@@ -139,6 +141,7 @@ class ShapeDynamicSkinnyGemm:
             k_unroll=config.k_unroll,
             has_residual=has_residual,
             use_pdl=self._use_pdl(),
+            use_warp_elect=current_platform.has_device_capability((9, 0)),
             static_k=config.static_k,
         )
         self._compiled[(dtype, config, has_residual)] = cute.compile(

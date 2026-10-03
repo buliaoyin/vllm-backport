@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen4Exp decode GEMM selection on Hopper and Blackwell.
+"""Qwen4Exp decode GEMM selection on Ampere, Hopper and Blackwell.
 
 Dispatch follows Kimi-K3 and uses the local ``(N, K)`` shape and token count.
 Plans contain measured CUDA graph capture sizes; other token counts use the
@@ -75,6 +75,57 @@ QWEN4_EXP_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
         2: SkinnyGemmConfig(2, 128, 1, static_k=10240),
         4: SkinnyGemmConfig(4, 128, 2, static_k=10240),
         8: SkinnyGemmConfig(8, 128, 1, k_unroll=4),
+    },
+}
+
+# CMP 170HX plans selected by hot/cold-L2 CUDA graph measurements.
+QWEN4_EXP_SM80_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
+    (32768, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, k_unroll=4, vector_width=4),
+        4: SkinnyGemmConfig(4, 32, 4, k_unroll=2, vector_width=4),
+    },
+    (65536, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, k_unroll=4, vector_width=4),
+        4: SkinnyGemmConfig(4, 32, 4, k_unroll=2, vector_width=4),
+    },
+    (16384, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, k_unroll=4, vector_width=4),
+        4: SkinnyGemmConfig(4, 32, 4, vector_width=4, static_k=2560),
+    },
+    (8192, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, k_unroll=4, vector_width=4),
+        4: SkinnyGemmConfig(4, 32, 4, vector_width=4, static_k=2560),
+    },
+    (48, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        7: SkinnyGemmConfig(7, 128, 1, vector_width=4, static_k=2560),
+        16: SkinnyGemmConfig(16, 128, 1, vector_width=4, static_k=2560),
+    },
+    (96, 2560): {
+        1: SkinnyGemmConfig(1, 64, 2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        7: SkinnyGemmConfig(7, 128, 2, vector_width=4, static_k=2560),
+        16: SkinnyGemmConfig(16, 128, 2, vector_width=4, static_k=2560),
+    },
+    (6656, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, k_unroll=4, vector_width=4),
+        4: SkinnyGemmConfig(4, 32, 8, vector_width=4, static_k=2560),
+    },
+    (13312, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, k_unroll=4, vector_width=4),
+        4: SkinnyGemmConfig(4, 32, 4, vector_width=4, static_k=2560),
+    },
+    (336, 10240): {
+        1: SkinnyGemmConfig(1, 128, 1, vector_width=4, static_k=10240),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=8, static_k=10240),
+    },
+    (320, 10240): {
+        1: SkinnyGemmConfig(1, 128, 1, vector_width=4, static_k=10240),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=8, static_k=10240),
+    },
+    (10240, 320): {
+        1: SkinnyGemmConfig(1, 32, 4, vector_width=2, static_k=320),
     },
 }
 
@@ -234,11 +285,17 @@ def _is_sm90() -> bool:
     return current_platform.is_device_capability((9, 0))
 
 
+def _is_sm80() -> bool:
+    return current_platform.is_device_capability((8, 0))
+
+
 def _is_sm120() -> bool:
     return current_platform.is_device_capability((12, 0))
 
 
 def _gemm_plans() -> dict[tuple[int, int], dict[int, SkinnyGemmConfig]]:
+    if _is_sm80():
+        return QWEN4_EXP_SM80_GEMM_PLANS
     if _is_sm103():
         return QWEN4_EXP_GEMM_PLANS
     if _is_sm90():

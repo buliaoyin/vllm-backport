@@ -204,6 +204,7 @@ GLM_CUTE_CASES = [
 ]
 
 QWEN4_EXP_GPU_TABLES = (
+    ((8, 0), qwen4_exp_gemm.QWEN4_EXP_SM80_GEMM_PLANS),
     ((9, 0), qwen4_exp_gemm.QWEN4_EXP_SM90_GEMM_PLANS),
     ((12, 0), qwen4_exp_gemm.QWEN4_EXP_SM120_GEMM_PLANS),
 )
@@ -747,7 +748,8 @@ def test_qwen4_exp_hopper_plans_are_valid() -> None:
         ((9, 0), qwen4_exp_gemm.QWEN4_EXP_SM90_GEMM_PLANS),
         ((12, 0), qwen4_exp_gemm.QWEN4_EXP_SM120_GEMM_PLANS),
         ((12, 1), {}),
-        ((8, 0), {}),
+        ((8, 0), qwen4_exp_gemm.QWEN4_EXP_SM80_GEMM_PLANS),
+        ((7, 5), {}),
     ],
 )
 def test_qwen4_exp_gemm_capability_routing(
@@ -1285,8 +1287,11 @@ def test_cute_residual_epilogue(n: int, k: int, num_tokens: int) -> None:
 
 
 @pytest.mark.parametrize("num_tokens", range(1, 17))
-def test_cute_residual_epilogue_all_supported_token_counts(num_tokens: int) -> None:
-    _require_sm103_and_cute()
+@pytest.mark.parametrize("capability", [(8, 0), (10, 3)])
+def test_cute_residual_epilogue_all_supported_token_counts(
+    num_tokens: int, capability: tuple[int, int]
+) -> None:
+    _require_capability_and_cute(capability)
     from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
         ShapeDynamicSkinnyGemm,
     )

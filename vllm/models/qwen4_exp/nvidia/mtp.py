@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig, replace, set_current_vllm_config
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -516,17 +516,26 @@ class Qwen4ExpMTP(LocalArgmaxMixin, nn.Module, SupportsPP, Qwen4ExpMixtureOfExpe
         if self.mtp_token_map is not None:
             raise ValueError("mtp_token_map cannot be changed after draft setup")
         parallel_config = self.vllm_config.parallel_config
+        tp_size = parallel_config.tensor_parallel_size
         if (
-            parallel_config.tensor_parallel_size != 1
-            or parallel_config.pipeline_parallel_size != 1
-            or self.lm_head.tp_size != 1
+            (tp_size, parallel_config.pipeline_parallel_size)
+            not in ((1, 1), (1, 2), (2, 1))
+            or not isinstance(self.lm_head, ParallelLMHead)
+            or self.lm_head.tp_size != tp_size
+            or self.lm_head.org_vocab_size != self.config.vocab_size
+            or self.lm_head.num_embeddings != self.config.vocab_size
         ):
-            raise ValueError("mtp_token_map requires TP1 and PP1")
+            raise ValueError("mtp_token_map requires TP1/PP1, TP1/PP2, or TP2/PP1")
+        if parallel_config.pipeline_parallel_size == 2:
+            pp_group = get_pp_group()
+            if pp_group.world_size != 2 or not pp_group.is_last_rank:
+                raise ValueError("mtp_token_map requires the last PP2 rank")
         weight = self.lm_head.weight
         rowwise_fp8 = isinstance(self.lm_head.quant_method, RowwiseFP8HeadMethod)
         if rowwise_fp8:
             if (
-                weight.dtype != torch.float8_e4m3fn
+                tp_size != 1
+                or weight.dtype != torch.float8_e4m3fn
                 or self.lm_head.weight_scale.dtype != torch.float32
                 or self.lm_head.weight_scale.shape != weight.shape[:1]
             ):
@@ -536,6 +545,17 @@ class Qwen4ExpMTP(LocalArgmaxMixin, nn.Module, SupportsPP, Qwen4ExpMixtureOfExpe
             (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
         ):
             raise ValueError("mtp_token_map requires an unquantized BF16 head")
+        if tp_size == 2:
+            shard = self.lm_head.shard_indices
+            shard_start = self.lm_head.tp_rank * weight.shape[0]
+            if (
+                self.lm_head.parallel_group is not None
+                or shard.org_vocab_start_index != shard_start
+                or shard.org_vocab_end_index
+                != min(shard_start + weight.shape[0], self.config.vocab_size)
+                or weight.shape[0] * tp_size != self.lm_head.num_embeddings_padded
+            ):
+                raise ValueError("mtp_token_map requires contiguous TP2 vocab shards")
         token_ids = torch.as_tensor(
             torch.load(path, map_location="cpu", weights_only=True)
         )
@@ -553,29 +573,42 @@ class Qwen4ExpMTP(LocalArgmaxMixin, nn.Module, SupportsPP, Qwen4ExpMixtureOfExpe
         ):
             raise ValueError("mtp_token_map token IDs must be unique and in range")
         token_ids = token_ids.to(weight.device)
+        if tp_size == 2:
+            weight = tensor_model_parallel_all_gather(weight, dim=0)[
+                : self.config.vocab_size
+            ]
         with set_current_vllm_config(self.vllm_config), torch.device(weight.device):
             head = ParallelLMHead(
                 token_ids.numel(),
                 weight.shape[1],
                 params_dtype=torch.bfloat16,
-                padding_size=1,
-                disable_tp=True,
+                padding_size=tp_size,
+                disable_tp=tp_size == 1,
             )
             logits_processor = LogitsProcessor(token_ids.numel())
+        shard = head.shard_indices
+        local_token_ids = token_ids[
+            shard.org_vocab_start_index : shard.org_vocab_end_index
+        ]
         if rowwise_fp8:
             install_rowwise_fp8_head(head)
-            replace_parameter(head, "weight", weight.index_select(0, token_ids))
+            replace_parameter(head, "weight", weight.index_select(0, local_token_ids))
             head.weight_scale.copy_(
-                self.lm_head.weight_scale.index_select(0, token_ids)
+                self.lm_head.weight_scale.index_select(0, local_token_ids)
             )
             head.quant_method.process_weights_after_loading(head)
         else:
-            head.weight.copy_(weight.index_select(0, token_ids))
+            head.weight.zero_()
+            head.weight[: local_token_ids.numel()].copy_(
+                weight.index_select(0, local_token_ids)
+            )
+            enable_qwen4_exp_low_latency_gemm(head, weight.dtype)
+        del weight
         self.lm_head = head
         self.logits_processor = logits_processor
         self.mtp_token_map = token_ids
         self.draft_id_to_target_id = token_ids - torch.arange(
-            token_ids.numel(), device=weight.device
+            token_ids.numel(), device=token_ids.device
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

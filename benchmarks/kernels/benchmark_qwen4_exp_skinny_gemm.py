@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tune Qwen4Exp BF16 projections on RTX PRO 6000 with CUDA graph timing."""
+"""Tune local Qwen4Exp BF16 projections with CUDA graph timing."""
 
 from __future__ import annotations
 
@@ -14,7 +14,11 @@ from functools import partial
 from pathlib import Path
 
 import torch
-from flashinfer.testing import bench_gpu_time_with_cupti
+from flashinfer.testing import (
+    bench_gpu_time_with_cudagraph,
+    bench_gpu_time_with_cupti,
+)
+from flashinfer.testing.utils import calculate_rotation_count
 
 from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
     SkinnyGemmConfig,
@@ -48,6 +52,27 @@ PROJECTIONS = {
     "lm_head": (248320, 2560),
     "draft_lm_head": (65536, 2560),
 }
+
+_REPLICATED_PROJECTIONS = {
+    "qsa_indexer",
+    "router",
+    "hc_down_inject",
+    "hc_final_down",
+    "hc_up",
+    "ple_kv",
+}
+_TIMING_BACKEND = "cupti"
+
+
+def _local_shape(name: str, tp_size: int) -> tuple[int, int]:
+    n, k = PROJECTIONS[name]
+    if name in _REPLICATED_PROJECTIONS:
+        return n, k
+    if name == "qsa_qkvg":
+        return 12288 // tp_size + 512 * max(1, 2 // tp_size), k
+    if name in ("attn_out", "shared_down"):
+        return n, k // tp_size
+    return n // tp_size, k
 
 
 def _configs(m: int, n: int, k: int) -> list[SkinnyGemmConfig]:
@@ -87,13 +112,34 @@ def _configs(m: int, n: int, k: int) -> list[SkinnyGemmConfig]:
 
 
 def _bench_us(fn: Callable[[], torch.Tensor], cold: bool, repeats: int) -> float:
-    samples = bench_gpu_time_with_cupti(
-        fn,
-        dry_run_iters=10,
-        repeat_iters=repeats,
-        use_cuda_graph=True,
-        cold_l2_cache=cold,
-    )
+    if _TIMING_BACKEND == "cuda-event":
+        if not isinstance(fn, partial):
+            raise ValueError("CUDA event timing requires explicit tensor arguments")
+        samples = bench_gpu_time_with_cudagraph(
+            fn.func,
+            input_args=fn.args,
+            input_kwargs=fn.keywords,
+            dry_run_iters=10,
+            repeat_iters=repeats,
+            num_iters_within_graph=max(
+                10,
+                calculate_rotation_count(
+                    [arg for arg in fn.args if isinstance(arg, torch.Tensor)],
+                    torch.device("cuda"),
+                )
+                if cold
+                else 1,
+            ),
+            cold_l2_cache=cold,
+        )
+    else:
+        samples = bench_gpu_time_with_cupti(
+            fn,
+            dry_run_iters=10,
+            repeat_iters=repeats,
+            use_cuda_graph=True,
+            cold_l2_cache=cold,
+        )
     return statistics.median(samples) * 1000
 
 
@@ -281,7 +327,14 @@ def _bench_fused_hc_up(x, weight, repeats: int, *, large_tiles=False) -> dict:
 
 
 def main() -> None:
+    global _TIMING_BACKEND
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, choices=(1, 2, 4), default=1
+    )
+    parser.add_argument(
+        "--timing-backend", choices=("cupti", "cuda-event"), default="cupti"
+    )
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument(
         "--projections", choices=PROJECTIONS, nargs="+", default=list(PROJECTIONS)
@@ -296,14 +349,20 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    _TIMING_BACKEND = args.timing_backend
     if args.rowwise_fp8_hc_triton and (
         not args.rowwise_fp8_hc
         or args.projections != ["hc_up"]
         or not all(m > 32 for m in args.tokens)
     ):
         raise SystemExit("--rowwise-fp8-hc-triton requires HC up and M>32")
-    if torch.cuda.get_device_capability() != (12, 0):
-        raise SystemExit("This benchmark requires an SM120 GPU")
+    rowwise_fp8 = (
+        args.rowwise_fp8_head or args.rowwise_fp8_hc or args.rowwise_fp8_output
+    )
+    if rowwise_fp8 and (
+        torch.cuda.get_device_capability() != (12, 0) or args.tensor_parallel_size != 1
+    ):
+        raise SystemExit("Rowwise FP8 requires an SM120 GPU and TP1")
     if not shape_dynamic_skinny_gemm.is_available():
         raise SystemExit("This benchmark requires CuTe DSL")
     if not all(
@@ -322,14 +381,19 @@ def main() -> None:
         "commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
-        "timing": "FlashInfer CUPTI, CUDA graph, hot and cold L2",
+        "timing": (
+            "FlashInfer CUPTI, CUDA graph, hot and cold L2"
+            if _TIMING_BACKEND == "cupti"
+            else "FlashInfer CUDA events, CUDA graph, hot and rotating-buffer cold L2"
+        ),
+        "tensor_parallel_size": args.tensor_parallel_size,
         "dtype": "bfloat16",
         "cases": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with torch.inference_mode():
         for name in args.projections:
-            n, k = PROJECTIONS[name]
+            n, k = _local_shape(name, args.tensor_parallel_size)
             weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
             for m in args.tokens:
                 x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
@@ -421,6 +485,17 @@ def main() -> None:
                     if item["hot_speedup"] > 1.05 and item["cold_speedup"] > 1.05
                 ]
                 best = min(winners, key=lambda item: item["cold_us"], default=None)
+                if best is not None:
+                    config = SkinnyGemmConfig(**best["config"])
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        actual = shape_dynamic_skinny_gemm(x, weight, config)
+                    for sign in (-1, 1):
+                        x.neg_()
+                        graph.replay()
+                        torch.testing.assert_close(
+                            actual.float(), sign * reference, rtol=2e-2, atol=2e-1
+                        )
                 results["cases"].append(
                     {
                         "projection": name,
@@ -429,6 +504,9 @@ def main() -> None:
                         "baseline_cold_us": base_cold,
                         "candidates": candidates,
                         "best": best,
+                        "correctness": (
+                            "FP32 oracle; winning changed-input graph replay"
+                        ),
                     }
                 )
                 args.output.write_text(json.dumps(results, indent=2) + "\n")

@@ -370,13 +370,19 @@ def test_qwen4_exp_mtp_token_map_selects_matching_fp8_scales(tmp_path) -> None:
         draft.configure_mtp_token_map(str(path))
 
 
+@pytest.mark.parametrize("pp_size", [1, 2])
 def test_qwen4_exp_mtp_token_map_survives_target_head_sharing(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, pp_size
 ) -> None:
     """Reduced drafts return target IDs while target logits remain unchanged."""
     from vllm.v1.worker.gpu.spec_decode.mtp import speculator as mtp_speculator
 
     draft, target_head = _make_token_map_draft("cpu")
+    draft.vllm_config.parallel_config.pipeline_parallel_size = pp_size
+    monkeypatch.setattr(
+        "vllm.models.qwen4_exp.nvidia.mtp.get_pp_group",
+        lambda: SimpleNamespace(world_size=pp_size, is_last_rank=True),
+    )
     path = tmp_path / "tokens.pt"
     torch.save(torch.tensor([6, 2, 4]), path)
     hidden = torch.tensor([[1] * 4, [-1] * 4], dtype=torch.bfloat16)
@@ -407,6 +413,96 @@ def test_qwen4_exp_mtp_token_map_survives_target_head_sharing(
     torch.testing.assert_close(draft.get_top_tokens(hidden), expected.argmax(-1))
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("token_ids", [[6, 2, 4], [6, 0, 2, 4]])
+def test_qwen4_exp_mtp_tp2_token_map_balances_rows_and_preserves_global_ids(
+    monkeypatch, tmp_path, rank, token_ids
+) -> None:
+    """Repartition hot rows across TP ranks without changing target logits."""
+    from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    draft, _ = _make_token_map_draft("cpu")
+    draft.config.vocab_size = 7
+    draft.vllm_config.parallel_config.tensor_parallel_size = 2
+    monkeypatch.setattr(
+        vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: rank
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    full_weight = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+    full_weight[-1].zero_()
+    hidden = torch.tensor([[1] * 4, [-1] * 4, [0] * 4], dtype=torch.bfloat16)
+    with set_current_vllm_config(draft.vllm_config):
+        target_head = ParallelLMHead(7, 4, params_dtype=torch.bfloat16, padding_size=2)
+        target_head.weight.data.copy_(full_weight[rank * 4 : (rank + 1) * 4])
+        draft.lm_head = target_head
+        draft.logits_processor = LogitsProcessor(7)
+    target_processor = draft.logits_processor
+    original_weight = target_head.weight.clone()
+    original_pointer = target_head.weight.data_ptr()
+    gathered_weights = []
+
+    def gather_weights(weight, dim):
+        assert dim == 0 and weight is target_head.weight
+        gathered_weights.append(weight)
+        return full_weight.clone()
+
+    monkeypatch.setattr(mtp, "tensor_model_parallel_all_gather", gather_weights)
+    path = tmp_path / "tokens.pt"
+    torch.save(torch.tensor(token_ids), path)
+    draft.configure_mtp_token_map(str(path))
+    assert len(gathered_weights) == 1
+    assert target_head.weight.data_ptr() == original_pointer
+    torch.testing.assert_close(target_head.weight, original_weight)
+    sorted_ids = torch.tensor(sorted(token_ids))
+    padded_rows = draft.lm_head.num_embeddings_padded
+    reduced_weight = torch.zeros(padded_rows, 4, dtype=torch.bfloat16)
+    reduced_weight[: len(token_ids)] = full_weight[sorted_ids]
+    rows_per_rank = padded_rows // 2
+    torch.testing.assert_close(
+        draft.lm_head.weight,
+        reduced_weight[rank * rows_per_rank : (rank + 1) * rows_per_rank],
+    )
+    target_logits = hidden @ full_weight.t()
+    reduced_logits = hidden @ reduced_weight.t()
+    masked_logits = reduced_logits.clone()
+    masked_logits[:, len(token_ids) :] = -torch.inf
+    pairs = []
+    for peer in range(2):
+        values, indices = masked_logits[
+            :, peer * rows_per_rank : (peer + 1) * rows_per_rank
+        ].max(-1)
+        pairs.append(
+            torch.stack((values.float(), (indices + peer * rows_per_rank).float()), -1)
+        )
+
+    def gather_logits(logits, dim=-1):
+        assert dim == -1
+        if logits.dtype == torch.float32:
+            torch.testing.assert_close(logits, pairs[rank])
+            return torch.cat(pairs, dim=-1)
+        expected = target_logits if logits.shape[-1] == 4 else reduced_logits
+        width = logits.shape[-1]
+        torch.testing.assert_close(
+            logits, expected[:, rank * width : (rank + 1) * width]
+        )
+        return expected
+
+    monkeypatch.setattr(
+        logits_processor, "tensor_model_parallel_all_gather", gather_logits
+    )
+    monkeypatch.setattr(logits_processor, "tensor_model_parallel_gather", gather_logits)
+    torch.testing.assert_close(
+        target_processor(target_head, hidden), target_logits[:, :7]
+    )
+    expected = torch.full((hidden.shape[0], 7), -torch.inf, dtype=torch.bfloat16)
+    expected[:, sorted_ids] = reduced_logits[:, : len(token_ids)]
+    torch.testing.assert_close(draft.compute_logits(hidden), expected)
+    torch.testing.assert_close(draft.get_top_tokens(hidden), expected.argmax(-1))
+
+
 @pytest.mark.parametrize(
     "token_ids",
     [[], [[2, 4]], [2.0, 4.0], [2, 2], [-1, 2], [2, 8]],
@@ -421,16 +517,53 @@ def test_qwen4_exp_mtp_rejects_invalid_token_map(tmp_path, token_ids) -> None:
     assert draft.lm_head is target_head
 
 
-@pytest.mark.parametrize("unsupported", ["tp", "pp", "fp32"])
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        "tp",
+        "head_tp",
+        "head_padding",
+        "pp_non_last",
+        "pp_size",
+        "head_vocab",
+        "added_vocab",
+        "tp2_fp8",
+        "fp32",
+    ],
+)
 def test_qwen4_exp_mtp_token_map_rejects_unsupported_head(
-    tmp_path, unsupported
+    monkeypatch, tmp_path, unsupported
 ) -> None:
     """A token map cannot reinterpret sharded or non-BF16 head weights."""
     draft, target_head = _make_token_map_draft("cpu")
     if unsupported == "tp":
         draft.vllm_config.parallel_config.tensor_parallel_size = 2
-    elif unsupported == "pp":
+    elif unsupported == "head_tp":
+        target_head.tp_size = 2
+    elif unsupported == "head_padding":
+        draft.vllm_config.parallel_config.tensor_parallel_size = 2
+        target_head.tp_size = 2
+    elif unsupported == "pp_non_last":
         draft.vllm_config.parallel_config.pipeline_parallel_size = 2
+        monkeypatch.setattr(
+            "vllm.models.qwen4_exp.nvidia.mtp.get_pp_group",
+            lambda: SimpleNamespace(world_size=2, is_last_rank=False),
+        )
+    elif unsupported == "pp_size":
+        draft.vllm_config.parallel_config.pipeline_parallel_size = 3
+    elif unsupported == "head_vocab":
+        target_head.org_vocab_size = 4
+    elif unsupported == "added_vocab":
+        target_head.num_embeddings = 9
+    elif unsupported == "tp2_fp8":
+        from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import (
+            install_rowwise_fp8_head,
+        )
+
+        draft.vllm_config.parallel_config.tensor_parallel_size = 2
+        target_head.tp_size = 2
+        install_rowwise_fp8_head(target_head)
+        target_head.quant_method.process_weights_after_loading(target_head)
     else:
         target_head.weight.data = target_head.weight.float()
     path = tmp_path / "tokens.pt"
