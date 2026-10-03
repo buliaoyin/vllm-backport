@@ -102,6 +102,7 @@ class BudgetCosts:
     selected: int = 3
     changed: int = -8
     probing: int | None = None
+    probe_samples_remaining: int = 0
     refresh_remaining: int = 0
 
 
@@ -256,6 +257,8 @@ class AdaptiveDraftBudget:
         drafts_count = lengths.pop()
         costs = self._costs(drafts, key)
         costs.samples.setdefault(drafts_count, deque(maxlen=12)).append(elapsed)
+        if costs.probing == drafts_count and costs.probe_samples_remaining:
+            costs.probe_samples_remaining -= 1
 
     def retain_requests(self, req_ids: Collection[str]) -> None:
         for req_id in self.requests.keys() - req_ids:
@@ -297,7 +300,10 @@ class MTPDraftBudget(AdaptiveDraftBudget):
             if len(costs.samples.get(drafts, ())) < 3:
                 return drafts
         if costs.probing is not None:
-            if len(costs.samples.get(costs.probing, ())) < 3:
+            if (
+                len(costs.samples.get(costs.probing, ())) < 3
+                or costs.probe_samples_remaining
+            ):
                 return costs.probing
             costs.probing = None
         scores, measured = self._batch_scores(req_ids, costs)
@@ -308,8 +314,8 @@ class MTPDraftBudget(AdaptiveDraftBudget):
         if costs.decisions % 32 == 0:
             drafts = self.lengths[(costs.decisions // 32 - 1) % len(self.lengths)]
             # A one-step probe cannot time MTP: it still verifies the old K.
-            if drafts not in measured:
-                costs.probing = drafts
+            costs.probing = drafts
+            costs.probe_samples_remaining = 1
             return drafts
         return self._select(scores, costs)
 

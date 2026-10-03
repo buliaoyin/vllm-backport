@@ -430,6 +430,11 @@ class SpeculativeConfig:
     index_share_for_mtp_iteration: bool | None = None
     """Override whether MTP iterations reuse the first step's sparse indices.
     If `None`, use the value from the draft model's Hugging Face config."""
+    mtp_token_map: str | None = None
+    """Local torch file containing target token IDs for a reduced Qwen4Exp MTP
+    output vocabulary. Requires Model Runner V2, TP1/PP1, and a BF16 or
+    SM120 rowwise FP8 draft head. The target vocabulary and input embeddings
+    stay full size."""
 
     # Advanced control
     disable_padded_drafter_batch: bool = False
@@ -646,6 +651,7 @@ class SpeculativeConfig:
                 factors.append(tuple(layer_ids))
 
         if self.method == "mtp" and self.draft_model_config is not None:
+            factors.append(self.mtp_token_map)
             factors.append(
                 getattr(
                     self.draft_model_config.hf_config,
@@ -1809,6 +1815,13 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+
+        if self.mtp_token_map is not None and (
+            self.method != "mtp"
+            or self.draft_model_config is None
+            or self.draft_model_config.hf_config.model_type != "qwen4_exp_mtp"
+        ):
+            raise ValueError("mtp_token_map requires Qwen4Exp MTP")
 
         if self.dspark_num_query_tokens is not None:
             if not self.use_dspark() or self.draft_sample_method != "greedy":

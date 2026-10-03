@@ -42,6 +42,7 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
+from .ops.rowwise_fp8 import install_rowwise_fp8_hc
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +125,18 @@ class GatedResidual(nn.Module):
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
+
+    def enable_rowwise_fp8(self) -> None:
+        if self.use_combine:
+            install_rowwise_fp8_hc(
+                self.input_mix_weight_down_block_inject,
+                bf16_start=self.lora_rank,
+                bf16_rows=self.hc_count,
+                pad_rows=self.pad_size,
+            )
+        else:
+            install_rowwise_fp8_hc(self.input_mix_weight_down)
+        install_rowwise_fp8_hc(self.input_mix_weight_up)
 
     def mix(
         self, hidden_states: torch.Tensor

@@ -8,7 +8,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
@@ -18,10 +21,34 @@ from vllm.models.qwen4_exp.config import (
     Qwen4ExpTextConfig,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+from vllm.platforms import current_platform
 from vllm.v1.spec_decode.dynamic.adaptive import supports_adaptive_mtp
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from ...utils import spawn_new_process_for_each_test
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_qwen4_exp_qsa_excluded_projection_retains_online_quantization(online):
+    """QSA QKV may quantize BF16 weights without applying checkpoint FP4."""
+    from vllm.config.quantization import QuantizationConfigArgs
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+    from vllm.models.qwen4_exp.nvidia.model import without_modelopt_fp4
+
+    quant_config = ModelOptNvFp4Config(exclude_modules=[])
+    overlay = (
+        OnlineQuantizationConfig(
+            QuantizationConfigArgs(targets={"*.self_attn.qkv_proj": "mxfp8"})
+        )
+        if online
+        else None
+    )
+    quant_config.online_quantization_config = overlay
+
+    assert without_modelopt_fp4(quant_config) is overlay
 
 
 def _text_config(**kwargs) -> Qwen4ExpTextConfig:
@@ -107,6 +134,350 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
         multi_hidden.unflatten(-1, (2, 4)).mean(dim=-2),
     )
     assert returned_multi_hidden is multi_hidden
+
+
+def _make_token_map_draft(device: str):
+    from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMTP
+
+    config = VllmConfig()
+    draft = object.__new__(Qwen4ExpMTP)
+    torch.nn.Module.__init__(draft)
+    draft.vllm_config = config
+    draft.config = SimpleNamespace(vocab_size=8)
+    draft.model = torch.nn.Module()
+    with set_current_vllm_config(config), torch.device(device):
+        target_head = ParallelLMHead(
+            8, 4, params_dtype=torch.bfloat16, padding_size=1, disable_tp=True
+        )
+        target_head.weight.data.copy_(torch.arange(32).view(8, 4))
+        draft.lm_head = target_head
+        draft.logits_processor = LogitsProcessor(8)
+    draft.register_buffer("draft_id_to_target_id", None, persistent=False)
+    draft.register_buffer("mtp_token_map", None, persistent=False)
+    return draft, target_head
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["capability", "dtype", "head_dtype", "tp", "pp", "tied", "lora"]
+)
+@pytest.mark.parametrize("feature", ["head", "hc", "output"])
+def test_qwen4_exp_rowwise_fp8_head_rejects_unsupported_config(
+    monkeypatch, unsupported, feature
+) -> None:
+    """Weight-only FP8 must fail before loading outside its supported scope."""
+    from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import (
+        rowwise_fp8_hc_enabled,
+        rowwise_fp8_head_enabled,
+        rowwise_fp8_output_enabled,
+    )
+
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: True
+    )
+    text = SimpleNamespace(tie_word_embeddings=False)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(**{f"sm120_rowwise_fp8_{feature}": True}),
+            hf_text_config=text,
+            dtype=torch.bfloat16,
+            head_dtype=torch.bfloat16,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, pipeline_parallel_size=1
+        ),
+        lora_config=None,
+    )
+    enabled = {
+        "head": rowwise_fp8_head_enabled,
+        "hc": rowwise_fp8_hc_enabled,
+        "output": rowwise_fp8_output_enabled,
+    }[feature]
+    assert enabled(config)
+    if unsupported == "capability":
+        monkeypatch.setattr(
+            current_platform, "is_device_capability", lambda capability: False
+        )
+    elif unsupported in ("dtype", "head_dtype"):
+        setattr(config.model_config, unsupported, torch.float32)
+    elif unsupported in ("tp", "pp"):
+        name = (
+            "tensor_parallel_size" if unsupported == "tp" else "pipeline_parallel_size"
+        )
+        setattr(config.parallel_config, name, 2)
+    elif unsupported == "tied":
+        text.tie_word_embeddings = True
+    else:
+        config.lora_config = object()
+    if feature != "head" and unsupported in ("head_dtype", "tied"):
+        assert enabled(config)
+    else:
+        with pytest.raises(ValueError, match=f"sm120_rowwise_fp8_{feature} requires"):
+            enabled(config)
+
+
+def test_qwen4_exp_rowwise_fp8_head_reload_refreshes_values_and_scales() -> None:
+    """A BF16 checkpoint reload must refresh both FP8 tensors in-place."""
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+    from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import (
+        install_rowwise_fp8_head,
+        quantize_rowwise_fp8,
+    )
+
+    draft, head = _make_token_map_draft("cpu")
+    install_rowwise_fp8_head(head)
+    record_metadata_for_reloading(head)
+    head.quant_method.process_weights_after_loading(head)
+    weight_ptr = head.weight.data_ptr()
+    scale_ptr = head.weight_scale.data_ptr()
+    replacement = torch.arange(32, dtype=torch.bfloat16).view(8, 4).neg() / 3
+    expected_weight, expected_scale = quantize_rowwise_fp8(replacement)
+    with set_current_vllm_config(draft.vllm_config):
+        initialize_layerwise_reload(head)
+        head.weight.weight_loader(head.weight, replacement)
+        finalize_layerwise_reload(head, None)
+    assert head.weight.data_ptr() == weight_ptr
+    assert head.weight_scale.data_ptr() == scale_ptr
+    torch.testing.assert_close(head.weight.float(), expected_weight.float())
+    torch.testing.assert_close(head.weight_scale, expected_scale)
+
+
+def test_qwen4_exp_rowwise_fp8_head_rejects_direct_resident_reload() -> None:
+    """Plain BF16 copying cannot leave an FP8 head with stale row scales."""
+    from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import install_rowwise_fp8_head
+
+    _, head = _make_token_map_draft("cpu")
+    install_rowwise_fp8_head(head)
+    head.quant_method.process_weights_after_loading(head)
+    values, scales = head.weight.float().clone(), head.weight_scale.clone()
+    with pytest.raises(ValueError, match="layerwise weight reload"):
+        head.weight.weight_loader(head.weight, torch.zeros(8, 4, dtype=torch.bfloat16))
+    torch.testing.assert_close(head.weight.float(), values)
+    torch.testing.assert_close(head.weight_scale, scales)
+
+
+def test_qwen4_exp_rowwise_fp8_hc_reload_preserves_bf16_injection(monkeypatch) -> None:
+    """Merged HC reloads quantize mixing rows and retain original injection."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+    from vllm.models.qwen4_exp.nvidia.ops import rowwise_fp8
+
+    draft, layer = _make_token_map_draft("cpu")
+    layer.quant_method = UnquantizedLinearMethod()
+    layer.weight.data.copy_(torch.randn_like(layer.weight))
+    original = layer.weight.clone()
+    rowwise_fp8.install_rowwise_fp8_hc(layer, bf16_start=4, bf16_rows=2, pad_rows=2)
+    record_metadata_for_reloading(layer)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert torch.equal(layer.bf16_weight, original[4:6])
+    assert layer.weight.float()[4:].count_nonzero() == 0
+    pointers = tuple(
+        value.data_ptr()
+        for value in (layer.weight, layer.weight_scale, layer.bf16_weight)
+    )
+    replacement = original.neg() / 3
+    with set_current_vllm_config(draft.vllm_config):
+        initialize_layerwise_reload(layer)
+        layer.weight.weight_loader(layer.weight, replacement)
+        finalize_layerwise_reload(layer, None)
+    assert pointers == tuple(
+        value.data_ptr()
+        for value in (layer.weight, layer.weight_scale, layer.bf16_weight)
+    )
+    assert torch.equal(layer.bf16_weight, replacement[4:6])
+    monkeypatch.setattr(rowwise_fp8, "_CHUNK_BYTES", 16)
+    hidden = torch.ones(33, 4, dtype=torch.bfloat16)
+    actual = layer.quant_method.apply(layer, hidden)
+    expected = (hidden.float() @ layer.weight.float().t()) * layer.weight_scale
+    expected[:, 4:6] = hidden.float() @ replacement[4:6].float().t()
+    torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-2)
+    assert actual[:, 6:].count_nonzero() == 0
+
+
+def test_qwen4_exp_rowwise_fp8_output_reload_keeps_registered_scales() -> None:
+    """Output projection reloads update resident FP8 values and row scales."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import install_rowwise_fp8_output
+
+    draft, layer = _make_token_map_draft("cpu")
+    layer.weight = torch.nn.Parameter(
+        torch.ones(2560, 6144, dtype=torch.bfloat16), requires_grad=False
+    )
+    layer.weight.weight_loader = default_weight_loader
+    layer.quant_method = UnquantizedLinearMethod()
+    install_rowwise_fp8_output(layer)
+    record_metadata_for_reloading(layer)
+    layer.quant_method.process_weights_after_loading(layer)
+    weight_ptr, scale_ptr = layer.weight.data_ptr(), layer.weight_scale.data_ptr()
+    original_scale = layer.weight_scale.clone()
+    replacement = torch.full((2560, 6144), 3, dtype=torch.bfloat16)
+    replacement[:, 0] = 0
+    with set_current_vllm_config(draft.vllm_config):
+        initialize_layerwise_reload(layer)
+        layer.weight.weight_loader(layer.weight, replacement)
+        finalize_layerwise_reload(layer, None)
+    assert (layer.weight.data_ptr(), layer.weight_scale.data_ptr()) == (
+        weight_ptr,
+        scale_ptr,
+    )
+    torch.testing.assert_close(layer.weight_scale, original_scale * 3)
+    assert layer.weight.float()[:, 0].count_nonzero() == 0
+    assert torch.all(layer.weight.float()[:, 1:] == 448)
+    with pytest.raises(ValueError, match="unquantized BF16"):
+        install_rowwise_fp8_output(layer)
+    with pytest.raises(ValueError, match="layerwise weight reload"):
+        layer.weight.weight_loader(layer.weight, replacement)
+
+
+def test_qwen4_exp_mtp_token_map_selects_matching_fp8_scales(tmp_path) -> None:
+    """Reduced FP8 heads retain target logits and map draft IDs correctly."""
+    from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import install_rowwise_fp8_head
+
+    draft, target_head = _make_token_map_draft("cpu")
+    install_rowwise_fp8_head(target_head)
+    target_head.quant_method.process_weights_after_loading(target_head)
+    hidden = torch.tensor([[1] * 4, [-1] * 4], dtype=torch.bfloat16)
+    expected_target = draft.compute_logits(hidden).clone()
+    target_processor = draft.logits_processor
+    target_weight = target_head.weight
+    target_scale = target_head.weight_scale
+    path = tmp_path / "tokens.pt"
+    torch.save(torch.tensor([6, 2, 4]), path)
+    draft.configure_mtp_token_map(str(path))
+    assert target_head.weight is target_weight
+    assert target_head.weight_scale is target_scale
+    torch.testing.assert_close(target_processor(target_head, hidden), expected_target)
+    torch.testing.assert_close(draft.lm_head.weight_scale, target_scale[[2, 4, 6]])
+    expected = torch.full_like(expected_target, -torch.inf)
+    expected[:, [2, 4, 6]] = expected_target[:, [2, 4, 6]]
+    torch.testing.assert_close(draft.compute_logits(hidden), expected)
+    torch.testing.assert_close(draft.get_top_tokens(hidden), expected.argmax(-1))
+    with pytest.raises(ValueError, match="cannot be changed"):
+        draft.configure_mtp_token_map(str(path))
+
+
+def test_qwen4_exp_mtp_token_map_survives_target_head_sharing(
+    monkeypatch, tmp_path
+) -> None:
+    """Reduced drafts return target IDs while target logits remain unchanged."""
+    from vllm.v1.worker.gpu.spec_decode.mtp import speculator as mtp_speculator
+
+    draft, target_head = _make_token_map_draft("cpu")
+    path = tmp_path / "tokens.pt"
+    torch.save(torch.tensor([6, 2, 4]), path)
+    hidden = torch.tensor([[1] * 4, [-1] * 4], dtype=torch.bfloat16)
+    target_logits_processor = draft.logits_processor
+    expected_target = draft.compute_logits(hidden).clone()
+
+    def load_shared_model(*args):
+        draft.lm_head = target_head
+        return draft
+
+    monkeypatch.setattr(mtp_speculator, "load_eagle_model", load_shared_model)
+    runner = object.__new__(mtp_speculator.MTPSpeculator)
+    runner.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            mtp_token_map=str(path),
+            draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+    )
+    assert runner.load_draft_model(torch.nn.Module(), set()) is draft
+    assert draft.lm_head is not target_head
+    assert draft.lm_head.weight.shape == (3, 4)
+    torch.testing.assert_close(
+        target_logits_processor(target_head, hidden), expected_target
+    )
+    expected = torch.full_like(expected_target, -torch.inf)
+    expected[:, [2, 4, 6]] = expected_target[:, [2, 4, 6]]
+    torch.testing.assert_close(draft.compute_logits(hidden), expected)
+    torch.testing.assert_close(draft.get_top_tokens(hidden), expected.argmax(-1))
+
+
+@pytest.mark.parametrize(
+    "token_ids",
+    [[], [[2, 4]], [2.0, 4.0], [2, 2], [-1, 2], [2, 8]],
+)
+def test_qwen4_exp_mtp_rejects_invalid_token_map(tmp_path, token_ids) -> None:
+    """Invalid hot vocabularies must fail before replacing the shared head."""
+    draft, target_head = _make_token_map_draft("cpu")
+    path = tmp_path / "tokens.pt"
+    torch.save(torch.tensor(token_ids), path)
+    with pytest.raises(ValueError, match="mtp_token_map"):
+        draft.configure_mtp_token_map(str(path))
+    assert draft.lm_head is target_head
+
+
+@pytest.mark.parametrize("unsupported", ["tp", "pp", "fp32"])
+def test_qwen4_exp_mtp_token_map_rejects_unsupported_head(
+    tmp_path, unsupported
+) -> None:
+    """A token map cannot reinterpret sharded or non-BF16 head weights."""
+    draft, target_head = _make_token_map_draft("cpu")
+    if unsupported == "tp":
+        draft.vllm_config.parallel_config.tensor_parallel_size = 2
+    elif unsupported == "pp":
+        draft.vllm_config.parallel_config.pipeline_parallel_size = 2
+    else:
+        target_head.weight.data = target_head.weight.float()
+    path = tmp_path / "tokens.pt"
+    torch.save(torch.tensor([2, 4, 6]), path)
+    with pytest.raises(ValueError, match="mtp_token_map requires"):
+        draft.configure_mtp_token_map(str(path))
+    assert draft.lm_head is target_head
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not torch.cuda.is_available(),
+    reason="CUDA graph requires an available CUDA device",
+)
+@pytest.mark.parametrize("rowwise_fp8", [False, True])
+@torch.inference_mode()
+def test_qwen4_exp_mtp_reduced_head_cuda_graph_remaps_fresh_tokens(
+    tmp_path, rowwise_fp8
+) -> None:
+    """Captured draft sampling retains the reduced head and returns target IDs."""
+    draft, target_head = _make_token_map_draft("cuda")
+    if rowwise_fp8:
+        from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import (
+            install_rowwise_fp8_head,
+        )
+
+        install_rowwise_fp8_head(target_head)
+        target_head.quant_method.process_weights_after_loading(target_head)
+    path = tmp_path / "tokens.pt"
+    torch.save(torch.tensor([2, 4, 6]), path)
+    draft.configure_mtp_token_map(str(path))
+    hidden = torch.ones(2, 4, dtype=torch.bfloat16, device="cuda")
+    draft.get_top_tokens(hidden)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        tokens = draft.get_top_tokens(hidden)
+        logits = draft.compute_logits(hidden)
+    for sign in (-1, 1):
+        hidden.fill_(sign)
+        graph.replay()
+        reference = hidden.float() @ draft.lm_head.weight.float().t()
+        if rowwise_fp8:
+            reference *= draft.lm_head.weight_scale
+        expected = draft.mtp_token_map[reference.argmax(-1)]
+        torch.testing.assert_close(tokens, expected)
+        torch.testing.assert_close(logits.argmax(-1), expected)
+        assert torch.isneginf(logits[:, [0, 1, 3, 5, 7]]).all()
 
 
 @spawn_new_process_for_each_test

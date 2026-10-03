@@ -198,7 +198,6 @@ def _metadata_launch_pdl() -> bool:
 @triton.jit(
     do_not_specialize=[
         "num_reqs",
-        "num_mapped_tokens",
         "num_tokens",
         "max_num_work",
         "num_search_steps",
@@ -218,7 +217,6 @@ def _build_qsa_metadata_kernel(
     block_table_stride_0: tl.constexpr,
     block_table_stride_1: tl.constexpr,
     num_reqs,
-    num_mapped_tokens,
     num_tokens,
     max_num_work,
     num_search_steps,
@@ -235,6 +233,8 @@ def _build_qsa_metadata_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
 
+    # Captured draft graphs can replay with fewer live requests than at capture.
+    num_mapped_tokens = tl.load(query_start_loc_ptr + num_reqs)
     pid = tl.program_id(0)
     token_idx = pid * TOKEN_BLOCK_SIZE + tl.arange(0, TOKEN_BLOCK_SIZE)
     store_mask = token_idx < num_tokens
@@ -401,7 +401,6 @@ def build_qsa_metadata_triton(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build QSA side-cache and optional pre-indexer work metadata."""
     num_tokens = common_attn_metadata.num_actual_tokens
-    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
     token_to_req = token_to_req_buffer[:num_tokens]
     logical_positions = logical_positions_buffer[:num_tokens]
     visible_blocks = visible_blocks_buffer[:num_tokens]
@@ -444,7 +443,6 @@ def build_qsa_metadata_triton(
         block_table.stride(0),
         block_table.stride(1),
         num_reqs,
-        num_mapped_tokens,
         num_tokens,
         max_num_work,
         num_search_steps,
@@ -594,12 +592,14 @@ class QSAForwardMetadata(AttentionMetadata):
     max_seq_len: int
     storage_block_size: int
     compress_ratio: int
+    common_attn_metadata: CommonAttentionMetadata | None = None
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_draft_decode_metadata_update = True
 
     def __init__(
         self,
@@ -647,6 +647,28 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             self.k_work_metadata_buffer = torch.empty(
                 0, 2, dtype=torch.int32, device=device
             )
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        assert metadata.num_prefills == 0 and metadata.decode_query_len in (0, 1)
+        assert metadata.common_attn_metadata is not None
+        build_qsa_metadata(
+            metadata.common_attn_metadata,
+            metadata.token_to_req,
+            metadata.logical_positions,
+            metadata.visible_blocks,
+            metadata.slot_mapping,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=(
+                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+            ),
+            k_work_metadata_buffer=(
+                metadata.k_work_metadata
+                if not self.is_circular_buffer and self.compress_ratio != 1
+                else None
+            ),
+            request_capacity=self.request_capacity,
+        )
 
     def build(
         self,
@@ -721,6 +743,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            common_attn_metadata=common_attn_metadata,
         )
 
 

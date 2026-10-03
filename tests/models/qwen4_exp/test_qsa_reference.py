@@ -8,12 +8,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.models.qwen4_exp.common import qsa_cache
 from vllm.models.qwen4_exp.common.qsa_cache import QSAMetadataBuilder
 from vllm.models.qwen4_exp.nvidia import indexer_qsa
 from vllm.models.qwen4_exp.nvidia import (
     model as _qwen4_exp_model,  # noqa: F401
 )
+from vllm.models.qwen4_exp.nvidia import qsa as qsa_attention
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
 from vllm.platforms import current_platform
@@ -23,6 +26,144 @@ requires_qsa_kernels = pytest.mark.skipif(
     not current_platform.is_cuda() or not HAS_TRITON,
     reason="QSA kernels require CUDA and Triton",
 )
+
+
+def _make_overlap_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    mode: CUDAGraphMode,
+):
+    attention = object.__new__(qsa_attention.Qwen4ExpQSAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.layer_name = "main"
+    attention.num_heads = attention.num_kv_heads = attention.head_dim = 1
+    attention._max_decode_query_len = 4
+    attention.kv_cache = torch.ones(1, device=device)
+    attention.topk_indices_buffer = torch.full(
+        (4, 2), -99, dtype=torch.int32, device=device
+    )
+    attention._indexer_stream = torch.cuda.Stream() if device == "cuda" else object()
+    attention._indexer_start_event = (
+        torch.cuda.Event() if device == "cuda" else object()
+    )
+    attention._indexer_done_event = torch.cuda.Event() if device == "cuda" else object()
+    calls = []
+
+    class IndexProjection(torch.nn.Module):
+        quant_method = UnquantizedLinearMethod()
+
+        def forward(self, x):
+            calls.append("index_projection")
+            return x, None
+
+    class Indexer(torch.nn.Module):
+        skip_topk = False
+        packed_output_width = 2
+        raw_key_cache = SimpleNamespace(prefix="side")
+
+        def __init__(self):
+            super().__init__()
+            self.index_qk_proj = IndexProjection()
+
+        def forward(self, projected, positions, out):
+            calls.append("selection")
+            out[:, 0].copy_(projected[: out.shape[0], 0].to(torch.int32))
+            out[:, 1].fill_(1)
+            return out
+
+    def cache_update(*args):
+        calls.append("main_cache_update")
+
+    def attend(layer, query, key, value, cache, metadata, output, **kwargs):
+        output.zero_()
+        output[: metadata.num_actual_tokens, 0, 0].copy_(
+            layer.topk_indices_buffer[: metadata.num_actual_tokens, 0]
+        )
+
+    attention.indexer = Indexer()
+    attention.qkv_proj = lambda x: (x, None)
+    attention._project_qkv_gate = lambda qkv, positions: (qkv, qkv, qkv, None)
+    attention.o_proj = lambda x: (x, None)
+    attention.impl = SimpleNamespace(
+        do_kv_cache_update=cache_update, forward_qsa=attend
+    )
+    metadata = {
+        "main": SimpleNamespace(
+            num_actual_tokens=3, max_query_len=4, slot_mapping=torch.arange(3)
+        ),
+        "side": SimpleNamespace(num_actual_tokens=3, token_to_req=torch.zeros(3)),
+    }
+    monkeypatch.setattr(
+        qsa_attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata, cudagraph_runtime_mode=mode),
+    )
+    return attention, calls
+
+
+@pytest.mark.parametrize(
+    "mode,breakable,quantized_indexer,expected_parallel",
+    [
+        (CUDAGraphMode.FULL, False, False, True),
+        (CUDAGraphMode.NONE, False, False, True),
+        (CUDAGraphMode.PIECEWISE, False, False, False),
+        (CUDAGraphMode.FULL, True, False, False),
+        (CUDAGraphMode.FULL, False, True, False),
+    ],
+)
+def test_qsa_overlap_refreshes_selection_once_before_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: CUDAGraphMode,
+    breakable: bool,
+    quantized_indexer: bool,
+    expected_parallel: bool,
+) -> None:
+    """Preselection must replace stale rows without repeating side-cache updates."""
+    attention, calls = _make_overlap_attention(monkeypatch, "cpu", mode)
+    if quantized_indexer:
+        attention.indexer.index_qk_proj.quant_method = object()
+    parallel_calls = []
+
+    def parallel(main, auxiliaries, *args, **kwargs):
+        parallel_calls.append(True)
+        selections = [fn() for fn in auxiliaries]
+        return main(), selections
+
+    monkeypatch.setattr(qsa_attention, "execute_in_parallel", parallel)
+    monkeypatch.setattr(
+        qsa_attention.BreakableCUDAGraphCapture, "is_active", lambda: breakable
+    )
+    for values in ([2, 4, 6, 8], [10, 12, 14, 16]):
+        calls.clear()
+        hidden = torch.tensor(values, dtype=torch.bfloat16).view(4, 1)
+        actual = attention(torch.arange(4), hidden)
+        torch.testing.assert_close(
+            actual, hidden * hidden.new_tensor([[1], [1], [1], [0]])
+        )
+        assert calls == ["index_projection", "selection", "main_cache_update"]
+    assert bool(parallel_calls) == expected_parallel
+    assert attention.topk_indices_buffer[3].tolist() == [-99, -99]
+
+
+@requires_qsa_kernels
+def test_qsa_overlap_cuda_graph_replay_reads_fresh_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The main stream must wait for the graphed indexer before consuming its rows."""
+    attention, _ = _make_overlap_attention(monkeypatch, "cuda", CUDAGraphMode.FULL)
+    hidden = torch.arange(4, dtype=torch.bfloat16, device="cuda").view(4, 1)
+    positions = torch.arange(4, device="cuda")
+    attention(positions, hidden)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = attention(positions, hidden)
+    for step in range(1, 4):
+        hidden.add_(4)
+        graph.replay()
+        expected = hidden.clone()
+        expected[3].zero_()
+        torch.testing.assert_close(output, expected)
 
 
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
@@ -89,6 +230,131 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     assert actual is rows
     assert len(updates) == 1
     assert not selections
+
+
+def _make_qsa_metadata_builder(
+    cache_type: str,
+    layers: list[str],
+    device: torch.device,
+) -> QSAMetadataBuilder:
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
+
+    kwargs = dict(block_size=8, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+    spec = (
+        CircularBufferSpec(**kwargs)
+        if cache_type == "raw"
+        else MLAAttentionSpec(**kwargs, tokens_per_state=4)
+    )
+    config = SimpleNamespace(
+        speculative_config=None,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=4),
+    )
+    return QSAMetadataBuilder(spec, layers, config, device)
+
+
+@pytest.mark.parametrize("cache_type", ["raw", "compressed"])
+def test_qsa_fused_metadata_refreshes_every_owner_that_updates_caches(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_type: str,
+) -> None:
+    """Every cache group refreshes its draft position and compressed slots."""
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    monkeypatch.setattr(
+        qsa_cache, "build_qsa_metadata", qsa_cache._build_qsa_metadata_torch
+    )
+    builder = _make_qsa_metadata_builder(cache_type, ["draft"], torch.device("cpu"))
+    common = CommonAttentionMetadata(
+        num_actual_tokens=1,
+        num_reqs=1,
+        max_query_len=1,
+        max_seq_len=8,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([7], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[2]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0], dtype=torch.int64),
+    )
+    metadata = builder.build(0, common)
+    common.seq_lens.add_(1)
+    assert builder.supports_draft_decode_metadata_update
+    builder.update_draft_decode_metadata(metadata)
+    assert metadata.logical_positions.tolist() == [7]
+    if cache_type == "compressed":
+        assert metadata.slot_mapping.tolist() == [5]
+    common.query_start_loc.zero_()
+    common.query_start_loc_cpu.zero_()
+    common.seq_lens.zero_()
+    idle_metadata = builder.build(0, common)
+    assert idle_metadata.decode_query_len == 0
+    builder.update_draft_decode_metadata(idle_metadata)
+    assert idle_metadata.logical_positions.tolist() == [-1]
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("cache_type", ["raw", "compressed"])
+def test_qsa_fused_metadata_graph_refresh_matches_fresh_build(
+    cache_type: str,
+) -> None:
+    """Captured refresh honors live lengths, physical owners, and request padding."""
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    device = torch.device("cuda")
+    builder = _make_qsa_metadata_builder(cache_type, ["target"], device)
+    reference_builder = _make_qsa_metadata_builder(cache_type, ["target"], device)
+    table = torch.tensor(
+        [[3, 7, 10], [1, 5, 11], [4, 0, 12], [2, 6, 13]],
+        dtype=torch.int32,
+        device=device,
+    )
+    common = CommonAttentionMetadata(
+        num_actual_tokens=4,
+        num_reqs=4,
+        max_query_len=1,
+        max_seq_len=24,
+        query_start_loc=torch.arange(5, dtype=torch.int32, device=device),
+        query_start_loc_cpu=torch.arange(5, dtype=torch.int32),
+        seq_lens=torch.tensor([7, 15, 9, 3], dtype=torch.int32, device=device),
+        block_table_tensor=table.clone(),
+        slot_mapping=torch.arange(4, dtype=torch.int64, device=device),
+    )
+    metadata = builder.build(0, common)
+    tensor_names = (
+        "token_to_req",
+        "logical_positions",
+        "visible_blocks",
+        "slot_mapping",
+        "k_work_metadata",
+    )
+    pointers = [getattr(metadata, name).data_ptr() for name in tensor_names]
+    builder.update_draft_decode_metadata(metadata)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        builder.update_draft_decode_metadata(metadata)
+    states = [
+        ([8, 16, 10, 4], [0, 1, 2, 3, 4], [0, 1, 2, 3]),
+        ([17, 8, 5, 11], [0, 1, 2, 3, 4], [0, 1, 2, 3]),
+        ([16, 8, 0, 0], [0, 1, 2, 2, 2], [0, -1, -1, -1]),
+        ([0, 0, 0, 0], [0, 0, 0, 0, 0], [-1, -1, -1, -1]),
+        ([24, 9, 12, 0], [0, 1, 2, 3, 3], [0, 1, 2, -1]),
+    ]
+    for step, (lengths, query_starts, common_slots) in enumerate(states):
+        common.seq_lens.copy_(common.seq_lens.new_tensor(lengths))
+        common.query_start_loc.copy_(common.query_start_loc.new_tensor(query_starts))
+        common.slot_mapping.copy_(common.slot_mapping.new_tensor(common_slots))
+        common.block_table_tensor.copy_(table.roll(step, dims=0))
+        graph.replay()
+        # Capture-time CPU offsets intentionally remain unchanged during replay.
+        reference_common = common.replace(
+            query_start_loc_cpu=torch.tensor(query_starts, dtype=torch.int32)
+        )
+        expected = reference_builder.build(0, reference_common)
+        for name, pointer in zip(tensor_names, pointers):
+            actual = getattr(metadata, name)
+            assert actual.data_ptr() == pointer
+            torch.testing.assert_close(actual, getattr(expected, name))
 
 
 def _qsa_mqa_paged_reference(
@@ -1083,6 +1349,101 @@ def test_qsa_sparse_paged_attention_correctness(
         scale,
     )
 
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("num_rows", "use_prefill_config", "selection_width", "page_size"),
+    [
+        (4, False, 2048, 16),
+        (65, True, 2048, 16),
+        (136, True, 2051, 1664),
+        (257, True, 2053, 1664),
+        (1025, True, 2051, 1664),
+        (1025, False, 2053, 1664),
+    ],
+)
+def test_qsa_fp8_cache_round_trip(
+    num_rows: int, use_prefill_config: bool, selection_width: int, page_size: int
+) -> None:
+    """Native cache writes and sparse reads apply the same calibrated scales."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(17)
+    num_pages, num_kv_heads, head_dim = 4, 2, 256
+    source = torch.randn(
+        num_pages * page_size,
+        num_kv_heads,
+        2 * head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    key, value = (part.contiguous() for part in source.split(head_dim, dim=-1))
+    cache = torch.empty(
+        num_pages,
+        num_kv_heads,
+        page_size,
+        2 * head_dim,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    key_cache, value_cache = cache.transpose(1, 2).split(head_dim, dim=-1)
+    k_scale = torch.tensor(0.25, dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor(2.0, dtype=torch.float32, device="cuda")
+    ops.reshape_and_cache_flash(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        torch.arange(num_pages * page_size, dtype=torch.int64, device="cuda"),
+        "fp8_e4m3",
+        k_scale,
+        v_scale,
+    )
+    query = torch.randn(num_rows, 24, head_dim, dtype=torch.bfloat16, device="cuda")
+    block_table = torch.tensor([[2, 0], [3, 1]], dtype=torch.int32, device="cuda")
+    token_to_req = torch.arange(num_rows, dtype=torch.int32, device="cuda") % 2
+    indices = torch.full(
+        (num_rows, selection_width + 1), -1, dtype=torch.int32, device="cuda"
+    )
+    indices[:, :5] = torch.tensor(
+        [0, 1, page_size - 1, page_size, 2 * page_size - 1], device="cuda"
+    )
+    indices[::3, 3:5] = -1
+    indices[::5, :5] = -1
+    if selection_width <= 2 * page_size:
+        indices[1, :selection_width] = torch.arange(selection_width, device="cuda")
+    indices[:, -1] = (indices[:, :-1] >= 0).sum(dim=1)
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        query,
+        key_cache.view(torch.float8_e4m3fn),
+        value_cache.view(torch.float8_e4m3fn),
+        indices,
+        block_table,
+        token_to_req,
+        use_prefill_config,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    reference_caches = []
+    for rows, scale in ((key, k_scale), (value, v_scale)):
+        quantized = (rows.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        reference_caches.append(
+            (quantized.float() * scale)
+            .to(torch.bfloat16)
+            .reshape(num_pages, page_size, num_kv_heads, head_dim)
+        )
+    expected = _qsa_sparse_paged_attention_reference(
+        query,
+        reference_caches[0],
+        reference_caches[1],
+        indices[:, :-1],
+        block_table,
+        token_to_req,
+        head_dim**-0.5,
+    )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 

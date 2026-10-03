@@ -144,6 +144,88 @@ QWEN4_EXP_SM90_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = 
 }
 
 
+# RTX PRO 6000 TP=1 plans selected by CUDA graph measurements with hot
+# and cold L2. Other token counts retain the standard linear implementation.
+QWEN4_EXP_SM120_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
+    (16384, 2560): {
+        1: SkinnyGemmConfig(1, 64, 4, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 2, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+    },
+    (2560, 6144): {
+        1: SkinnyGemmConfig(1, 128, 2, static_k=6144),
+        2: SkinnyGemmConfig(2, 128, 1, vector_width=4, static_k=6144),
+        4: SkinnyGemmConfig(4, 256, 1, vector_width=4, static_k=6144),
+    },
+    (96, 2560): {
+        1: SkinnyGemmConfig(1, 128, 2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 4, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
+        16: SkinnyGemmConfig(16, 128, 1, vector_width=4, static_k=2560),
+    },
+    (13312, 2560): {
+        1: SkinnyGemmConfig(1, 64, 4, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 1, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 64, 2, k_unroll=2, vector_width=4),
+    },
+    (640, 2560): {
+        1: SkinnyGemmConfig(1, 128, 2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
+    },
+    (1280, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 4, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
+    },
+    (2560, 640): {
+        1: SkinnyGemmConfig(1, 32, 4, vector_width=2, static_k=640),
+        2: SkinnyGemmConfig(2, 32, 2, vector_width=2, static_k=640),
+        4: SkinnyGemmConfig(4, 32, 4, vector_width=4, static_k=640),
+        8: SkinnyGemmConfig(8, 32, 2, k_unroll=2, vector_width=2),
+    },
+    (512, 2560): {
+        1: SkinnyGemmConfig(1, 64, 2, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
+    },
+    (336, 10240): {
+        1: SkinnyGemmConfig(1, 256, 1, vector_width=4, static_k=10240),
+        2: SkinnyGemmConfig(2, 128, 2, static_k=10240),
+        4: SkinnyGemmConfig(4, 256, 1, vector_width=4, static_k=10240),
+    },
+    (320, 10240): {
+        1: SkinnyGemmConfig(1, 256, 1, vector_width=4, static_k=10240),
+        2: SkinnyGemmConfig(2, 256, 1, vector_width=4, static_k=10240),
+        4: SkinnyGemmConfig(4, 256, 1, vector_width=4, static_k=10240),
+    },
+    (10240, 320): {
+        1: SkinnyGemmConfig(1, 32, 8, vector_width=2, static_k=320),
+        2: SkinnyGemmConfig(2, 32, 8, vector_width=2, static_k=320),
+    },
+    (12800, 2560): {
+        1: SkinnyGemmConfig(1, 64, 4, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 2, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 64, 2, k_unroll=2, vector_width=4),
+    },
+    (2560, 2560): {
+        1: SkinnyGemmConfig(1, 128, 2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 4, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
+    },
+    (248320, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, k_unroll=4, vector_width=4),
+    },
+}
+
+
 def _is_sm103() -> bool:
     return current_platform.is_device_capability((10, 3))
 
@@ -152,11 +234,17 @@ def _is_sm90() -> bool:
     return current_platform.is_device_capability((9, 0))
 
 
+def _is_sm120() -> bool:
+    return current_platform.is_device_capability((12, 0))
+
+
 def _gemm_plans() -> dict[tuple[int, int], dict[int, SkinnyGemmConfig]]:
     if _is_sm103():
         return QWEN4_EXP_GEMM_PLANS
     if _is_sm90():
         return QWEN4_EXP_SM90_GEMM_PLANS
+    if _is_sm120():
+        return QWEN4_EXP_SM120_GEMM_PLANS
     return {}
 
 
@@ -238,7 +326,7 @@ def enable_qwen4_exp_low_latency_gemm(
     warmup_configs: set[SkinnyGemmConfig] = set()
     for child in module.modules():
         is_linear = (
-            isinstance(child, LinearBase)
+            isinstance(child, (LinearBase, ParallelLMHead))
             and type(child.quant_method) is UnquantizedLinearMethod
         )
         is_head = (

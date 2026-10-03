@@ -73,6 +73,8 @@ class MTPSpeculator(AutoRegressiveSpeculator):
     ) -> nn.Module:
         draft_model = load_eagle_model(target_model, self.vllm_config)
         spec_config = self.vllm_config.speculative_config
+        if spec_config is not None and spec_config.mtp_token_map is not None:
+            draft_model.configure_mtp_token_map(spec_config.mtp_token_map)
         draft_hf_config = (
             spec_config.draft_model_config.hf_config
             if spec_config is not None

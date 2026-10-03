@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -211,6 +212,33 @@ def test_mtp_batch_probes_measure_shapes_with_nonlinear_costs():
         budget.complete(step, now, dict.fromkeys(req_ids, min(previous, 4) + 1))
         previous = k
     assert choices[-64:].count(4) >= 58
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_batch_refreshes_previously_measured_costs(feedback_delay: int) -> None:
+    """Periodic probes must measure again when a calibrated K becomes faster."""
+    budget = MTPDraftBudget(3)
+    req_ids = [str(i) for i in range(4)]
+    latencies = {1: 0.020, 2: 0.019, 3: 0.018}
+    pending: deque[tuple[int, float, int]] = deque()
+    now, previous = 0.0, 3
+    choices: list[int] = []
+    for step in range(424):
+        if step == 24:
+            assert choices[-1] == 3
+            latencies[2] = 0.010
+        k = budget.choose(req_ids, 4096, False)
+        choices.append(k)
+        budget.scheduled(
+            step, now, 4096, False, dict.fromkeys(req_ids, previous), proposal_drafts=k
+        )
+        now += latencies[k]
+        pending.append((step, now, previous + 1))
+        if len(pending) > feedback_delay:
+            completed, finished, sampled = pending.popleft()
+            budget.complete(completed, finished, dict.fromkeys(req_ids, sampled))
+        previous = k
+    assert choices[-64:].count(2) >= 56
 
 
 def test_mtp_batch_rejecting_drafts_starts_with_short_calibration():

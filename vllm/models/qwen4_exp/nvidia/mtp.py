@@ -25,14 +25,18 @@ from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import LocalArgmaxMixin, SupportsPP
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -43,6 +47,7 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -57,6 +62,7 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+from .ops.rowwise_fp8 import RowwiseFP8HeadMethod, install_rowwise_fp8_head
 
 
 def _remap_ignored_layers(
@@ -402,7 +408,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
-class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+class Qwen4ExpMTP(LocalArgmaxMixin, nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+    mtp_token_map: torch.Tensor | None
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.language_model.lm_head.": "lm_head.",
@@ -425,6 +433,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
+        if (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.mtp_token_map is not None
+            and not vllm_config.use_v2_model_runner
+        ):
+            raise ValueError("mtp_token_map requires Model Runner V2")
         cache_config = vllm_config.cache_config
         if cache_config.mamba_cache_mode == "all":
             raise NotImplementedError(
@@ -455,6 +469,8 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.register_buffer("draft_id_to_target_id", None, persistent=False)
+        self.register_buffer("mtp_token_map", None, persistent=False)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -485,7 +501,82 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is None or self.mtp_token_map is None:
+            return logits
+        full_logits = logits.new_full(
+            (*logits.shape[:-1], self.config.vocab_size), float("-inf")
+        )
+        full_logits[..., self.mtp_token_map] = logits
+        return full_logits
+
+    @torch.no_grad()
+    def configure_mtp_token_map(self, path: str) -> None:
+        """Install a reduced output head after sharing target model weights."""
+        if self.mtp_token_map is not None:
+            raise ValueError("mtp_token_map cannot be changed after draft setup")
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            parallel_config.tensor_parallel_size != 1
+            or parallel_config.pipeline_parallel_size != 1
+            or self.lm_head.tp_size != 1
+        ):
+            raise ValueError("mtp_token_map requires TP1 and PP1")
+        weight = self.lm_head.weight
+        rowwise_fp8 = isinstance(self.lm_head.quant_method, RowwiseFP8HeadMethod)
+        if rowwise_fp8:
+            if (
+                weight.dtype != torch.float8_e4m3fn
+                or self.lm_head.weight_scale.dtype != torch.float32
+                or self.lm_head.weight_scale.shape != weight.shape[:1]
+            ):
+                raise ValueError("mtp_token_map requires a valid rowwise FP8 head")
+        elif weight.dtype != torch.bfloat16 or not isinstance(
+            self.lm_head.quant_method,
+            (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+        ):
+            raise ValueError("mtp_token_map requires an unquantized BF16 head")
+        token_ids = torch.as_tensor(
+            torch.load(path, map_location="cpu", weights_only=True)
+        )
+        if (
+            token_ids.ndim != 1
+            or token_ids.numel() == 0
+            or token_ids.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("mtp_token_map must contain a nonempty integer vector")
+        token_ids = token_ids.to(torch.int64).sort().values
+        if (
+            token_ids[0] < 0
+            or token_ids[-1] >= self.config.vocab_size
+            or token_ids.unique().numel() != token_ids.numel()
+        ):
+            raise ValueError("mtp_token_map token IDs must be unique and in range")
+        token_ids = token_ids.to(weight.device)
+        with set_current_vllm_config(self.vllm_config), torch.device(weight.device):
+            head = ParallelLMHead(
+                token_ids.numel(),
+                weight.shape[1],
+                params_dtype=torch.bfloat16,
+                padding_size=1,
+                disable_tp=True,
+            )
+            logits_processor = LogitsProcessor(token_ids.numel())
+        if rowwise_fp8:
+            install_rowwise_fp8_head(head)
+            replace_parameter(head, "weight", weight.index_select(0, token_ids))
+            head.weight_scale.copy_(
+                self.lm_head.weight_scale.index_select(0, token_ids)
+            )
+            head.quant_method.process_weights_after_loading(head)
+        else:
+            head.weight.copy_(weight.index_select(0, token_ids))
+        self.lm_head = head
+        self.logits_processor = logits_processor
+        self.mtp_token_map = token_ids
+        self.draft_id_to_target_id = token_ids - torch.arange(
+            token_ids.numel(), device=weight.device
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

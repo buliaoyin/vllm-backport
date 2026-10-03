@@ -20,6 +20,130 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import KIMI_K3_PROJECTIONS
 from vllm.models.qwen4_exp.nvidia import low_latency_gemm as qwen4_exp_gemm
 from vllm.platforms import current_platform
 
+
+@pytest.mark.parametrize("num_tokens", [0, 1, 4, 16, 33])
+@pytest.mark.parametrize("shape", [(67, 130), (65536, 2560), (248320, 2560)])
+@torch.inference_mode()
+def test_qwen4_exp_rowwise_fp8_head_replays_changed_inputs(num_tokens, shape) -> None:
+    """Weight-only FP8 logits match an independent FP32 quantized oracle."""
+    from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import (
+        quantize_rowwise_fp8,
+        rowwise_fp8_logits,
+    )
+
+    if not current_platform.is_cuda() or not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 is required")
+    torch.manual_seed(73)
+    n, k = shape
+    weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    weight[0].zero_()
+    quantized, scales = quantize_rowwise_fp8(weight)
+    x = torch.randn(num_tokens, k, dtype=torch.bfloat16, device="cuda")
+    rowwise_fp8_logits(x, quantized, scales)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = rowwise_fp8_logits(x, quantized, scales)
+    for sign in (-1, 1):
+        x.mul_(sign)
+        graph.replay()
+        reference = (x.float() @ quantized.float().t()) * scales
+        torch.testing.assert_close(actual.float(), reference, rtol=1e-2, atol=1e-1)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 33])
+@pytest.mark.parametrize(
+    "shape,bf16_start,bf16_rows,pad_rows",
+    [
+        ((71, 259), 63, 3, 5),
+        ((336, 10240), 320, 4, 12),
+        ((320, 10240), 0, 0, 0),
+        ((10240, 320), 0, 0, 0),
+    ],
+)
+@torch.inference_mode()
+def test_qwen4_exp_rowwise_fp8_hc_keeps_injection_bf16(
+    num_tokens, shape, bf16_start, bf16_rows, pad_rows
+) -> None:
+    """HC quantization preserves injection rows across CUDA graph replays."""
+    from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import (
+        quantize_rowwise_fp8,
+        rowwise_fp8_logits,
+    )
+
+    if not current_platform.is_cuda() or not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 is required")
+    torch.manual_seed(81)
+    n, k = shape
+    weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    quantized, scale = quantize_rowwise_fp8(weight)
+    bf16 = weight[bf16_start : bf16_start + bf16_rows].clone()
+    quantized[bf16_start : bf16_start + bf16_rows] = 0
+    scale[bf16_start : bf16_start + bf16_rows] = 1
+    if pad_rows:
+        quantized[-pad_rows:] = 0
+        scale[-pad_rows:] = 1
+    x = torch.randn(num_tokens, k, dtype=torch.bfloat16, device="cuda")
+    rowwise_fp8_logits(x, quantized, scale, bf16, bf16_start)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = rowwise_fp8_logits(x, quantized, scale, bf16, bf16_start)
+    for sign in (-1, 1):
+        x.mul_(sign)
+        graph.replay()
+        reference = (x.float() @ quantized.float().t()) * scale
+        reference[:, bf16_start : bf16_start + bf16_rows] = x.float() @ bf16.float().t()
+        torch.testing.assert_close(actual.float(), reference, rtol=1e-2, atol=1e-1)
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1, 4, 12, 16, 32, 33, 129, 4096, 8192])
+@torch.inference_mode()
+def test_qwen4_exp_rowwise_fp8_output_replays_input_scales(num_tokens) -> None:
+    """Hybrid output projections retain row scales and capture input quantization."""
+    from types import SimpleNamespace
+
+    from vllm import _custom_ops as ops
+    from vllm.models.qwen4_exp.nvidia.ops.rowwise_fp8 import (
+        RowwiseFP8OutputMethod,
+        quantize_rowwise_fp8,
+    )
+
+    if not current_platform.is_cuda() or not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 is required")
+    torch.manual_seed(75)
+    weight = torch.randn(2560, 6144, dtype=torch.bfloat16, device="cuda")
+    quantized, scales = quantize_rowwise_fp8(weight)
+    layer = SimpleNamespace(weight=quantized, weight_scale=scales)
+    x = torch.randn(num_tokens, 12288, dtype=torch.bfloat16, device="cuda")[:, ::2]
+    bias = torch.randn(2560, dtype=torch.bfloat16, device="cuda")
+    method = RowwiseFP8OutputMethod()
+    method.apply(layer, x, bias)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = method.apply(layer, x)
+        biased = method.apply(layer, x, bias)
+    for shift in (-0.125, 0.25):
+        x.add_(shift)
+        graph.replay()
+        if num_tokens > 32:
+            aq, input_scale = ops.scaled_fp8_quant(
+                x.contiguous(), use_per_token_if_dynamic=True
+            )
+            reference = (aq.float() @ quantized.float().t()) * input_scale * scales
+        else:
+            reference = (x.float() @ quantized.float().t()) * scales
+        torch.testing.assert_close(actual.float(), reference, rtol=1e-2, atol=1e-1)
+        torch.testing.assert_close(biased, actual + bias, rtol=0, atol=0)
+
+
 # Keyed by local (N, K): (cute token counts, dsv3 token counts). 1536x7168 is
 # the unified shared_gate_up_proj/mla_g_proj entry (dsv3 M1..16).
 EXPECTED_SELECTIONS = {
@@ -79,9 +203,15 @@ GLM_CUTE_CASES = [
     for _, config in spec.cute_configs
 ]
 
-QWEN4_EXP_SM90_CASES = [
-    (n, k, num_tokens, config)
-    for (n, k), plans in qwen4_exp_gemm.QWEN4_EXP_SM90_GEMM_PLANS.items()
+QWEN4_EXP_GPU_TABLES = (
+    ((9, 0), qwen4_exp_gemm.QWEN4_EXP_SM90_GEMM_PLANS),
+    ((12, 0), qwen4_exp_gemm.QWEN4_EXP_SM120_GEMM_PLANS),
+)
+
+QWEN4_EXP_CUTE_CASES = [
+    (capability, n, k, num_tokens, config)
+    for capability, table in QWEN4_EXP_GPU_TABLES
+    for (n, k), plans in table.items()
     for num_tokens, config in plans.items()
 ]
 
@@ -615,6 +745,8 @@ def test_qwen4_exp_hopper_plans_are_valid() -> None:
     [
         ((10, 3), qwen4_exp_gemm.QWEN4_EXP_GEMM_PLANS),
         ((9, 0), qwen4_exp_gemm.QWEN4_EXP_SM90_GEMM_PLANS),
+        ((12, 0), qwen4_exp_gemm.QWEN4_EXP_SM120_GEMM_PLANS),
+        ((12, 1), {}),
         ((8, 0), {}),
     ],
 )
@@ -630,6 +762,52 @@ def test_qwen4_exp_gemm_capability_routing(
     )
 
     assert qwen4_exp_gemm._gemm_plans() == expected_plans
+
+
+@pytest.mark.parametrize(
+    "method_type,expected_type",
+    [
+        (
+            qwen4_exp_gemm.UnquantizedLinearMethod,
+            qwen4_exp_gemm.Qwen4ExpLowLatencyLinearMethod,
+        ),
+        (
+            qwen4_exp_gemm.UnquantizedEmbeddingMethod,
+            qwen4_exp_gemm.Qwen4ExpLowLatencyEmbeddingMethod,
+        ),
+    ],
+)
+def test_qwen4_exp_lm_head_preserves_unquantized_method_family(
+    monkeypatch: pytest.MonkeyPatch,
+    method_type: type,
+    expected_type: type,
+) -> None:
+    """ModelOpt-excluded heads use linear methods instead of embedding methods."""
+
+    class FakeHead(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quant_method = method_type()
+            self.weight = torch.empty(248320, 2560, device="meta")
+
+    head = FakeHead()
+    monkeypatch.setattr(qwen4_exp_gemm, "ParallelLMHead", FakeHead)
+    monkeypatch.setattr(
+        qwen4_exp_gemm, "_gemm_plans", lambda: qwen4_exp_gemm.QWEN4_EXP_SM120_GEMM_PLANS
+    )
+    monkeypatch.setattr(
+        qwen4_exp_gemm.shape_dynamic_skinny_gemm, "is_available", lambda: True
+    )
+    monkeypatch.setattr(
+        qwen4_exp_gemm.shape_dynamic_skinny_gemm,
+        "request_warmup_configs",
+        lambda dtype, configs: None,
+    )
+
+    qwen4_exp_gemm.enable_qwen4_exp_low_latency_gemm(head, torch.bfloat16)
+
+    assert type(head.quant_method) is expected_type
+    assert isinstance(head.quant_method, method_type)
 
 
 def test_installation_is_shape_specific_and_unquantized(
@@ -783,27 +961,33 @@ def test_glm_cute_selected_shapes(
     torch.testing.assert_close(output.float(), reference, rtol=2e-2, atol=2e-1)
 
 
-@pytest.mark.parametrize("n,k,num_tokens,config", QWEN4_EXP_SM90_CASES)
-def test_qwen4_exp_sm90_selected_shapes(
+@pytest.mark.parametrize("capability,n,k,num_tokens,config", QWEN4_EXP_CUTE_CASES)
+def test_qwen4_exp_selected_shapes(
+    capability: tuple[int, int],
     n: int,
     k: int,
     num_tokens: int,
     config: SkinnyGemmConfig,
 ) -> None:
-    _require_capability_and_cute((9, 0))
+    _require_capability_and_cute(capability)
     torch.manual_seed(42 + num_tokens)
     x = torch.randn(num_tokens, k, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
 
-    selected = qwen4_exp_gemm.QWEN4_EXP_SM90_GEMM_PLANS[(n, k)][num_tokens]
+    selected = qwen4_exp_gemm._gemm_plans()[(n, k)][num_tokens]
     assert selected == config
     output = qwen4_exp_gemm._qwen4_exp_low_latency_gemm(x, weight)
 
-    reference = torch.nn.functional.linear(x, weight)
-    cosine = torch.nn.functional.cosine_similarity(
-        output.float().flatten(), reference.float().flatten(), dim=0
-    ).item()
-    assert cosine > 0.999
+    reference = torch.nn.functional.linear(x.float(), weight.float())
+    torch.testing.assert_close(output.float(), reference, rtol=2e-2, atol=2e-1)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = qwen4_exp_gemm._qwen4_exp_low_latency_gemm(x, weight)
+    x.mul_(-0.5)
+    graph.replay()
+    reference = torch.nn.functional.linear(x.float(), weight.float())
+    torch.testing.assert_close(captured.float(), reference, rtol=2e-2, atol=2e-1)
 
 
 def test_glm52_q_b_nonpacked_single_row_falls_back() -> None:

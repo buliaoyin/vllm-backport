@@ -10,6 +10,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_scalar_specialization_rep,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 
@@ -18,6 +19,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -39,6 +42,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_rows,
     num_cache_blocks,
     num_requests,
+    FP8_KV: tl.constexpr,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -126,6 +130,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if FP8_KV:
+            keys = (keys.to(tl.float32) * tl.load(k_scale_ptr)).to(query.dtype)
+            values = (values.to(tl.float32) * tl.load(v_scale_ptr)).to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -446,6 +453,11 @@ def _select_config(
     return BLOCK_N, num_warps, num_tiles, num_splits
 
 
+def _select_num_stages(fp8_kv: bool) -> int:
+    # FP8 conversion with two 64-token stages exceeds SM120's 99 KiB limit.
+    return 1 if fp8_kv and current_platform.is_device_capability_family(120) else 2
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -455,8 +467,11 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     use_prefill_config: bool,
     out: torch.Tensor | None = None,
+    *,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches.
+    """Run sparse GQA directly over paged BF16 or FP8 E4M3 K/V caches.
 
     logical_indices is the PACKED selection buffer: [rows, selection_width + 1]
     with the trailing column holding each row's valid-entry count (written by
@@ -480,7 +495,16 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert q.dtype == torch.bfloat16
+    assert k_cache.dtype == v_cache.dtype
+    assert k_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    fp8_kv = k_cache.dtype == torch.float8_e4m3fn
+    if fp8_kv:
+        if k_scale is None or v_scale is None:
+            raise ValueError("FP8 QSA requires per-tensor K/V scales")
+        for scale in (k_scale, v_scale):
+            assert scale.numel() == 1 and scale.dtype == torch.float32
+            assert scale.device == q.device
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -527,6 +551,8 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scale if k_scale is not None else q,
+        v_scale if v_scale is not None else q,
         logical_indices,
         block_table,
         token_to_req,
@@ -548,6 +574,7 @@ def qsa_sparse_paged_attention(
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
+        FP8_KV=fp8_kv,
         TOPK=selection_width,
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
@@ -559,7 +586,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=_select_num_stages(fp8_kv),
     )
     if num_splits == 1:
         return out
@@ -590,6 +617,8 @@ def warmup_qsa_sparse_paged_attention(
 ) -> tuple[tuple[int, int, int], ...]:
     """Compile every production-reachable split-K/merge specialization."""
 
+    if kv_cache.dtype == torch.uint8:
+        kv_cache = kv_cache.view(torch.float8_e4m3fn)
     head_dim = kv_cache.shape[-1] // 2
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
     num_kv_heads = key_cache.shape[2]
@@ -621,6 +650,7 @@ def warmup_qsa_sparse_paged_attention(
         shape=tuple(value_cache.shape),
         strides=tuple(value_cache.stride()),
     )
+    scale_ptr = TritonWarmupTensor(torch.float32)
     # +1: the packed buffer's trailing count column.
     indices_ptr = TritonWarmupTensor(torch.int32, shape=(num_rows, selection_width + 1))
     block_table_ptr = TritonWarmupTensor(
@@ -653,6 +683,8 @@ def warmup_qsa_sparse_paged_attention(
             q_ptr,
             k_cache_ptr,
             v_cache_ptr,
+            scale_ptr,
+            scale_ptr,
             indices_ptr,
             block_table_ptr,
             token_to_req_ptr,
@@ -674,6 +706,7 @@ def warmup_qsa_sparse_paged_attention(
             num_rows,
             num_cache_blocks,
             num_requests,
+            FP8_KV=key_cache.dtype == torch.float8_e4m3fn,
             TOPK=selection_width,
             PAGE_SIZE=key_cache.shape[1],
             PAGE_TABLE_WIDTH=block_table.shape[1],
@@ -685,7 +718,7 @@ def warmup_qsa_sparse_paged_attention(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=warps,
-            num_stages=2,
+            num_stages=_select_num_stages(key_cache.dtype == torch.float8_e4m3fn),
             grid=(num_rows, num_kv_heads, num_splits),
         )
         if num_splits > 1:

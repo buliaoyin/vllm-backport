@@ -80,6 +80,13 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+from .ops.rowwise_fp8 import (
+    install_rowwise_fp8_head,
+    install_rowwise_fp8_output,
+    rowwise_fp8_hc_enabled,
+    rowwise_fp8_head_enabled,
+    rowwise_fp8_output_enabled,
+)
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
@@ -87,10 +94,10 @@ from .qsa import Qwen4ExpQSAAttention
 def without_modelopt_fp4(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
-    """Return ``None`` for weights excluded from Qwen4Exp ModelOpt-FP4."""
+    """Preserve online quantization for projections excluded from ModelOpt-FP4."""
 
     if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-        return None
+        return quant_config.online_quantization_config
     return quant_config
 
 
@@ -667,6 +674,9 @@ class Qwen4ExpForCausalLM(
             self.extra_safetensors_files = ("ngram_embedding.safetensors",)
         self.config = config
         self.scheduler_config = vllm_config.scheduler_config
+        self._sm120_rowwise_fp8_head = rowwise_fp8_head_enabled(vllm_config)
+        self._sm120_rowwise_fp8_hc = rowwise_fp8_hc_enabled(vllm_config)
+        self._sm120_rowwise_fp8_output = rowwise_fp8_output_enabled(vllm_config)
         if vllm_config.cache_config.mamba_cache_mode == "all":
             raise NotImplementedError(
                 "Qwen4Exp currently does not support 'all' prefix caching, "
@@ -687,6 +697,33 @@ class Qwen4ExpForCausalLM(
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
+        if self._sm120_rowwise_fp8_head:
+            install_rowwise_fp8_head(self.lm_head)
+        if self._sm120_rowwise_fp8_hc:
+            for module in self.model.modules():
+                if isinstance(module, GatedResidual):
+                    module.enable_rowwise_fp8()
+        if self._sm120_rowwise_fp8_output:
+            for layer in self.model.layers:
+                attention = (
+                    layer.linear_attn
+                    if hasattr(layer, "linear_attn")
+                    else layer.self_attn
+                )
+                if not isinstance(
+                    attention, (QwenGatedDeltaNetAttention, Qwen4ExpQSAAttention)
+                ):
+                    raise ValueError("sm120_rowwise_fp8_output requires GDN or QSA")
+                output = (
+                    attention.out_proj
+                    if hasattr(attention, "out_proj")
+                    else attention.o_proj
+                )
+                install_rowwise_fp8_output(output)
+
+    def process_weights_after_loading(self) -> None:
+        if self._sm120_rowwise_fp8_head:
+            self.lm_head.quant_method.process_weights_after_loading(self.lm_head)
 
     @staticmethod
     def get_model_state_cls():
@@ -1056,6 +1093,9 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
 
     def forward(
         self,
