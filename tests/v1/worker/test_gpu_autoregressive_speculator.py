@@ -379,8 +379,9 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
 
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("max_drafts", [3, 5])
+@pytest.mark.parametrize("record_confidence", [False, True])
 def test_adaptive_mtp_changes_work_and_clears_unused_drafts(
-    monkeypatch, fused, max_drafts
+    monkeypatch, fused, max_drafts, record_confidence
 ):
     """Switching K must skip model calls and never return a previous draft tail."""
     from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
@@ -394,6 +395,8 @@ def test_adaptive_mtp_changes_work_and_clears_unused_drafts(
     spec.dp_size, spec.dp_rank = 1, 0
     spec.hidden_states = torch.zeros(2, 3)
     spec.draft_tokens = torch.full((1, max_drafts), 999, dtype=torch.int64)
+    spec.record_scheduler_confidence = record_confidence
+    spec.draft_token_confidence_probs = torch.full((1, max_drafts), 0.99)
     spec.last_token_indices = torch.zeros(1, dtype=torch.int64)
     spec.idx_mapping = torch.zeros(1, dtype=torch.int64)
     spec.current_draft_step = torch.tensor(0)
@@ -406,12 +409,35 @@ def test_adaptive_mtp_changes_work_and_clears_unused_drafts(
     spec._copy_request_inputs = spec._prepare_eplb_forward = lambda *args: None
     spec.share_mtp_topk_indices = True
     hooks = SimpleNamespace(set_skip_topk=Mock(), compact_topk_indices=Mock())
-    spec.model = SimpleNamespace(model=hooks)
+    confidence_head = Mock(
+        side_effect=lambda hidden: (
+            hidden[:, 0].long() + 100,
+            torch.full((hidden.shape[0],), 0.5),
+        )
+    )
+    greedy_head = Mock(side_effect=lambda hidden: hidden[:, 0].long() + 100)
+    spec.use_local_argmax_reduction = True
+    spec.model = SimpleNamespace(
+        model=hooks,
+        get_top_tokens_with_confidence=confidence_head,
+        get_top_tokens=greedy_head,
+    )
     steps = []
 
     def generate(step):
         steps.append(step)
         spec.draft_tokens[0, step] = 100 + step
+        if record_confidence:
+            tokens = spec.sample_draft(
+                torch.full((1, 3), float(step)),
+                spec.sample_src_positions,
+                spec.idx_mapping,
+                torch.zeros(1),
+                torch.zeros(1, dtype=torch.int64),
+                torch.tensor(step),
+                None,
+            )
+            spec.draft_tokens[0, step] = tokens[0]
 
     spec._prefill = lambda *args, **kwargs: generate(0)
     spec._generate_draft = lambda *args, **kwargs: generate(
@@ -442,6 +468,8 @@ def test_adaptive_mtp_changes_work_and_clears_unused_drafts(
         steps.clear()
         hooks.set_skip_topk.reset_mock()
         hooks.compact_topk_indices.reset_mock()
+        confidence_head.reset_mock()
+        greedy_head.reset_mock()
         result = spec.propose(
             batch,
             {},
@@ -456,6 +484,14 @@ def test_adaptive_mtp_changes_work_and_clears_unused_drafts(
         assert result.tolist() == [
             list(range(100, 100 + budget)) + [-1] * (max_drafts - budget)
         ]
+        if record_confidence:
+            assert confidence_head.call_count == 1
+            assert greedy_head.call_count == budget - 1
+            torch.testing.assert_close(
+                spec.draft_token_confidence_probs[0, 0], torch.tensor(0.5)
+            )
+            assert torch.isnan(spec.draft_token_confidence_probs[0, 1:]).all()
+            assert not spec._collect_scheduler_confidence
         assert hooks.compact_topk_indices.call_count == int(budget > 1)
         assert [call.args[0] for call in hooks.set_skip_topk.call_args_list] == (
             [False, True, False] if budget > 1 else [False]
@@ -573,3 +609,181 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
 
     assert not called
     assert metadata.scheduler_metadata is None
+
+
+@pytest.mark.parametrize(
+    "field,value,expected",
+    [
+        (None, None, True),
+        ("additional_config", {}, False),
+        ("additional_config", None, False),
+        ("additional_config", {"mtp_confidence_forecast": False}, False),
+        ("quantization", "exl3", False),
+        ("pipeline_parallel_size", 1, False),
+        ("tensor_parallel_size", 2, False),
+        ("model_type", "qwen3_5_text", False),
+        ("enable_adaptive_verification", False, False),
+        ("use_local_argmax_reduction", False, False),
+        ("draft_sample_method", "probabilistic", False),
+    ],
+)
+def test_mtp_scheduler_confidence_scope(monkeypatch, field, value, expected):
+    """Confidence work must be restricted to the measured Qwen NVFP4 PP2 path."""
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    monkeypatch.setattr(base_spec_module, "_target_feeds_hc_residual", lambda _: False)
+    draft_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen4_exp_mtp", architectures=["Qwen4ExpMTP"], n_predict=1
+        ),
+        get_hidden_size=lambda: 4,
+        get_vocab_size=lambda: 16,
+    )
+    spec_config = SimpleNamespace(
+        method="mtp",
+        num_speculative_tokens=4,
+        draft_model_config=draft_config,
+        use_local_argmax_reduction=True,
+        draft_sample_method="greedy",
+        enable_adaptive_verification=True,
+    )
+    model = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="qwen4_exp_text"),
+        quantization="modelopt_fp4",
+        max_model_len=32,
+        head_dtype=torch.float32,
+        dtype=torch.float32,
+        use_fp64_gumbel=False,
+    )
+    parallel = SimpleNamespace(
+        data_parallel_size=1,
+        data_parallel_rank=0,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+    )
+    if field == "quantization":
+        model.quantization = value
+    elif field == "model_type":
+        model.hf_text_config.model_type = value
+    elif field in ("pipeline_parallel_size", "tensor_parallel_size"):
+        setattr(parallel, field, value)
+    elif field is not None and field != "additional_config":
+        setattr(spec_config, field, value)
+    config = SimpleNamespace(
+        speculative_config=spec_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=8),
+        model_config=model,
+        parallel_config=parallel,
+        additional_config=(
+            value if field == "additional_config" else {"mtp_confidence_forecast": True}
+        ),
+    )
+    speculator = MTPSpeculator(config, torch.device("cpu"))
+    assert speculator.record_scheduler_confidence is expected
+    if expected:
+        assert speculator.scheduler_confidence_table.shape == (2, 4)
+        assert torch.isnan(speculator.scheduler_confidence_table).all()
+        assert torch.isnan(speculator.draft_token_confidence_probs).all()
+    else:
+        assert speculator.scheduler_confidence_table is None
+        assert speculator.draft_token_confidence_probs is None
+
+
+def test_mtp_confidence_capture_separates_prefill_and_decode_work():
+    """Prefill capture records one feature head; decode captures only greedy work."""
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    spec = object.__new__(MTPSpeculator)
+    spec.record_scheduler_confidence = True
+    spec.draft_token_confidence_probs = torch.full((1, 4), 0.99)
+    spec.use_local_argmax_reduction = True
+    spec.dynamic_draft = True
+    spec.num_speculative_steps = 4
+    spec.max_num_reqs = 1
+    spec.share_mtp_topk_indices = False
+    spec._decode_managers = {}
+    spec.use_fused_multi_step_decode = True
+    spec.last_token_indices = torch.zeros(1, dtype=torch.int64)
+    spec.idx_mapping = torch.zeros(1, dtype=torch.int64)
+    tokens = torch.tensor([7])
+    feature_head = Mock(return_value=(tokens, torch.tensor([0.8])))
+    greedy_head = Mock(return_value=tokens)
+    spec.model = SimpleNamespace(
+        get_top_tokens_with_confidence=feature_head, get_top_tokens=greedy_head
+    )
+    phases = []
+
+    def sample(step):
+        phases.append(spec._collect_scheduler_confidence)
+        assert (
+            spec.sample_draft(
+                torch.ones(1, 4),
+                torch.zeros(1),
+                spec.idx_mapping,
+                torch.zeros(1),
+                torch.zeros(1, dtype=torch.int64),
+                torch.tensor(step),
+                None,
+            )
+            is tokens
+        )
+
+    spec._prefill = lambda *args, **kwargs: sample(0)
+    spec._generate_fused_drafts = lambda *args, **kwargs: [
+        sample(step) for step in range(1, 4)
+    ]
+    manager = SimpleNamespace(
+        use_breakable_cg=False,
+        capture=Mock(side_effect=lambda fn, *args, **kwargs: fn()),
+    )
+    spec.prefill_cudagraph_manager = spec.decode_cudagraph_manager = manager
+    for name in (
+        "model_state",
+        "target_input_buffers",
+        "block_tables",
+        "target_attn_groups",
+        "kv_cache_config",
+        "input_buffers",
+        "attn_groups",
+    ):
+        setattr(spec, name, None)
+    spec.capture()
+    assert phases == [True, False, False, False]
+    assert feature_head.call_count == 1
+    assert greedy_head.call_count == 3
+    assert not spec._collect_scheduler_confidence
+    torch.testing.assert_close(
+        spec.draft_token_confidence_probs[0, 0], torch.tensor(0.8)
+    )
+    assert torch.isnan(spec.draft_token_confidence_probs[0, 1:]).all()
+
+
+def test_mtp_confidence_excludes_stochastic_and_padded_rows():
+    """Target sampling mode must not contaminate greedy acceptance calibration."""
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    spec = object.__new__(MTPSpeculator)
+    spec.record_scheduler_confidence = True
+    spec._collect_scheduler_confidence = True
+    spec.draft_token_confidence_probs = torch.full((3, 4), float("nan"))
+    tokens = torch.tensor([4, 5, 6])
+    spec.model = SimpleNamespace(
+        get_top_tokens_with_confidence=Mock(
+            return_value=(tokens, torch.tensor([0.6, 0.7, 0.8]))
+        )
+    )
+    sampled = spec.sample_draft(
+        torch.ones(3, 4),
+        torch.zeros(3),
+        torch.tensor([2, 0, -1]),
+        torch.tensor([0.8, 0.0, 0.0]),
+        torch.zeros(3, dtype=torch.int64),
+        torch.tensor(0),
+        None,
+    )
+    assert sampled is tokens
+    torch.testing.assert_close(
+        spec.draft_token_confidence_probs[0, 0], torch.tensor(0.6)
+    )
+    assert torch.isnan(spec.draft_token_confidence_probs[1:]).all()
+    assert torch.isnan(spec.draft_token_confidence_probs[0, 1:]).all()

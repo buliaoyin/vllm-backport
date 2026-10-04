@@ -510,6 +510,21 @@ class Qwen4ExpMTP(LocalArgmaxMixin, nn.Module, SupportsPP, Qwen4ExpMixtureOfExpe
         full_logits[..., self.mtp_token_map] = logits
         return full_logits
 
+    def get_top_tokens_with_confidence(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return greedy tokens and their probability within the draft vocabulary."""
+        if self.lm_head.tp_size != 1:
+            raise ValueError("MTP scheduler confidence requires TP1")
+        logits = self.logits_processor.get_shard_logits(self.lm_head, hidden_states)
+        _, top = logits.max(dim=-1)
+        probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        confidence = probabilities.gather(-1, top.unsqueeze(-1)).squeeze(-1)
+        confidence.clamp_(0.0, 1.0)
+        if self.draft_id_to_target_id is not None:
+            top = top + self.draft_id_to_target_id[top]
+        return top, confidence
+
     @torch.no_grad()
     def configure_mtp_token_map(self, path: str) -> None:
         """Install a reduced output head after sharing target model weights."""

@@ -17,11 +17,11 @@ import sys
 
 print(json.dumps({
     "method": "mtp",
-    "num_speculative_tokens": 3,
+    "num_speculative_tokens": 5,
     "index_share_for_mtp_iteration": False,
     "mtp_token_map": sys.argv[1],
     "use_local_argmax_reduction": True,
-    "enable_adaptive_verification": False,
+    "enable_adaptive_verification": True,
 }))
 PY
 )"
@@ -51,5 +51,5 @@ exec "${VLLM_COMMAND[@]}" serve "$MODEL_PATH" \
   --engram-config '{"cpu_offload":true}' \
   --mamba-ssm-cache-dtype bfloat16 \
   --speculative-config "$SPECULATIVE_CONFIG" \
-  --compilation-config '{"cudagraph_capture_sizes":[1,2,3,4,6,8,12,16]}' \
+  --compilation-config '{"cudagraph_capture_sizes":[1,2,3,4,5,6,8,9,10,12,15,16,18,20,24]}' \
   "$@"

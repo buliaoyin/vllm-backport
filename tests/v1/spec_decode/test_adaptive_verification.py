@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections import deque
+import random
+from collections import Counter, deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,6 +13,7 @@ from vllm.v1.spec_decode.dynamic.adaptive import (
     AdaptiveDraftBudget,
     ConfidenceDraftBudget,
     MTPDraftBudget,
+    prefers_default_mtp_budget,
 )
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
@@ -164,6 +166,36 @@ def test_mtp_budget_still_adapts_when_acceptance_changes(num_reqs, prefer_defaul
             now += 0.02 + 0.002 * k
             budget.complete(step, now, dict.fromkeys(req_ids, 1 + min(k, accepted)))
         assert choices[-32:].count(5 if accepted else 1) >= 30
+
+
+@pytest.mark.parametrize(
+    "quantization,pipeline_parallel_size,expected",
+    [("exl3", 1, True), ("modelopt_fp4", 1, False), ("modelopt_fp4", 2, True)],
+)
+def test_qwen_mtp_incumbent_policy_matches_quantization_and_pipeline(
+    quantization, pipeline_parallel_size, expected
+):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="qwen4_exp_text"),
+            quantization=quantization,
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pipeline_parallel_size),
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            enable_adaptive_verification=True,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    model_type="qwen4_exp_mtp",
+                    architectures=["Qwen4ExpMTP"],
+                    n_predict=1,
+                )
+            ),
+        ),
+    )
+    assert prefers_default_mtp_budget(config) is expected
+    config.speculative_config.enable_adaptive_verification = False
+    assert not prefers_default_mtp_budget(config)
 
 
 def test_mtp_reuses_shape_costs_but_resets_request_acceptance():
@@ -319,6 +351,38 @@ def test_mtp_default_policy_refreshes_censored_third_position():
         assert choices[-64:].count(2 if accepted == 2 else 3) >= 48
 
 
+@pytest.mark.parametrize("num_reqs", [1, 4])
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_default_policy_bounds_refresh_cost_for_profitable_short_budget(
+    num_reqs, feedback_delay
+):
+    """Refreshing a censored suffix must preserve a measured short-budget gain."""
+    budget = MTPDraftBudget(3, prefer_default=True)
+    req_ids = [str(i) for i in range(num_reqs)]
+    latencies = {1: 0.024, 2: 0.030, 3: 0.036}
+    pending: deque[tuple[int, float, int]] = deque()
+    measured = []
+    now, previous = 0.0, 3
+    for step in range(384):
+        k = budget.choose(req_ids, 4096, False)
+        budget.scheduled(
+            step, now, 4096, False, dict.fromkeys(req_ids, previous), proposal_drafts=k
+        )
+        elapsed = (latencies[previous] + latencies[k]) / 2
+        now += elapsed
+        sampled = min(previous, 2) + 1
+        measured.append((sampled, elapsed))
+        pending.append((step, now, sampled))
+        if len(pending) > feedback_delay:
+            completed, finished, sampled = pending.popleft()
+            budget.complete(completed, finished, dict.fromkeys(req_ids, sampled))
+        previous = k
+    observed = sum(tokens for tokens, _ in measured[-192:]) / sum(
+        elapsed for _, elapsed in measured[-192:]
+    )
+    assert observed >= 0.98 * 3 / latencies[2]
+
+
 def test_mtp_default_policy_scores_observed_prefix_yield():
     """Rejection bursts must not distort the fixed-three throughput reference."""
     budget = MTPDraftBudget(5, prefer_default=True)
@@ -388,6 +452,186 @@ def test_mtp_default_policy_avoids_marginal_long_budget_gains(prefer_default):
         previous = k
     expected = {3} if prefer_default else {4, 5}
     assert sum(k in expected for k in choices[-64:]) >= 60
+
+
+@pytest.mark.parametrize("num_reqs", [1, 4])
+def test_mtp_default_policy_discovers_efficient_suffix_with_moderate_survival(num_reqs):
+    """Cheap suffixes can improve throughput even when most prefixes reject."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    req_ids = [str(i) for i in range(num_reqs)]
+    latencies = {1: 0.028, 2: 0.029, 3: 0.030, 4: 0.03114}
+    acceptance = [4, 4, 4, 3, 0, 0, 0, 0, 0, 0]
+    pending: deque[tuple[int, float, int]] = deque()
+    measured = []
+    now, previous = 0.0, 3
+    for step in range(768):
+        k = budget.choose(req_ids, 4096, False)
+        budget.scheduled(
+            step, now, 4096, False, dict.fromkeys(req_ids, previous), proposal_drafts=k
+        )
+        elapsed = (latencies[previous] + latencies[k]) / 2
+        now += elapsed
+        accepted = acceptance[step % len(acceptance)]
+        sampled, reference = min(previous, accepted) + 1, min(3, accepted) + 1
+        measured.append((sampled, reference, elapsed))
+        pending.append((step, now, sampled))
+        if len(pending) > 2:
+            completed, finished, sampled = pending.popleft()
+            budget.complete(completed, finished, dict.fromkeys(req_ids, sampled))
+        previous = k
+    observed = sum(tokens for tokens, _, _ in measured[-256:]) / sum(
+        elapsed for _, _, elapsed in measured[-256:]
+    )
+    reference_rate = sum(tokens for _, tokens, _ in measured[-256:]) / (
+        256 * latencies[3]
+    )
+    assert observed > 1.05 * reference_rate
+
+
+def _mtp_prefix_probe_steps(
+    budget, feedback_delay, accepted, latencies=None, max_steps=80
+):
+    pending: deque[tuple[int, float, int, int, int]] = deque()
+    now, previous, completed = 0.0, 3, None
+    latencies = latencies or {1: 0.029, 2: 0.032, 3: 0.035, 4: 0.038}
+    for step in range(max_steps):
+        proposed = budget.choose(["request"], 8192, False)
+        stats = budget.extension_stats(["request"], 8192, False)
+        yield proposed, stats, completed
+        budget.scheduled(
+            step, now, 8192, False, {"request": previous}, proposal_drafts=proposed
+        )
+        step_latencies = latencies(step) if callable(latencies) else latencies
+        now += (step_latencies[previous] + step_latencies[proposed]) / 2
+        count = accepted(previous)
+        pending.append((step, now, previous, proposed, count))
+        completed = None
+        if len(pending) > feedback_delay:
+            done, finished, verified, proposal, count = pending.popleft()
+            budget.complete(done, finished, {"request": count + 1})
+            completed = verified, proposal, count
+        previous = proposed
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_default_trial_waits_for_conditional_prefix_opportunities(feedback_delay):
+    """Three cheap costs cannot decide a suffix before its prefix is observed."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    long_rounds = 0
+
+    def accepted(drafts):
+        nonlocal long_rounds
+        if drafts == 4:
+            long_rounds += 1
+            return 2 if long_rounds <= 4 else 4
+        return drafts
+
+    stable, opportunities, held, promoted = 0, 0, False, False
+    for proposed, stats, completed in _mtp_prefix_probe_steps(
+        budget, feedback_delay, accepted
+    ):
+        if completed is not None:
+            verified, proposal, count = completed
+            stable += int(verified == proposal == 4)
+            opportunities += int(verified == 4 and count >= 3)
+        if stable >= 3 and opportunities < 3:
+            assert proposed == stats["trial_k"] == 4
+            held = True
+        if proposed == 4 and stats["trial_k"] is None:
+            assert stable >= 3 and opportunities >= 3
+            promoted = True
+            break
+    assert held and promoted
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_default_trial_backs_off_when_prefix_stays_unobserved(feedback_delay):
+    """Missing conditional evidence must not prolong a trial beyond its cap."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    trials, returned = 0, 0
+    for proposed, stats, _ in _mtp_prefix_probe_steps(
+        budget, feedback_delay, lambda drafts: 2 if drafts == 4 else drafts
+    ):
+        if stats["trial_k"] == 4:
+            assert proposed == 4
+            trials += 1
+        elif trials:
+            assert proposed == 3 and stats["next_trial_in"] > 0
+            returned += 1
+            if returned == 8:
+                break
+    assert trials == 12 and returned == 8
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_default_policy_retains_profitable_suffix_when_gain_shrinks(feedback_delay):
+    """A promoted suffix survives a smaller gain, then exits when unprofitable."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    gains = (0.08, 0.03, -0.05)
+
+    def latencies(step):
+        return {
+            1: 0.029,
+            2: 0.032,
+            3: 0.035,
+            4: 0.035 * 1.25 / (1 + gains[step // 384]),
+        }
+
+    choices: list[list[int]] = [[], [], []]
+    for step, (proposed, _, _) in enumerate(
+        _mtp_prefix_probe_steps(
+            budget,
+            feedback_delay,
+            lambda drafts: drafts,
+            latencies=latencies,
+            max_steps=3 * 384,
+        )
+    ):
+        phase = step // 384
+        choices[phase].append(proposed)
+    assert choices[0][-128:].count(4) >= 120
+    assert choices[1][-128:].count(4) >= 120
+    assert choices[2][-128:].count(3) >= 120
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_default_policy_remeasures_long_costs_for_new_batch_cohort(feedback_delay):
+    """Another cohort's cheap shape cannot justify prolonged expensive drafting."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    now, step = 0.0, 0
+    for cohort in ("cheap", "expensive"):
+        req_ids = [f"{cohort}-{i}" for i in range(4)]
+        budget.retain_requests(set(req_ids))
+        latencies = {1: 0.028, 2: 0.029, 3: 0.030}
+        latencies[4] = 0.031 if cohort == "cheap" else 0.080
+        pending: deque[tuple[int, float, int]] = deque()
+        choices = []
+        previous = 3
+        for _ in range(256):
+            k = budget.choose(req_ids, 4096, False)
+            choices.append(k)
+            budget.scheduled(
+                step,
+                now,
+                4096,
+                False,
+                dict.fromkeys(req_ids, previous),
+                proposal_drafts=k,
+            )
+            now += (latencies[previous] + latencies[k]) / 2
+            pending.append((step, now, previous + 1))
+            if len(pending) > feedback_delay:
+                completed, finished, sampled = pending.popleft()
+                budget.complete(completed, finished, dict.fromkeys(req_ids, sampled))
+            previous = k
+            step += 1
+        for completed, finished, sampled in pending:
+            budget.complete(completed, finished, dict.fromkeys(req_ids, sampled))
+        if cohort == "cheap":
+            assert choices[-64:].count(4) >= 60
+        else:
+            assert choices[:64].count(4) <= 4 + feedback_delay
+            assert choices[-64:].count(3) >= 60
 
 
 @pytest.mark.parametrize("num_reqs", [1, 8])
@@ -962,3 +1206,379 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
     # (request, position) keys, so the kernel can mask rows the compacted
     # device layout no longer has room for.
     assert mapping == [0, 1, 2, 3, 4, 5, 6]
+
+
+@pytest.mark.parametrize("local_cost,expected", [(0.030, 4), (0.012, 3)])
+def test_mtp_default_policy_measures_new_cohort_incumbent(local_cost, expected):
+    """Other cohorts' K3 costs cannot promote a locally measured long budget."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    context, step, now = 8192, 0, 0.0
+
+    def complete(req_ids, verified, proposal, elapsed):
+        nonlocal step, now
+        budget.scheduled(
+            step,
+            now,
+            context,
+            False,
+            dict.fromkeys(req_ids, verified),
+            proposal_drafts=proposal,
+        )
+        now += elapsed
+        budget.complete(step, now, dict.fromkeys(req_ids, verified + 1))
+        step += 1
+
+    for _ in range(16):
+        budget.choose(["previous"], context, False)
+        complete(["previous"], 3, 3, 0.020)
+    budget.retain_requests(set())
+    cohort = ["a", "b", "c", "d"]
+    for _ in range(32):
+        budget.choose(cohort, context, False)
+        complete(cohort, 3, 3, 0.020)
+
+    assert budget.choose(["a"], context, False) == 3
+    for _ in range(3):
+        complete(["a"], 4, 4, 0.018)
+        assert budget.choose(["a"], context, False) == 3
+
+    complete(["a"], 3, 4, 0.500)
+    assert budget.choose(["a"], context, False) == 3
+    for _ in range(3):
+        complete(["a"], 3, 3, local_cost)
+    assert budget.choose(["a"], context, False) == expected
+
+
+@pytest.mark.parametrize("prefer_default", [False, True])
+def test_mtp_extension_debt_uses_local_incumbent_only_when_preferred(prefer_default):
+    """A cheap cohort must not charge debt to another cohort's profitable suffix."""
+    budget = MTPDraftBudget(4, prefer_default=prefer_default)
+    now, step = 0.0, 0
+
+    def complete(req_id, drafts, elapsed):
+        nonlocal now, step
+        budget.choose([req_id], 4096, False)
+        budget.scheduled(
+            step, now, 4096, False, {req_id: drafts}, proposal_drafts=drafts
+        )
+        now += elapsed
+        budget.complete(step, now, {req_id: drafts + 1})
+        step += 1
+
+    for _ in range(4):
+        complete("slow", 3, 0.030)
+    for _ in range(12):
+        complete("cheap", 3, 0.012)
+    complete("slow", 4, 0.031)
+    excess = budget.extension_stats(["slow"], 4096, False)["excess_ms_per_step"]
+    if prefer_default:
+        assert excess == 0.0
+    else:
+        assert excess > 0.0
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_default_policy_releases_long_budget_when_prefix_evidence_expires(
+    feedback_delay,
+):
+    """An unscored long budget must not block the core's cheaper short proposal."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    rounds = 0
+
+    def accepted(drafts):
+        nonlocal rounds
+        count = drafts if rounds < 96 else 0
+        rounds += 1
+        return count
+
+    latencies = {1: 0.020, 2: 0.025, 3: 0.035, 4: 0.028}
+    choices = []
+    for proposed, stats, _ in _mtp_prefix_probe_steps(
+        budget,
+        feedback_delay,
+        accepted,
+        latencies=latencies,
+        max_steps=192,
+    ):
+        choices.append(proposed)
+    assert choices[64:96].count(4) >= 30
+    assert stats["prefix_acceptance"][4] is None
+    assert choices[-32:].count(1) >= 30
+
+
+def _mtp_incumbent_cost_trace(budget, feedback_delay, drift, steps=1024):
+    pending: deque[tuple[int, float, int]] = deque()
+    previous, now, rows = 3, 0.0, []
+    for step in range(steps):
+        latency = {
+            1: 0.029,
+            2: 0.032,
+            3: 0.024 if drift and step >= 256 else 0.035,
+            4: 0.038,
+            5: 0.060,
+        }
+        proposed = budget.choose(["request"], 8192, False)
+        budget.scheduled(
+            step, now, 8192, False, {"request": previous}, proposal_drafts=proposed
+        )
+        elapsed = (latency[previous] + latency[proposed]) / 2
+        now += elapsed
+        rows.append((proposed, previous + 1, elapsed))
+        pending.append((step, now, previous + 1))
+        if len(pending) > feedback_delay:
+            completed, finished, sampled = pending.popleft()
+            budget.complete(completed, finished, {"request": sampled})
+        previous = proposed
+    return rows
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_long_policy_remeasures_incumbent_when_routing_cost_drops(feedback_delay):
+    """Unchanged acceptance must not retain K4 against a newly cheaper K3."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    rows = _mtp_incumbent_cost_trace(budget, feedback_delay, drift=True)
+    assert sum(k == 4 for k, _, _ in rows[64:128]) >= 60
+    observed = sum(n for _, n, _ in rows[-512:]) / sum(
+        elapsed for _, _, elapsed in rows[-512:]
+    )
+    assert observed > 0.99 * (4 / 0.024)
+    assert budget.extension_stats(["request"], 8192, False)["step_ms"][3] == 24.0
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_incumbent_refresh_keeps_profitable_long_budget_overhead_bounded(
+    feedback_delay,
+):
+    """Periodic incumbent measurements should cost under one percent at steady K4."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    rows = _mtp_incumbent_cost_trace(budget, feedback_delay, drift=False)
+    last = rows[-512:]
+    assert sum(k == 3 for k, _, _ in last) <= 16
+    observed = sum(n for _, n, _ in last) / sum(elapsed for _, _, elapsed in last)
+    assert observed > 0.99 * (5 / 0.038)
+
+
+def test_mtp_incumbent_refresh_waits_between_trials_when_feedback_is_delayed():
+    """Missing PP completions must not turn each four-step refresh into another."""
+    budget = MTPDraftBudget(4, prefer_default=True)
+    rows = _mtp_incumbent_cost_trace(budget, 0, drift=False, steps=256)
+    previous = rows[-1][0]
+    now = sum(elapsed for _, _, elapsed in rows)
+    choices = []
+    for step in range(256, 856):
+        proposed = budget.choose(["request"], 8192, False)
+        choices.append(proposed)
+        budget.scheduled(
+            step, now, 8192, False, {"request": previous}, proposal_drafts=proposed
+        )
+        now += 0.038
+        previous = proposed
+    assert choices.count(3) <= 20
+    consecutive = longest = 0
+    for proposed in choices:
+        consecutive = consecutive + 1 if proposed == 3 else 0
+        longest = max(longest, consecutive)
+    assert longest == 4
+
+
+def test_mtp_incumbent_refresh_preserves_an_active_longer_probe():
+    """A deferred incumbent refresh must yield to an ongoing K5 trial."""
+    budget = MTPDraftBudget(5, prefer_default=True)
+    _mtp_incumbent_cost_trace(budget, 0, drift=False, steps=256)
+    extension = budget._extension
+    state = extension.state(["request"], budget.key(1, 8192, False))
+    state.selected = 4
+    state.probing, state.stable, state.attempts = 5, 0, 0
+    state.refresh_remaining = 4
+    state.decisions = max(state.incumbent_updated, state.incumbent_refreshed) + 127
+    assert budget.choose(["request"], 8192, False) == 5
+    assert budget.extension_stats(["request"], 8192, False)["trial_k"] == 5
+
+
+def _mtp_previous_confidence_trace(
+    feedback_delay,
+    *,
+    use_confidence=True,
+    feature_mode="correlated",
+    prefer_default=True,
+    noise=0.0,
+    steps=1536,
+    budget=None,
+):
+    """Two interleaved PP cohorts verify their previous producer's actual block."""
+    if budget is None:
+        budget = MTPDraftBudget(4, prefer_default=prefer_default, use_confidence=True)
+    requests = ["cohort0", "cohort1"]
+    producers = {
+        r: (3, 0.8 if i == 0 else 0.05, 4 if i == 0 else 0)
+        for i, r in enumerate(requests)
+    }
+    local: Counter[str] = Counter()
+    pending: deque[tuple[int, float, str, int, float]] = deque()
+    costs = {1: 0.021, 2: 0.028, 3: 0.035, 4: 0.038}
+    now = tokens = fixed_tokens = 0.0
+    choices = []
+    feature_random = random.Random(77)
+    cost_random = random.Random(19)
+
+    def complete(entry):
+        step, finished, r, count, feature = entry
+        budget.complete(step, finished, {r: count})
+        if use_confidence:
+            budget.observe_confidences(r, step, [feature, *[float("nan")] * 3])
+
+    for step in range(steps):
+        cohort = step % 2
+        r = requests[cohort]
+        high = ((local[r] + cohort * 16) // 16) % 2 == 0
+        truth = 4 if high else 0
+        feature = 0.8 if high else 0.05
+        if feature_mode == "random":
+            feature = 0.8 if feature_random.random() < 0.5 else 0.05
+        elif feature_mode == "nan":
+            feature = float("nan")
+        elif feature_mode == "constant":
+            feature = 0.3
+        proposed = budget.choose([r], 8192, False)
+        verified, old_feature, old_truth = producers[r]
+        budget.scheduled(
+            step, now, 8192, False, {r: verified}, proposal_drafts=proposed
+        )
+        factor = 1 + cost_random.uniform(-noise, noise)
+        now += 0.5 * (costs[verified] + costs[proposed]) * factor
+        tokens += 1 + min(verified, old_truth)
+        fixed_tokens += 1 + min(3, old_truth)
+        pending.append((step, now, r, 1 + min(verified, old_truth), old_feature))
+        if len(pending) > feedback_delay:
+            complete(pending.popleft())
+        producers[r] = (proposed, feature, truth)
+        local[r] += 1
+        choices.append(proposed)
+    while pending:
+        complete(pending.popleft())
+    # The cost stream is independent of budget decisions, so this is the same
+    # token acceptance and timing counterfactual for a uniform fixed K=3.
+    cost_random = random.Random(19)
+    fixed_time = sum(
+        costs[3] * (1 + cost_random.uniform(-noise, noise)) for _ in range(steps)
+    )
+    return (
+        budget,
+        producers,
+        {
+            "rate": tokens / now,
+            "fixed_rate": fixed_tokens / fixed_time,
+            "choices": choices,
+        },
+    )
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_confidence_is_opt_in_without_changing_empirical_policy(feedback_delay):
+    """Confidence packets cannot train or alter a default empirical controller."""
+    default = MTPDraftBudget(4, prefer_default=True)
+    _, _, measured = _mtp_previous_confidence_trace(feedback_delay, budget=default)
+    empirical = MTPDraftBudget(4, prefer_default=True)
+    _, _, expected = _mtp_previous_confidence_trace(
+        feedback_delay, use_confidence=False, budget=empirical
+    )
+    assert measured == expected
+    for r in ("cohort0", "cohort1"):
+        stats = default.extension_stats([r], 8192, False)
+        assert stats["confidence_forecast"] == {}
+        assert stats == empirical.extension_stats([r], 8192, False)
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_previous_confidence_forecast_improves_changing_prefix_latency(
+    feedback_delay,
+):
+    """A calibrated past-block feature saves time when acceptance changes."""
+    budget, _, measured = _mtp_previous_confidence_trace(feedback_delay, noise=0.15)
+    _, _, empirical = _mtp_previous_confidence_trace(
+        feedback_delay, use_confidence=False, noise=0.15
+    )
+    assert measured["rate"] > empirical["rate"] * 1.015
+    assert measured["rate"] > measured["fixed_rate"] * 1.05
+    for i, r in enumerate(["cohort0", "cohort1"]):
+        stats = budget.extension_stats([r], 8192, False)["confidence_forecast"]
+        assert stats["training_pairs"] > 500
+        assert stats["weighted_decisions"] > 100
+        feature, producer, consumer = stats["last_pair_steps"][r]
+        assert feature < producer < consumer
+        assert feature % 2 == producer % 2 == consumer % 2 == i
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+@pytest.mark.parametrize("feature_mode", ["random", "nan", "constant"])
+def test_mtp_previous_confidence_falls_back_without_predictive_evidence(
+    feedback_delay, feature_mode
+):
+    """NaNs, unchanging scores and unrelated scores retain the empirical policy."""
+    _, _, measured = _mtp_previous_confidence_trace(
+        feedback_delay, feature_mode=feature_mode
+    )
+    _, _, empirical = _mtp_previous_confidence_trace(
+        feedback_delay, feature_mode=feature_mode, use_confidence=False
+    )
+    assert measured == empirical
+
+
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+def test_mtp_previous_confidence_does_not_change_nonpreferred_policy(feedback_delay):
+    _, _, measured = _mtp_previous_confidence_trace(
+        feedback_delay, prefer_default=False
+    )
+    _, _, empirical = _mtp_previous_confidence_trace(
+        feedback_delay, prefer_default=False, use_confidence=False
+    )
+    assert measured == empirical
+
+
+@pytest.mark.parametrize("cancel", ["preempt", "missing_output"])
+def test_mtp_previous_confidence_discards_cancelled_producer_and_finished_request(
+    cancel,
+):
+    """Stale producer metadata cannot train a resumed or reused request ID."""
+    budget, producers, _ = _mtp_previous_confidence_trace(2, steps=384)
+    r = "cohort0"
+    before = budget.extension_stats([r], 8192, False)["confidence_forecast"]
+    verified, _, _ = producers[r]
+    proposed = budget.choose([r], 8192, False)
+    budget.scheduled(1000, 10.0, 8192, False, {r: verified}, proposal_drafts=proposed)
+    if cancel == "preempt":
+        budget.invalidate_confidence(r)
+        # Even an unexpected late successful output carries an older epoch.
+        budget.complete(1000, 10.035, {r: verified + 1})
+    else:
+        budget.complete(1000, 10.035, {})
+    budget.observe_confidences(r, 1000, [0.8, *[float("nan")] * 3])
+    budget.choose([r], 8192, False)
+    budget.scheduled(1002, 10.1, 8192, False, {r: 3}, proposal_drafts=3)
+    budget.complete(1002, 10.135, {r: 4})
+    budget.observe_confidences(r, 1002, [0.8, *[float("nan")] * 3])
+    after = budget.extension_stats([r], 8192, False)["confidence_forecast"]
+    assert after["training_pairs"] == before["training_pairs"]
+    assert after["ready_requests"] == 0
+    budget.retain_requests([])
+    assert budget.choose([r], 8192, False) == 3
+    fresh = budget.extension_stats([r], 8192, False)["confidence_forecast"]
+    assert fresh["training_pairs"] == fresh["weighted_decisions"] == 0
+    assert fresh["conditional_samples"] == {}
+
+
+def test_mtp_previous_confidence_labels_only_prefix_and_first_rejection():
+    """A rank-zero feature does not label unverified future suffix positions."""
+    budget = MTPDraftBudget(4, prefer_default=True, use_confidence=True)
+    for step in range(20):
+        budget.choose(["request"], 8192, False)
+        budget.scheduled(
+            step, step * 0.1, 8192, False, {"request": 3}, proposal_drafts=3
+        )
+        budget.complete(step, step * 0.1 + 0.035, {"request": 2})
+        budget.observe_confidences(
+            "request", step, [0.8 if step % 2 else 0.05, *[float("nan")] * 3]
+        )
+    stats = budget.extension_stats(["request"], 8192, False)["confidence_forecast"]
+    assert stats["training_pairs"] == 18
+    assert stats["conditional_samples"]["request"] == [18, 18, 0, 0]

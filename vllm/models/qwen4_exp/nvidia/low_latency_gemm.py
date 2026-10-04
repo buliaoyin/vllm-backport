@@ -105,7 +105,10 @@ QWEN4_EXP_SM80_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = 
     (96, 2560): {
         1: SkinnyGemmConfig(1, 64, 2, vector_width=4, static_k=2560),
         4: SkinnyGemmConfig(4, 128, 2, vector_width=4, static_k=2560),
+        5: SkinnyGemmConfig(5, 128, 2, vector_width=4, static_k=2560),
         7: SkinnyGemmConfig(7, 128, 2, vector_width=4, static_k=2560),
+        10: SkinnyGemmConfig(10, 128, 2, vector_width=4, static_k=2560),
+        15: SkinnyGemmConfig(15, 128, 2, vector_width=4, static_k=2560),
         16: SkinnyGemmConfig(16, 128, 2, vector_width=4, static_k=2560),
     },
     (6656, 2560): {
@@ -115,10 +118,12 @@ QWEN4_EXP_SM80_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = 
     (13312, 2560): {
         1: SkinnyGemmConfig(1, 128, 4, k_unroll=4, vector_width=4),
         4: SkinnyGemmConfig(4, 32, 4, vector_width=4, static_k=2560),
+        5: SkinnyGemmConfig(5, 32, 4, vector_width=4, static_k=2560),
     },
     (336, 10240): {
         1: SkinnyGemmConfig(1, 128, 1, vector_width=4, static_k=10240),
         4: SkinnyGemmConfig(4, 128, 2, vector_width=8, static_k=10240),
+        5: SkinnyGemmConfig(5, 128, 2, vector_width=4, static_k=10240),
     },
     (320, 10240): {
         1: SkinnyGemmConfig(1, 128, 1, vector_width=4, static_k=10240),
@@ -126,6 +131,23 @@ QWEN4_EXP_SM80_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = 
     },
     (10240, 320): {
         1: SkinnyGemmConfig(1, 32, 4, vector_width=2, static_k=320),
+    },
+    (640, 2560): {
+        5: SkinnyGemmConfig(5, 64, 2, vector_width=8, static_k=2560),
+    },
+    (1280, 2560): {
+        5: SkinnyGemmConfig(5, 64, 2, vector_width=4, static_k=2560),
+    },
+    (2560, 640): {
+        5: SkinnyGemmConfig(5, 32, 2, vector_width=2, static_k=640),
+    },
+    (512, 2560): {
+        5: SkinnyGemmConfig(5, 64, 2, vector_width=8, static_k=2560),
+        10: SkinnyGemmConfig(10, 64, 2, vector_width=8, static_k=2560),
+        15: SkinnyGemmConfig(15, 64, 2, vector_width=8, static_k=2560),
+    },
+    (2560, 6144): {
+        5: SkinnyGemmConfig(5, 64, 2, vector_width=4, static_k=6144),
     },
 }
 

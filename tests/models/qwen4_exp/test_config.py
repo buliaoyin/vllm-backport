@@ -411,6 +411,9 @@ def test_qwen4_exp_mtp_token_map_survives_target_head_sharing(
     expected[:, [2, 4, 6]] = expected_target[:, [2, 4, 6]]
     torch.testing.assert_close(draft.compute_logits(hidden), expected)
     torch.testing.assert_close(draft.get_top_tokens(hidden), expected.argmax(-1))
+    tokens, confidence = draft.get_top_tokens_with_confidence(hidden)
+    torch.testing.assert_close(tokens, expected.argmax(-1))
+    torch.testing.assert_close(confidence, expected.float().softmax(-1).max(-1).values)
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -759,3 +762,47 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+@pytest.mark.parametrize("remap", [False, True])
+def test_qwen4_exp_mtp_confidence_keeps_greedy_ties_and_maps_ids(remap) -> None:
+    """Confidence must reuse the head while preserving the selected target ID."""
+    draft, _ = _make_token_map_draft("cpu")
+    logits = torch.tensor(
+        [[2.0, 5.0, 5.0, -1.0], [1000.0, 996.0, -1000.0, 0.0]],
+        dtype=torch.bfloat16,
+    )
+    mapping = torch.tensor([0, 2, 5, 7])
+    if remap:
+        draft.draft_id_to_target_id = mapping - torch.arange(4)
+    hidden = torch.ones(2, 4)
+    with patch.object(
+        draft.logits_processor, "get_shard_logits", return_value=logits
+    ) as head:
+        tokens, confidence = draft.get_top_tokens_with_confidence(hidden)
+    head.assert_called_once_with(draft.lm_head, hidden)
+    expected_ids = logits.argmax(-1)
+    assert torch.equal(tokens, mapping[expected_ids] if remap else expected_ids)
+    expected = logits.float().softmax(-1).max(-1).values
+    torch.testing.assert_close(confidence, expected)
+    assert confidence.dtype == torch.float32
+
+
+def test_qwen4_exp_mtp_invalid_confidence_preserves_argmax() -> None:
+    """Nonfinite rows must invalidate feedback without changing greedy selection."""
+    draft, _ = _make_token_map_draft("cpu")
+    logits = torch.tensor(
+        [[float("-inf"), float("-inf")], [float("nan"), 1.0], [float("inf"), 0.0]]
+    )
+    with patch.object(draft.logits_processor, "get_shard_logits", return_value=logits):
+        tokens, confidence = draft.get_top_tokens_with_confidence(torch.ones(3, 4))
+    assert torch.equal(tokens, logits.argmax(-1))
+    assert torch.isnan(confidence).all()
+
+
+def test_qwen4_exp_mtp_confidence_rejects_sharded_vocab() -> None:
+    """A local softmax cannot claim a global confidence for a TP shard."""
+    draft, _ = _make_token_map_draft("cpu")
+    draft.lm_head.tp_size = 2
+    with pytest.raises(ValueError, match="requires TP1"):
+        draft.get_top_tokens_with_confidence(torch.ones(1, 4))

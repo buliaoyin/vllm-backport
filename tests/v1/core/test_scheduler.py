@@ -49,6 +49,7 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.dynamic.adaptive import MTPDraftBudget
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
@@ -6741,3 +6742,33 @@ def test_token_budget_recycles_unscheduled_windows_after_completion():
     assert block_ids[:2] == [null_id, null_id]
     assert block_ids[2:] == [block.block_id for block in retained[2:]]
     assert all(block.ref_cnt == 1 for block in retained[2:])
+
+
+def test_preemption_discards_mtp_forecast_before_recompute():
+    """A request resumed after re-prefill cannot use its old draft producer."""
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+    budget = MTPDraftBudget(4, prefer_default=True, use_confidence=True)
+    r = request.request_id
+    for step in range(4):
+        budget.choose([r], 8192, False)
+        budget.scheduled(step, step * 0.1, 8192, False, {r: 3}, proposal_drafts=3)
+        budget.complete(step, step * 0.1 + 0.035, {r: 4})
+        budget.observe_confidences(r, step, [0.8, *[float("nan")] * 3])
+    before = budget.extension_stats([r], 8192, False)["confidence_forecast"][
+        "training_pairs"
+    ]
+    assert before == 2
+    scheduler.adaptive_draft_budget = budget
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 1.0)
+    budget.choose([r], 8192, False)
+    budget.scheduled(100, 10.0, 8192, False, {r: 3}, proposal_drafts=3)
+    budget.complete(100, 10.035, {r: 4})
+    budget.observe_confidences(r, 100, [0.8, *[float("nan")] * 3])
+    after = budget.extension_stats([r], 8192, False)["confidence_forecast"][
+        "training_pairs"
+    ]
+    assert after == before

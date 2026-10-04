@@ -74,6 +74,7 @@ from vllm.v1.spec_decode.dynamic.adaptive import (
     ConfidenceDraftBudget,
     MTPDraftBudget,
     prefers_default_mtp_budget,
+    uses_mtp_confidence_forecast,
     uses_scheduler_adaptive_verification,
 )
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -298,6 +299,7 @@ class Scheduler(SchedulerInterface):
                 MTPDraftBudget(
                     self.num_spec_tokens,
                     prefer_default=prefers_default_mtp_budget(vllm_config),
+                    use_confidence=uses_mtp_confidence_forecast(vllm_config),
                 )
                 if speculative_config.method == "mtp"
                 else ConfidenceDraftBudget(self.num_spec_tokens)
@@ -1669,6 +1671,8 @@ class Scheduler(SchedulerInterface):
             request.spec_token_ids = []
         request.spec_token_ids_step_id = None
         self._discard_pending_draft_token_ids(request.request_id)
+        if isinstance(self.adaptive_draft_budget, MTPDraftBudget):
+            self.adaptive_draft_budget.invalidate_confidence(request.request_id)
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains

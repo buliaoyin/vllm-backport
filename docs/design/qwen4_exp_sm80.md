@@ -260,13 +260,22 @@ saved. Formal runs do not invoke profiling.
 
 ## Launch and reproduce
 
-The measured preset is
-`examples/online_serving/qwen38_nvfp4_dual170hx.sh`:
+The original fixed-MTP3 measurement used
+`examples/online_serving/qwen38_nvfp4_dual170hx.sh` with these overrides.
+The updated adaptive default is described below.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,2 bash examples/online_serving/qwen38_nvfp4_dual170hx.sh \
   /home/bul/dev/models1/Qwen/RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-  --host 127.0.0.1 --port 18940
+  --host 127.0.0.1 --port 18940 \
+  --speculative-config '{
+    "method":"mtp", "num_speculative_tokens":3,
+    "enable_adaptive_verification":false,
+    "index_share_for_mtp_iteration":false,
+    "mtp_token_map":"/home/bul/dev/sglang-rtxpro6000/configs/pennyroyal/frspec/flash-next-64k.pt",
+    "use_local_argmax_reduction":true
+  }' \
+  --compilation-config '{"cudagraph_capture_sizes":[1,2,3,4,6,8,12,16]}'
 ```
 
 Set `MTP_TOKEN_MAP` if the SG repository is not in the default sibling
@@ -366,7 +375,8 @@ speed improvement from enabling adaptive MTP on this configuration.
 Generated text can change acceptance and routing workloads, so these
 rates are end-to-end observations, not isolated controller-overhead
 measurements.
-The launch preset therefore retains fixed MTP3.
+The preset retained fixed MTP3 after this validation. The later five-task
+optimization below updates its default.
 
 To reproduce adaptive maximum 3, append a complete speculative config to
 the preset command. Preserve the map and reduction settings:
@@ -399,3 +409,164 @@ Git). Its `comparison.json` and `comparison.md` include full repetition
 ranges, decode rates and first-token delays. All benchmark and diagnostic
 clients exited zero; all three serving processes shut down normally, and
 the measurement GPUs were released.
+
+## Adaptive optimization on the original five-task mixture (2026-10-04)
+
+The final target reuses the DeepSeek V4.1 Flash requests for Python, Chinese
+fiction, C++, English fiction, and TypeScript. The original user questions,
+audit codes, and complete faulty C++ ThreadPool reference are preserved.
+Inputs use the checkpoint's native Qwen non-thinking chat template. Only
+middle reference material is trimmed or repeated to reach 32,768 or 60,000
+tokens; at least 512 original tokens at each end are protected. Independent
+CPU review verified all ten generated variants, including exact native
+decode/re-encode identity. Formal measurements use nine variants;
+TypeScript at 60K is generated but not measured.
+
+Each arm warms all five 32K tasks with 256 outputs, then measures two rounds
+of eight scenarios: five single 32K tasks with 1,024 outputs; a staggered
+four-task 32K group with 512 outputs each; a single 60K Chinese story with
+512 outputs; and a staggered four-task 60K group with 512 outputs each.
+The mixed arrival order matches the original recorded run: Chinese story,
+English story, Python, C++. Later requests start 0.5, 1.0, and 1.5 seconds
+after the first request's first content. Original N8/N16 and 256K scenarios
+are outside this dual-card measurement. Each arm has 28 formal requests
+and 19,456 output tokens; five warmup requests are excluded.
+
+Fixed three and adaptive maximum five share all 15 captured source files,
+model weights, map, TP1/PP2 layout, BF16 state/KV, CPU PLE offload, and
+serving limits. Adaptive verification uses capture sizes
+`[1,2,3,4,5,6,8,9,10,12,15,16,18,20,24]`; fixed three uses
+`[1,2,3,4,6,8,12,16]`. The first adaptive arm reused the preceding
+architecture/evaluation server. Its fixed-three reference was fresh.
+The confirmation ran fixed three first on that fixed server, then started
+a fresh adaptive server. Every arm repeated the same five-task warmup.
+These warm-state differences are retained in the source records.
+
+Fresh salts separate every request within and across arms. Independent
+review recomputed raw SSE usage, input hashes, seed/temperature, summaries,
+and all 84 warm/formal groups' Prometheus counters. All prefix-cache hit
+counters and their increments are zero; all 132 salts are unique.
+
+The original decode metric is retained:
+`(outputs - requests) / (last content - first content)`. Whole-group output
+throughput includes initial prefill, staggered arrivals, and later prefill
+interference. The total below sums the 16 formal group durations. A
+separate matrix-span metric includes client/metrics gaps. All observed
+first content events contain one token, so the independently corrected
+first-packet metric equals the original decode metric.
+
+| Pair | Fixed 3 total seconds | Adaptive total seconds | Whole-group throughput gain | Decode geometric-mean gain |
+| --- | ---: | ---: | ---: | ---: |
+| First pair | 271.72 | 264.26 | +2.82% | +4.78% |
+| Reversed-order confirmation | 272.51 | 264.59 | +2.99% | +5.55% |
+
+Decode gains use the geometric mean of the eight ratios of per-scenario
+mean rates. Matrix-span throughput improves 2.85% and 2.98%, respectively.
+Fixed-three repeatability changes total throughput by -0.29% between its
+two runs. These are repeated observations, not significance tests or a
+claim that every scenario improves.
+
+Pooling both pairs gives +5.16% for the eight mean decode-rate ratios,
++3.87% for the output-weighted decode geometric mean, and +2.91% for
+whole-group throughput. Six scenarios' pooled means improve; C++ and
+English fiction regress by 0.54% and 1.02%, respectively.
+
+Confirmation decode rates, in tokens/s, average two repetitions:
+
+| Scenario | Fixed 3 | Adaptive maximum 5 | Change |
+| --- | ---: | ---: | ---: |
+| Python 32K, single | 188.05 | 204.51 | +8.75% |
+| Chinese story 32K, single | 67.93 | 76.51 | +12.64% |
+| C++ 32K, single | 169.11 | 173.86 | +2.81% |
+| English story 32K, single | 127.92 | 125.54 | -1.87% |
+| TypeScript 32K, single | 173.48 | 186.92 | +7.75% |
+| Four-task mixture 32K | 100.60 | 101.20 | +0.60% |
+| Chinese story 60K, single | 67.62 | 77.00 | +13.87% |
+| Four-task mixture 60K | 69.57 | 70.26 | +0.99% |
+
+The first pair's C++ mean decode rate regresses 3.77%; confirmation's
+English-story mean regresses 1.87%. Chinese story uses a mean actual
+verified draft length around 1.08 at 32K and 1.17 at 60K in the first arm;
+Python/TypeScript frequently verify four or five drafts. These lengths
+come from per-group draft-token/draft-round counter differences, not
+exact per-K histograms. Five-second scheduler logs provide bounded
+windows for individual K choices.
+
+The policy starts from measured K3 for Qwen NVFP4 pipeline execution,
+collects actual verified-prefix observations, and measures shorter budgets
+when acceptance makes them promising. Longer budgets require matched
+producer/verification lengths, local cohort timing, three observed prefix
+opportunities, bounded trials, and a 5% promotion margin. Profitable long
+budgets are retained down to a 1% margin. Four K3 choices refresh the
+incumbent after 128 decisions without interrupting an active longer
+probe. The refresh cooldown handles delayed PP completions. Probe debt
+uses local timing and allows observed gains to offset losses. Stale
+prefix observations expire instead of permanently suppressing recovery.
+
+Twelve BF16 dense GEMM dispatch entries cover M5 plus M10/M15 router and
+BA shapes; microbenchmarks and GPU correctness support these entries.
+This does not attribute the entire serving gain to individual kernels.
+QSA candidate microbenchmarks remain exploratory: the actual cross-layer
+cache-pool block stride was not validated for those temporary candidates.
+The confidence forecast remains an experimental explicit opt-in through
+`additional_config.mtp_confidence_forecast`; the preset keeps it disabled.
+The examined real runs did not establish useful forecast activation.
+The default allocates no confidence buffers and adds no confidence
+softmax or D2H transfer.
+
+The preceding six-case architecture-only matrix is retained as a
+counterexample to a universal speed claim. On the same final runtime,
+adaptive maximum four versus fresh fixed three changes its geometric
+mean by +0.03% and total throughput by -0.62%; maximum five changes them
+by -0.72% and -0.89%. Those results are separate from the five-task target.
+
+All four mixed-task arms return their exact budgets. Every formal output
+contains the correct audit code and task cues, with no streaming error,
+replacement character, or long exact repetition detected. Literal
+first-line compliance is only 20/28 per arm: Python/TypeScript start with
+a Markdown fence and put the correct audit comment on the next line.
+Each fixed/dynamic pair has zero byte-identical complete texts; fixed
+three's own rerun also has zero. These checks do not establish semantic
+equivalence, compileability, or completion of the deliberately truncated
+stories and code. The fresh final adaptive server scores 63/64 on the
+same GSM8K subset, with the same incorrect case 12 (12 instead of 13),
+and passes all 12 serving diagnostics. Disconnect followed by successful
+recovery is observed; internal abort completion is not independently
+proven. All formal and quality clients exit zero.
+
+Focused checks pass: 123 controller tests; 25 selected producer/model/
+preemption tests; and 37 selected SM80 GEMM GPU tests (79 skipped).
+Normal pre-commit and changed-file Python 3.12 mypy pass. Repository-wide
+Python 3.12 mypy reports 31 errors in nine unchanged files; its failure
+log is retained. No new QSA implementation is adopted by this change.
+
+The preset now enables adaptive one-to-five drafts. Its effective command
+was captured without starting a model and compared to the measured final
+server: speculative settings, graph sizes, map SHA, dtypes, offload,
+parallel layout, and limits match. The other 14 captured files remain
+byte-identical. The preset file's hash changes only for these defaults.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,2 bash examples/online_serving/qwen38_nvfp4_dual170hx.sh \
+  /home/bul/dev/models1/Qwen/RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --host 127.0.0.1 --port 18940
+
+.venv/bin/python \
+  docs/validation/qwen38-dual170hx-adaptive-opt-20261004/qwen-dsv41-multitask/benchmark_qwen4_exp_multitask_serving.py \
+  --url http://127.0.0.1:18940 \
+  --suite docs/validation/qwen38-dual170hx-adaptive-opt-20261004/qwen-dsv41-multitask/qwen-dsv41-suite.json \
+  --label reproduction --phase all --rounds 2 --arrival-delay 0.5 \
+  --output /tmp/qwen-dsv41-reproduction.jsonl
+```
+
+The frozen client, original reference summary, tokenized suite, lineage,
+raw SSE outputs, per-group cache metrics, source hashes, launch commands,
+quality comparisons, negative experiments, test logs, and hardware samples
+are retained under
+`docs/validation/qwen38-dual170hx-adaptive-opt-20261004/` (ignored by Git).
+Use `qwen-dsv41-multitask/dsmix-first-pair-audited-v1.json` and
+`dsmix-confirm-pair-audited-v1.json` for the complete pair reports.
+The suite SHA256 is
+`ac1a191008947beaee14c29413b704c79389309ff1ef4adc304fbf95ccd36c19`;
+the frozen serving-client SHA256 is
+`6d7e383c53543f0d2f022837b0a3f356ff800dc96446093b8caf18693fca9d48`.
