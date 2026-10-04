@@ -305,3 +305,97 @@ Source hashes captured before the final preset starts must match the final
 committed Python files and preset. Microbenchmarks use physical GPU 3 in
 isolation; native TP2 checks use GPUs 0 and 2 outside serving measurements.
 The SM120 regression run uses physical GPU 1.
+
+## Adaptive draft validation (2026-10-04)
+
+Scheduler-owned adaptive MTP was measured on the same physical CMP 170HX
+GPUs 0 and 2 with TP1/PP2 and native MRv2. Three fresh servers used the
+runtime source at `23520ce082`: fixed MTP3, adaptive maximum 3, and adaptive
+maximum 6. The model, FR-Spec map, BF16 state/KV types, CPU PLE offload,
+memory utilization and serving limits were identical. The maximum-6 run
+used capture sizes `[1,2,3,4,6,7,8,12,14,16,21,28]`; maximum 3 retained
+`[1,2,3,4,6,8,12,16]`. A CPU dispatch check covered all 48 target shapes
+(two stages, C1–C4, K1–K6) and eight draft decode shapes.
+
+Native scheduler logs confirm completed verification rounds for every K
+from 1 to 3 in the maximum-3 run and from 1 to 6 in the maximum-6 run,
+without forced budgets. These counters accumulate over the whole process,
+including priming, performance, quality and diagnostics; they are not
+per-scenario frequencies. The focused CPU regression selection passed
+103 tests, covering budget/cost feedback, changing draft work, graph
+routing, pipeline output fences and cancellation bookkeeping.
+
+All three servers scored 63/64 on the same GSM8K subset, with the same
+incorrect case 12 and identical extracted numeric values. Maximum 6
+formatted case 58 as `57.00` instead of `57`. Each server also passed
+12/12 serving diagnostics: exact copying, arithmetic, typed JSON, mixed
+prompt lengths, concurrent and staggered arrivals, one seeded
+nonzero-temperature case, and a fresh request after a streaming client
+disconnected. All 12 diagnostic outputs matched between configurations.
+The disconnect/recovery check does not independently prove internal abort
+completion; one seeded case does not establish sampling-distribution
+equivalence.
+
+All 45 long-form greedy benchmark outputs differed from fresh fixed 3.
+The preceding fixed-3 run also differed from fresh fixed 3 on all 45
+matched prompts. GSM8K explanations differed on 41/64 cases for adaptive
+maximum 3 and 40/64 for maximum 6. Generated text and output-prefix
+comparisons are retained. The quality result is bounded evidence for this
+subset, not a claim of byte-identical output or complete model equivalence.
+
+Each server ran two priming repetitions and three formal repetitions of
+all six scenarios, with 1,024 output tokens per request. Prompt tags and
+tokenized inputs matched across servers. Every timed request changed its
+first cache block within and across phases. The table reports aggregate
+output throughput, including prefill, against the fresh fixed-MTP3
+reference from this session; the earlier measurement above is preserved.
+
+| Input tokens | Concurrency | Fresh fixed 3 | Adaptive max 3 | Change | Adaptive max 6 | Change |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 136 | 1 | 164.30 | 159.41 | -2.98% | 157.45 | -4.17% |
+| 136 | 4 | 428.44 | 432.50 | +0.95% | 426.34 | -0.49% |
+| 8,192 | 1 | 132.58 | 133.98 | +1.06% | 131.01 | -1.18% |
+| 8,192 | 4 | 308.13 | 304.17 | -1.29% | 295.35 | -4.15% |
+| 60,000 | 1 | 76.14 | 76.13 | -0.02% | 77.22 | +1.42% |
+| 60,000 | 4 | 116.86 | 117.57 | +0.61% | 117.30 | +0.38% |
+
+Values are tok/s and changes are relative to fresh fixed 3. These medians
+and retained min/max ranges describe three repetitions per scenario;
+they are not significance tests. The results do not establish a general
+speed improvement from enabling adaptive MTP on this configuration.
+Generated text can change acceptance and routing workloads, so these
+rates are end-to-end observations, not isolated controller-overhead
+measurements.
+The launch preset therefore retains fixed MTP3.
+
+To reproduce adaptive maximum 3, append a complete speculative config to
+the preset command. Preserve the map and reduction settings:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,2 bash examples/online_serving/qwen38_nvfp4_dual170hx.sh \
+  /home/bul/dev/models1/Qwen/RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --host 127.0.0.1 --port 18940 \
+  --speculative-config '{
+    "method":"mtp", "num_speculative_tokens":3,
+    "enable_adaptive_verification":true,
+    "index_share_for_mtp_iteration":false,
+    "mtp_token_map":"/home/bul/dev/sglang-rtxpro6000/configs/pennyroyal/frspec/flash-next-64k.pt",
+    "use_local_argmax_reduction":true
+  }'
+```
+
+For adaptive maximum 6, change `num_speculative_tokens` to 6 and append:
+
+```bash
+--compilation-config '{"cudagraph_capture_sizes":[1,2,3,4,6,7,8,12,14,16,21,28]}'
+```
+
+Use the priming, formal and quality commands from the preceding section
+for each fresh server. Raw results, all generated answers, native budget
+logs, source/checkpoint/input hashes, exact launch commands, hardware
+samples, CPU test selection and serving diagnostic fixtures are retained
+under `docs/validation/qwen38-dual170hx-adaptive-20261004/` (ignored by
+Git). Its `comparison.json` and `comparison.md` include full repetition
+ranges, decode rates and first-token delays. All benchmark and diagnostic
+clients exited zero; all three serving processes shut down normally, and
+the measurement GPUs were released.
