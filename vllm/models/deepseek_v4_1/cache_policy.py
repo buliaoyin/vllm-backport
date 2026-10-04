@@ -169,10 +169,15 @@ class TailCachePolicy:
         num_experts = len(scores)
         if costs is None:
             costs = np.full(num_experts, self.transfer_ms)
-        candidates = sorted(
-            set(range(num_experts)) - set(selected), key=lambda e: (-scores[e], e)
-        )
-        victims = sorted(set(selected) - pinned, key=lambda e: (scores[e], e))
+        resident = np.zeros(num_experts, dtype=np.bool_)
+        resident[list(selected)] = True
+        mutable = resident.copy()
+        mutable[[expert for expert in selected if expert in pinned]] = False
+        order = np.argsort(-scores, kind="stable")
+        candidates = order[~resident[order]]
+        order = np.argsort(scores, kind="stable")
+        victims = order[mutable[order]]
+        slots = {expert: slot for slot, expert in enumerate(selected)}
         result, saving, swaps = list(selected), 0.0, 0
         for incoming in candidates:
             if swaps >= min(limit, len(victims)):
@@ -184,7 +189,7 @@ class TailCachePolicy:
             cost = float(costs[incoming])
             if cost > budget or benefit <= self.safety_factor * cost:
                 continue
-            result[result.index(outgoing)] = incoming
+            result[slots[outgoing]] = int(incoming)
             saving += benefit
             budget -= cost
             swaps += 1

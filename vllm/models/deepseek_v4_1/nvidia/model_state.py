@@ -284,6 +284,13 @@ class DeepseekV41ModelState(DefaultModelState):
                 self.hybrid_steps,
                 self.hybrid_generated,
             )
+        profile = getattr(self, "hybrid_expert_profile", None)
+        if profile is not None:
+            profile.save(
+                (layer, module.gpu_cache)
+                for layer, module in enumerate(self.cpu_expert_modules, start=20)
+                if module.gpu_cache is not None
+            )
         self.hybrid_active = None
         self.hybrid_generated = self.hybrid_steps = self.hybrid_request_steps = 0
 
