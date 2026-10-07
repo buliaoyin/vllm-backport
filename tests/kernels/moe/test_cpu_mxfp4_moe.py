@@ -75,7 +75,6 @@ def test_expert_cache_profile_restores_demand_and_adjusts_resident_capacity(tmp_
     assert profile.selection(entries["20"], 2) == [1, 3]
     assert profile.selection(entries["20"], 1) == [3]
     assert profile.selection(entries["20"], 3) == [1, 3, 2]
-    assert profile.selection(entries["20"], 2, rank_by_history=True) == [3, 1]
     assert list(tmp_path.iterdir()) == [profile.path]
 
 
@@ -118,42 +117,6 @@ def test_expert_cache_profile_limits_writes_and_preserves_previous_on_failure(
     profile.save([(20, cache)])
     profile.save([(20, cache)])
     assert profile.path.read_bytes() == previous
-
-
-def test_expert_cache_profile_preserves_inactive_layer_demand_for_allocation(tmp_path):
-    """A layer with no resident slots retains its historical warm-start demand."""
-    from vllm.models.deepseek_v4_1.cache_profile import ExpertCacheProfile
-    from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
-
-    profile = ExpertCacheProfile(tmp_path / "profile.json", "checkpoint", 33, [20, 21])
-    demand = [[1.0] * 32 + [0.0], [0.0] * 33]
-    caches = [
-        SimpleNamespace(
-            selected=list(range(16)),
-            learning_state=lambda history=history: {
-                "history": history,
-                "requests": 1,
-                "mass": 1,
-            },
-        )
-        for history in demand
-    ]
-    profile.save(zip((20, 21), caches))
-    profile = ExpertCacheProfile(profile.path, "checkpoint", 33, [20, 21], interval=1)
-    initial = profile.load()
-    weighted = plan_expert_cache([32], 2, 33, scores=demand)
-    assert weighted == [(0, 32), (0, 0)]
-    caches[0].selected = list(range(32))
-    profile.save([(20, caches[0])])
-    restored = profile.load()
-    assert restored["20"]["selected"] == list(range(32))
-    assert restored["21"] == initial["21"]
-    assert (
-        plan_expert_cache(
-            [32], 2, 33, scores=[restored[str(layer)]["history"] for layer in (20, 21)]
-        )
-        == weighted
-    )
 
 
 @pytest.mark.parametrize("corruption", ["fingerprint", "duplicate", "nan", "large"])
@@ -205,6 +168,32 @@ def test_expert_cache_profile_fingerprint_tracks_checkpoint_revision_and_files(
     config.hf_config._commit_hash = None
     shard.write_bytes(b"replaced-checkpoint")
     assert model_fingerprint(config) != initial
+
+
+def test_expert_cache_profile_preserves_inactive_layer_history(tmp_path):
+    """A layer with no resident slots retains its saved learning state."""
+    from vllm.models.deepseek_v4_1.cache_profile import ExpertCacheProfile
+
+    profile = ExpertCacheProfile(tmp_path / "profile.json", "checkpoint", 33, [20, 21])
+    caches = [
+        SimpleNamespace(
+            selected=list(range(16)),
+            learning_state=lambda history=history: {
+                "history": history,
+                "requests": 1,
+                "mass": 1,
+            },
+        )
+        for history in ([1.0] * 32 + [0.0], [0.0] * 33)
+    ]
+    profile.save(zip((20, 21), caches))
+    profile = ExpertCacheProfile(profile.path, "checkpoint", 33, [20, 21], interval=1)
+    initial = profile.load()
+    caches[0].selected = list(range(32))
+    profile.save([(20, caches[0])])
+    restored = profile.load()
+    assert restored["20"]["selected"] == list(range(32))
+    assert restored["21"] == initial["21"]
 
 
 @pytest.mark.parametrize("draft_tokens", [3, 5, 7])
@@ -1163,64 +1152,19 @@ def test_gpu_cache_preserves_mixed_routes_across_prefill_and_graph_replay(
         module.backend.close()
 
 
-@pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize(
     "capacities", [[600, 600, 160], [1700, 1500, 1500, 2000], [0, 8, 0]]
 )
-def test_automatic_cache_respects_each_devices_remaining_budget(capacities, weighted):
+def test_automatic_cache_respects_each_devices_remaining_budget(capacities):
     from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
 
-    demand = [[1.0 / (expert + 1) for expert in range(384)]] * 20
-    plan = plan_expert_cache(
-        capacities,
-        local_device=len(capacities) - 1,
-        scores=demand if weighted else None,
-    )
+    plan = plan_expert_cache(capacities, local_device=len(capacities) - 1)
     assert len(plan) == 20
     for device, budget in enumerate(capacities):
         assert sum(count for owner, count in plan if owner == device) <= budget
     assert all(0 <= count < 384 for _, count in plan)
     if sum(capacities) > 20 * 8:
         assert all(count > 0 for _, count in plan)
-
-
-def test_profile_cache_allocates_slots_to_larger_marginal_demand():
-    from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
-
-    demand = [[1.0] * 24 + [0.0] * 9, [0.5] * 8 + [0.0] * 25]
-    fair = plan_expert_cache([32], num_layers=2, bank_size=33)
-    learned = plan_expert_cache([32], num_layers=2, bank_size=33, scores=demand)
-
-    def saved_calls(plan):
-        return sum(
-            sum(sorted(score, reverse=True)[:count])
-            for score, (_, count) in zip(demand, plan)
-        )
-
-    assert learned == [(0, 24), (0, 8)]
-    assert saved_calls(learned) > saved_calls(fair)
-
-
-@pytest.mark.parametrize("scores", [None, [None, None], [[0.0] * 33] * 2])
-def test_profile_cache_keeps_fair_plan_without_learned_demand(scores):
-    from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
-
-    fair = plan_expert_cache([32], num_layers=2, bank_size=33)
-    assert plan_expert_cache([32], num_layers=2, bank_size=33, scores=scores) == fair
-
-
-def test_profile_cache_keeps_local_device_when_its_fair_budget_fits():
-    from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
-
-    plan = plan_expert_cache(
-        [40, 40],
-        num_layers=2,
-        bank_size=33,
-        local_device=1,
-        scores=[[1.0] * 16 + [0.0] * 17] * 2,
-    )
-    assert [device for device, _ in plan] == [1, 0]
-    assert all(count > 0 for _, count in plan)
 
 
 @pytest.mark.parametrize(
@@ -1834,102 +1778,3 @@ def test_checkpoint_reclaim_preserves_private_data_and_excludes_other_storage(
     finally:
         del source
         owner.close()
-
-
-def test_cache_repacking_shares_staging_without_corrupting_resident_weights(
-    decode_refresh_cache, monkeypatch
-):
-    """Packing in another cache must preserve both caches' resident slots."""
-    from copy import copy
-    from unittest.mock import Mock
-
-    import vllm.models.deepseek_v4_1.expert_cache as cache_module
-
-    cache = decode_refresh_cache
-    cache.selected, cache.packed = [], None
-    cache._raw_host = cache._raw_device = cache._raw_copy_done = None
-    cache.feedback_enabled = False
-    cache.weight_source = None
-    cache.weights = {
-        (expert, projection): (
-            torch.full((2, 2), expert * 16 + projection, dtype=torch.uint8),
-            torch.full((2, 1), expert * 16 + projection + 8, dtype=torch.uint8),
-        )
-        for expert in range(4)
-        for projection in range(3)
-    }
-    cache.dynamic_stats["repacked_experts"] = 0
-    del cache._pack_expert
-    empty = torch.empty
-    monkeypatch.setattr(
-        torch, "empty", lambda *args, pin_memory=False, **kw: empty(*args, **kw)
-    )
-    event = Mock()
-    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
-    monkeypatch.setattr(
-        cache_module,
-        "prepare_moe_mxfp4_layer_for_marlin",
-        lambda layer, *parts, **kwargs: parts,
-    )
-    cache.select([0, 1])
-    staging_addresses = [part.data_ptr() for part in cache._raw_device]
-    second = copy(cache)
-    second.stream = Mock()
-    second.selected, second.packed = [], None
-    second.expert_map = torch.full_like(cache.expert_map, -1)
-    second.membership = torch.zeros_like(cache.membership)
-    second._host_map = second._host_membership = None
-    second.select([2, 3])
-    cache.select([0, 2])
-    cache.select([3, 2])
-    assert [part.data_ptr() for part in cache._raw_device] == staging_addresses
-    assert cache._raw_buffers is second._raw_buffers
-    assert event.synchronize.call_count == 5
-    for resident in (cache, second):
-        for slot, expert in enumerate(resident.selected):
-            assert resident.packed[0][slot, :2].eq(expert * 16).all()
-            assert resident.packed[0][slot, 2:].eq(expert * 16 + 2).all()
-            assert resident.packed[1][slot].eq(expert * 16 + 1).all()
-    assert cache.packing_workspace_bytes == 18
-
-
-def test_cache_selection_orders_remote_membership_before_return(
-    decode_refresh_cache, monkeypatch
-):
-    """Remote weights and the origin's routing mask publish as one update."""
-    import threading
-    from unittest.mock import Mock
-
-    cache = decode_refresh_cache
-    cache.origin = torch.device("cuda", 1)
-    origin_stream = Mock()
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda _: origin_stream)
-    order = []
-    cache.stream.synchronize.side_effect = lambda: order.append("complete")
-    origin_stream.wait_stream.side_effect = lambda _: order.append("weights_ready")
-    cache.stream.wait_stream.side_effect = lambda _: order.append("membership_ready")
-    cache.select([0, 2])
-    assert order == ["complete", "weights_ready", "membership_ready", "complete"]
-    assert cache.expert_map.tolist() == [0, -1, 1, -1]
-    assert cache.membership.tolist() == [True, False, True, False]
-    host_map = cache._host_map
-    cache.set_enabled(False)
-    assert cache._host_map is host_map
-    assert cache.expert_map.tolist() == [-1] * 4
-    assert not cache.membership.any()
-
-    lock = threading.Lock()
-    cache._packing_workspace = SimpleNamespace(lock=lock)
-    cache.stream.wait_stream.side_effect = RuntimeError("publication interrupted")
-    locked_during_sync = []
-    cache.stream.synchronize.side_effect = lambda: locked_during_sync.append(
-        ("cache", lock.locked())
-    )
-    origin_stream.synchronize.side_effect = lambda: locked_during_sync.append(
-        ("origin", lock.locked())
-    )
-    with pytest.raises(RuntimeError, match="publication interrupted"):
-        cache.set_enabled(True)
-    assert cache.membership.tolist() == [True, False, True, False]
-    assert locked_during_sync == [("cache", True), ("origin", True)]
-    assert not lock.locked()

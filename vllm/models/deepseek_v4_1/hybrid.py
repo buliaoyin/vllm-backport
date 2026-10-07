@@ -30,7 +30,6 @@ def apply_hybrid_defaults(args):
         "engram_cache_gib",
         "expert_profile",
         "expert_profile_interval",
-        "expert_allocation",
     }
     if unknown:
         raise ValueError(f"Unknown DeepSeek hybrid options: {sorted(unknown)}")
@@ -46,13 +45,6 @@ def apply_hybrid_defaults(args):
     ):
         raise ValueError(
             "expert_profile_interval requires a profile and positive count"
-        )
-    allocation = settings.get("expert_allocation", "fair")
-    if allocation not in ("fair", "profile") or (
-        allocation == "profile" and "expert_profile" not in settings
-    ):
-        raise ValueError(
-            "expert_allocation must be fair or profile with expert_profile"
         )
     storage = settings.get("engram_storage", "ram")
     if storage not in ("ram", "ssd"):
@@ -157,19 +149,8 @@ def plan_engram_cache(settings, num_embeddings, head_dim):
     return tuple(result)
 
 
-def plan_expert_cache(
-    capacities,
-    num_layers=20,
-    bank_size=384,
-    local_device=None,
-    *,
-    scores=None,
-):
-    """Allocate bounded slots, optionally favoring learned expert demand.
-
-    Profile allocation preserves the fair plan's device placement and assigns
-    each next group of eight slots by its expected saved expert calls.
-    """
+def plan_expert_cache(capacities, num_layers=20, bank_size=384, local_device=None):
+    """Distribute bounded slots fairly, preferring local execution when it fits."""
     remaining = list(capacities)
     result = []
     for layer in range(num_layers):
@@ -184,42 +165,7 @@ def plan_expert_cache(
         count = min(target, remaining[device]) // 8 * 8
         result.append((device, count))
         remaining[device] -= count
-    if scores is None or len(scores) != num_layers or any(s is None for s in scores):
-        return result
-    if any(
-        len(s) != bank_size or any(not math.isfinite(value) or value < 0 for value in s)
-        for s in scores
-    ):
-        raise ValueError("Expert demand scores must be finite non-negative banks")
-    ranked = [sorted(s, reverse=True) for s in scores]
-    if not any(any(s) for s in ranked):
-        return result
-    remaining = list(capacities)
-    counts = [0] * num_layers
-    while True:
-        candidates = []
-        for layer, (device, _) in enumerate(result):
-            count = counts[layer]
-            if count + 8 >= bank_size or remaining[device] < 8:
-                continue
-            saving = sum(ranked[layer][count : count + 8])
-            if saving > 0:
-                candidates.append((saving, -layer))
-        if not candidates:
-            break
-        _, selected = max(candidates)
-        layer = -selected
-        device = result[layer][0]
-        remaining[device] -= 8
-        counts[layer] += 8
-    learned = [(device, counts[layer]) for layer, (device, _) in enumerate(result)]
-    learned_saving = sum(
-        sum(ranked[layer][:count]) for layer, (_, count) in enumerate(learned)
-    )
-    fair_saving = sum(
-        sum(ranked[layer][:count]) for layer, (_, count) in enumerate(result)
-    )
-    return learned if learned_saving > fair_saving else result
+    return result
 
 
 def native_libraries():

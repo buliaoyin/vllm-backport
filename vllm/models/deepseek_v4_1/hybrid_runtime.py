@@ -190,7 +190,7 @@ def initialize_hybrid_cache(worker):
     if settings is None:
         return
     from .cpu_moe import CPUExpertModule
-    from .expert_cache import ExpertPackingWorkspace, GPUExpertCache
+    from .expert_cache import GPUExpertCache
 
     group = get_pp_group()
     runner = worker.model_runner
@@ -289,8 +289,10 @@ def initialize_hybrid_cache(worker):
             if isinstance(m, CPUExpertModule)
         ]
         expert_bytes = 3 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
-        # All caches on a device share one raw expert repacking workspace.
-        capacities = [max(0, int(item[0] // expert_bytes) - 1) for item in stats]
+        capacities = [int(item[0] // expert_bytes) for item in stats]
+        plan = plan_expert_cache(
+            capacities, len(modules), hf.n_routed_experts, group.rank_in_group
+        )
         host_budget = int(settings.get("host_cache_gib", 12) * GiB)
         lru_slots = min(32, host_budget // max(1, len(modules) * expert_bytes))
         enabled = config.speculative_config is not None
@@ -308,20 +310,6 @@ def initialize_hybrid_cache(worker):
             )
             learned = profile.load()
         runner.model_state.hybrid_expert_profile = profile
-        scores = None
-        if settings.get("expert_allocation") == "profile":
-            scores = [
-                learned.get(str(layer), {}).get("history")
-                for layer in range(20, 20 + len(modules))
-            ]
-        plan = plan_expert_cache(
-            capacities,
-            len(modules),
-            hf.n_routed_experts,
-            group.rank_in_group,
-            scores=scores,
-        )
-        packing_workspaces = {}
         for layer, (module, (device, count)) in enumerate(zip(modules, plan), start=20):
             if not count:
                 continue
@@ -329,9 +317,6 @@ def initialize_hybrid_cache(worker):
                 raise RuntimeError(
                     "Automatic caching requires resident CPU expert export"
                 )
-            if device not in packing_workspaces:
-                packing_workspaces[device] = ExpertPackingWorkspace(device)
-            workspace = packing_workspaces[device]
             cache = GPUExpertCache(
                 count,
                 hf.n_routed_experts,
@@ -339,7 +324,6 @@ def initialize_hybrid_cache(worker):
                 float(hf.swiglu_limit or 0),
                 hf.num_experts_per_tok,
                 weight_source=module.backend.export_expert,
-                packing_workspace=workspace,
             )
             cache.weight_shape = (hf.moe_intermediate_size, hf.hidden_size // 2)
             cache.loaded = set(module.backend._loaded)
@@ -349,11 +333,7 @@ def initialize_hybrid_cache(worker):
             entry = learned.get(str(layer))
             if entry is not None:
                 assert profile is not None
-                selected = profile.selection(
-                    entry,
-                    count,
-                    rank_by_history=settings.get("expert_allocation") == "profile",
-                )
+                selected = profile.selection(entry, count)
             # Packing alternates native export with small Torch CPU copies.
             # Keep those copies serial instead of repeatedly resizing the team.
             with set_default_torch_num_threads(1):
@@ -397,11 +377,6 @@ def initialize_hybrid_cache(worker):
                 lru_slots,
             )
         cached_experts = sum(count for _, count in plan)
-        logger.info(
-            "Shared expert repacking workspaces: devices=%d bytes=%d",
-            len(packing_workspaces),
-            sum(workspace.nbytes for workspace in packing_workspaces.values()),
-        )
         if learned:
             assert profile is not None
             logger.info(

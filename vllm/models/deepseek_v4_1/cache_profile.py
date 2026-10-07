@@ -100,13 +100,11 @@ class ExpertCacheProfile:
             logger.warning("Ignoring expert cache profile %s: %s", self.path, error)
             return {}
 
-    def selection(self, entry, capacity, *, rank_by_history=False):
+    def selection(self, entry, capacity):
         selected = entry["selected"]
         history = entry["history"]
         if history is not None:
             ranking = sorted(range(self.num_experts), key=lambda e: (-history[e], e))
-            if rank_by_history:
-                return ranking[:capacity]
             if len(selected) > capacity:
                 selected = sorted(selected, key=lambda e: (-history[e], e))
         else:

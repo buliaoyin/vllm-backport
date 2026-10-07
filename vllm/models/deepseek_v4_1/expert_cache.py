@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A fixed-capacity GPU expert cache with stable addresses across graph replays."""
 
-import math
-import threading
 import time
 from collections import OrderedDict
 from contextlib import nullcontext
@@ -51,61 +49,18 @@ class DynamicCacheStats(TypedDict):
     feedback_calls: list[int]
 
 
-class ExpertPackingWorkspace:
-    """Explicit scratch shared by synchronous cache updates on one device."""
-
-    def __init__(self, device):
-        self.device = (
-            torch.device("cuda", device)
-            if isinstance(device, int)
-            else torch.device(device)
-        )
-        self.lock = threading.RLock()
-        self.raw_host: tuple[torch.Tensor, ...] | None = None
-        self.raw_device: tuple[torch.Tensor, ...] | None = None
-        self.raw_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
-        self.copy_done: torch.cuda.Event | None = None
-
-    @property
-    def nbytes(self):
-        if self.raw_device is None:
-            return 0
-        return sum(part.numel() * part.element_size() for part in self.raw_device)
-
-
 class GPUExpertCache:
-    def __init__(
-        self,
-        capacity,
-        num_experts,
-        device,
-        limit,
-        top_k,
-        weight_source=None,
-        *,
-        packing_workspace=None,
-    ):
+    def __init__(self, capacity, num_experts, device, limit, top_k, weight_source=None):
         self.capacity = capacity
         self.num_experts = num_experts
         self.device = torch.device("cuda", device)
         self.origin = torch.device("cuda", torch.accelerator.current_device_index())
         self.stream = torch.cuda.Stream(device=self.device)
-        self._packing_workspace = packing_workspace or ExpertPackingWorkspace(
-            self.device
-        )
-        if self._packing_workspace.device != self.device:
-            raise ValueError("Expert packing workspace belongs to another device")
         self.weights = {}
         self.weight_shape: tuple[int, int] | None = None
         self.loaded: set[tuple[int, int]] = set()
         self.weight_source = weight_source
         self.packed: tuple[torch.Tensor, ...] | None = None
-        self._raw_host: tuple[torch.Tensor, ...] | None = None
-        self._raw_device: tuple[torch.Tensor, ...] | None = None
-        self._raw_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._raw_copy_done: torch.cuda.Event | None = None
-        self._host_map: torch.Tensor | None = None
-        self._host_membership: torch.Tensor | None = None
         self.selected = []
         self.enabled = True
         self.calibrate_from_prompt = True
@@ -173,7 +128,6 @@ class GPUExpertCache:
             )
 
     def _pack_expert(self, expert):
-        """Pack on self.stream; weight views are reused by the next repack."""
         if expert in self.host_packed:
             return self.host_packed[expert]
         if self.feedback_enabled and expert in self.host_lru_slots:
@@ -189,53 +143,18 @@ class GPUExpertCache:
             else self.weights[expert, p]
             for p in range(3)
         }
-        parts = (((0, 2), 0), ((1,), 0), ((0, 2), 1), ((1,), 1))
-        workspace = getattr(self, "_packing_workspace", None)
-        if workspace is None:
-            workspace = self._packing_workspace = ExpertPackingWorkspace(self.device)
-        shapes = []
-        for projections, part in parts:
-            pieces = [weights[p][part] for p in projections]
-            shapes.append(
-                (1, sum(piece.shape[0] for piece in pieces), *pieces[0].shape[1:])
+        raw = [
+            torch.cat([weights[p][part] for p in projections], dim=0)
+            .unsqueeze(0)
+            .to(self.device)
+            for projections, part in (
+                ((0, 2), 0),
+                ((1,), 0),
+                ((0, 2), 1),
+                ((1,), 1),
             )
-        if workspace.raw_host is None:
-            sizes = [math.prod(shape) for shape in shapes]
-            host_buffer = torch.empty(sum(sizes), dtype=torch.uint8, pin_memory=True)
-            device_buffer = torch.empty(
-                sum(sizes), dtype=torch.uint8, device=self.device
-            )
-            workspace.raw_buffers = host_buffer, device_buffer
-            workspace.raw_host = tuple(
-                part.view(shape)
-                for part, shape in zip(host_buffer.split(sizes), shapes)
-            )
-            workspace.raw_device = tuple(
-                part.view(shape)
-                for part, shape in zip(device_buffer.split(sizes), shapes)
-            )
-        elif [tuple(part.shape) for part in workspace.raw_host] != shapes:
-            raise ValueError("Shared expert packing workspace shapes differ")
-        if workspace.copy_done is not None:
-            # CPU writes must wait for the previous DMA's reads of pinned memory.
-            workspace.copy_done.synchronize()
-        self._raw_host = workspace.raw_host
-        self._raw_device = workspace.raw_device
-        self._raw_buffers = workspace.raw_buffers
-        assert self._raw_device is not None
-        for host, (copy_projections, part) in zip(self._raw_host, parts):
-            offset = 0
-            for projection in copy_projections:
-                source = weights[projection][part]
-                host[0, offset : offset + source.shape[0]].copy_(source)
-                offset += source.shape[0]
-        assert self._raw_buffers is not None
-        self._raw_buffers[1].copy_(self._raw_buffers[0], non_blocking=True)
-        if workspace.copy_done is None:
-            workspace.copy_done = torch.cuda.Event()
-        self._raw_copy_done = workspace.copy_done
-        workspace.copy_done.record(self.stream)
-        w13, w2, s13, s2 = self._raw_device
+        ]
+        w13, w2, s13, s2 = raw
         packed = prepare_moe_mxfp4_layer_for_marlin(
             SimpleNamespace(params_dtype=torch.bfloat16),
             w13,
@@ -257,15 +176,6 @@ class GPUExpertCache:
             self.host_lru_slots[expert] = slot
             self.dynamic_stats["lru_fills"] += 1
         return packed
-
-    @property
-    def packing_workspace_bytes(self):
-        workspace = getattr(self, "_packing_workspace", None)
-        return workspace.nbytes if workspace is not None else 0
-
-    def _packing_context(self):
-        workspace = getattr(self, "_packing_workspace", None)
-        return workspace.lock if workspace is not None else nullcontext()
 
     def set_feedback_enabled(self, enabled):
         self.feedback_enabled = enabled and self.decode_feedback is not None
@@ -313,21 +223,6 @@ class GPUExpertCache:
                 self.decode_feedback.counts.copy_(torch.tensor(pending))
 
     def select(self, experts, *, preserve_slots=True):
-        with self._packing_context():
-            try:
-                self._select(experts, preserve_slots=preserve_slots)
-            except BaseException:
-                self._synchronize_failed_update()
-                raise
-
-    def _synchronize_failed_update(self):
-        try:
-            self.stream.synchronize()
-        finally:
-            if self.device != self.origin:
-                torch.cuda.current_stream(self.origin).synchronize()
-
-    def _select(self, experts, *, preserve_slots=True):
         selected = set(experts)
         if len(experts) != self.capacity or len(selected) != self.capacity:
             raise ValueError("GPU expert cache selection must fill every slot once")
@@ -368,65 +263,29 @@ class GPUExpertCache:
                     destination[slot : slot + 1].copy_(source, non_blocking=True)
                 del packed
                 self.reloaded_experts += 1
-        self.selected = slots
-        self._publish_mapping(self.enabled)
         self.stream.synchronize()
+        self.selected = slots
+        self.set_enabled(self.enabled)
         self.reload_seconds += time.perf_counter() - start
         self.reload_updates += 1
 
     def set_enabled(self, enabled):
-        with self._packing_context():
-            try:
-                self.enabled = enabled
-                self._publish_mapping(enabled)
-                self.stream.synchronize()
-            except BaseException:
-                self._synchronize_failed_update()
-                raise
-
-    def _publish_mapping(self, enabled):
-        if getattr(self, "_host_map", None) is None:
-            pin = self.device.type == "cuda"
-            self._host_map = torch.empty(
-                self.num_experts, dtype=torch.int32, pin_memory=pin
-            )
-            self._host_membership = torch.empty(
-                self.num_experts, dtype=torch.bool, pin_memory=pin
-            )
-        assert self._host_membership is not None
-        assert self._host_map is not None
-        mapping = self._host_map
-        mapping.fill_(-1)
-        self._host_membership.fill_(False)
+        self.enabled = enabled
+        mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device="cpu")
         if enabled:
             mapping[self.selected] = torch.arange(
                 len(self.selected), dtype=torch.int32, device="cpu"
             )
-            self._host_membership[self.selected] = True
         with torch.cuda.stream(self.stream):
-            self.expert_map.copy_(mapping, non_blocking=True)
-            if self.device == self.origin:
-                self.membership.copy_(self._host_membership, non_blocking=True)
-        if self.device != self.origin:
-            origin_stream = torch.cuda.current_stream(self.origin)
-            origin_stream.wait_stream(self.stream)
-            with torch.cuda.stream(origin_stream):
-                self.membership.copy_(self._host_membership, non_blocking=True)
-            self.stream.wait_stream(origin_stream)
+            self.expert_map.copy_(mapping)
+            self.membership.copy_(mapping >= 0)
+        self.stream.synchronize()
 
     def select_static(self, experts):
         self.select(experts)
         self.calibrate_from_prompt = False
 
     def prepare_dynamic(self, settings):
-        with self._packing_context():
-            try:
-                self._prepare_dynamic(settings)
-            except BaseException:
-                self._synchronize_failed_update()
-                raise
-
-    def _prepare_dynamic(self, settings):
         policy = TailCachePolicy(**settings)
         if self.dynamic_policy is not None:
             if self.dynamic_policy != policy:
