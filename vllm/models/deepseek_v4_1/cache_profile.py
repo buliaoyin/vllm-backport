@@ -9,6 +9,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -37,6 +38,28 @@ def model_fingerprint(model_config):
 
 
 class ExpertCacheProfile:
+    @classmethod
+    def from_config(cls, settings, model_config, num_experts, layers):
+        """Resolve the model-specific default path or an explicit override."""
+        path = settings.get("expert_profile")
+        if path is False:
+            return None
+        fingerprint = model_fingerprint(model_config)
+        if path is None:
+            path = (
+                Path(envs.VLLM_CACHE_ROOT)
+                / "expert_profiles"
+                / "deepseek_v41"
+                / f"{fingerprint}.json"
+            )
+        return cls(
+            path,
+            fingerprint,
+            num_experts,
+            layers,
+            settings.get("expert_profile_interval", 16),
+        )
+
     def __init__(self, path, fingerprint, num_experts, layers, interval=16):
         self.path = Path(path).expanduser()
         self.fingerprint = fingerprint

@@ -2,7 +2,7 @@
 
 GPU 常驻热点专家，其余路由由 CPU 处理。缓存根据 verification-group
 路由反馈和跨请求 EWMA 更新专家选择，已有 host packed/LRU 缓存、收益阈值和
-替换预算。可选的热点持久化保存驻留名单和学习状态，供同一模型重启时恢复。
+替换预算。热点持久化默认保存驻留名单和学习状态，供同一模型重启时恢复，也可关闭。
 
 ## 配置
 
@@ -10,8 +10,14 @@ GPU 常驻热点专家，其余路由由 CPU 处理。缓存根据 verification-
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
-| `expert_profile` | 不设置 | 读取、保存学习状态的 JSON 路径，支持 `~`。 |
-| `expert_profile_interval` | `16` | 两次保存尝试之间的请求组结束次数，正整数，要求设置 profile。 |
+| `expert_profile` | 按模型指纹生成路径 | 读取、保存学习状态的 JSON 路径，支持 `~`；`false` 关闭持久化。 |
+| `expert_profile_interval` | `16` | 两次保存尝试之间的请求组结束次数，正整数；默认路径也可设置，关闭持久化时不可设置。 |
+
+未指定 `expert_profile` 时，自动使用
+`$VLLM_CACHE_ROOT/expert_profiles/deepseek_v41/<模型指纹>.json`。
+沿用 vLLM 缓存目录约定：`VLLM_CACHE_ROOT` 优先，其次为 `$XDG_CACHE_HOME/vllm`，
+均未设置时使用 `~/.cache/vllm`。同一模型重启复用文件，不同指纹使用不同文件。
+启动日志中的 `Expert cache profile` 显示实际路径；显式配置的路径优先于默认路径。
 
 例如三张 CMP 170HX：
 
@@ -55,7 +61,8 @@ checkpoint fingerprint 包含模型路径/ID、revision、HF commit、配置，�
 忽略整份文件。保存使用同目录临时文件和 `os.replace`，失败不打断生成。各独立部署使用
 独立路径；多个写入者共享路径时最后一次原子写入生效，不合并学习状态。
 
-移除 `expert_profile`、`expert_profile_interval` 即可回到默认行为。
+移除 `expert_profile` 即可使用默认路径；设为 `false` 并移除 `expert_profile_interval`
+即可关闭持久化，恢复每次启动重新学习的行为。
 GPU/CPU 既有数值舍入可能因缓存放置变化而改变生成内容和 DSpark 接受率，需要做模型评测。
 
 ## Strata 来源

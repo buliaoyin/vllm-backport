@@ -3111,6 +3111,41 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
 
 
 @pytest.mark.parametrize(
+    "settings",
+    [{"expert_profile_interval": 8}, {"expert_profile": False}],
+)
+def test_dsv41_expert_profile_allows_default_path_interval_and_disable(
+    monkeypatch, settings
+):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1 import hybrid
+
+    monkeypatch.setattr(hybrid, "native_libraries", lambda: [Path("ik"), Path("cuda")])
+    args = EngineArgs(
+        pipeline_parallel_size=3,
+        additional_config={
+            "deepseek_v41_hybrid": {"pipeline_layers": [7, 8, 25], **settings}
+        },
+    )
+    hybrid.apply_hybrid_defaults(args)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [{"expert_profile": value} for value in (None, "", True, 0)]
+    + [{"expert_profile_interval": value} for value in (0, True, 1.5)]
+    + [{"expert_profile": False, "expert_profile_interval": 1}],
+)
+def test_dsv41_expert_profile_rejects_invalid_paths_and_intervals(settings):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1.hybrid import apply_hybrid_defaults
+
+    args = EngineArgs(additional_config={"deepseek_v41_hybrid": settings})
+    with pytest.raises(ValueError, match="expert_profile"):
+        apply_hybrid_defaults(args)
+
+
+@pytest.mark.parametrize(
     "extra", [{"kv_cache_memory_bytes": 1024}, {"num_gpu_blocks_override": 10}]
 )
 def test_kv_token_budget_rejects_conflicting_byte_or_block_budgets(extra):

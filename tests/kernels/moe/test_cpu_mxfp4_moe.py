@@ -59,6 +59,54 @@ def test_static_cache_selects_capacity_and_device_per_layer():
         cpu_moe_config(config, 22)
 
 
+@pytest.mark.parametrize("cache_env", ["VLLM_CACHE_ROOT", "XDG_CACHE_HOME"])
+@pytest.mark.parametrize("explicit_path", [False, True])
+def test_expert_cache_profile_resolves_path_and_restores_after_restart(
+    tmp_path, monkeypatch, cache_env, explicit_path
+):
+    from vllm.models.deepseek_v4_1.cache_profile import (
+        ExpertCacheProfile,
+        model_fingerprint,
+    )
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("VLLM_CACHE_ROOT", raising=False)
+    root = tmp_path / "xdg" / "vllm"
+    if cache_env == "VLLM_CACHE_ROOT":
+        root = tmp_path / "cache"
+        monkeypatch.setenv("VLLM_CACHE_ROOT", str(root))
+    config = SimpleNamespace(
+        model="test-checkpoint",
+        revision=None,
+        hf_config=SimpleNamespace(to_dict=lambda: {"n_routed_experts": 4}),
+    )
+    expected = root / "expert_profiles" / "deepseek_v41"
+    expected /= f"{model_fingerprint(config)}.json"
+    settings = {}
+    if explicit_path:
+        expected = tmp_path / "custom.json"
+        settings["expert_profile"] = str(expected)
+    profile = ExpertCacheProfile.from_config(settings, config, 4, [20])
+    assert profile.path == expected
+    state = {"history": [0.0, 1.0, 0.0, 0.0], "requests": 1, "mass": 1}
+    profile.save([(20, SimpleNamespace(selected=[1], learning_state=lambda: state))])
+    restarted = ExpertCacheProfile.from_config(settings, config, 4, [20])
+    assert restarted.load() == {"20": {"selected": [1], **state}}
+    config.revision = "different-checkpoint"
+    different = ExpertCacheProfile.from_config(settings, config, 4, [20])
+    if not explicit_path:
+        assert different.path != profile.path
+    assert different.load() == {}
+
+
+def test_expert_cache_profile_disable_skips_checkpoint_access():
+    from vllm.models.deepseek_v4_1.cache_profile import ExpertCacheProfile
+
+    assert (
+        ExpertCacheProfile.from_config({"expert_profile": False}, None, 4, [20]) is None
+    )
+
+
 def test_expert_cache_profile_restores_demand_and_adjusts_resident_capacity(tmp_path):
     from vllm.models.deepseek_v4_1.cache_profile import ExpertCacheProfile
 

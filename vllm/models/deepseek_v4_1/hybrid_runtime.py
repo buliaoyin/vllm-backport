@@ -296,18 +296,17 @@ def initialize_hybrid_cache(worker):
         host_budget = int(settings.get("host_cache_gib", 12) * GiB)
         lru_slots = min(32, host_budget // max(1, len(modules) * expert_bytes))
         enabled = config.speculative_config is not None
-        profile = None
-        learned = {}
-        if settings.get("expert_profile"):
-            from .cache_profile import ExpertCacheProfile, model_fingerprint
+        from .cache_profile import ExpertCacheProfile
 
-            profile = ExpertCacheProfile(
-                settings["expert_profile"],
-                model_fingerprint(config.model_config),
-                hf.n_routed_experts,
-                range(20, 20 + len(modules)),
-                settings.get("expert_profile_interval", 16),
-            )
+        profile = ExpertCacheProfile.from_config(
+            settings,
+            config.model_config,
+            hf.n_routed_experts,
+            range(20, 20 + len(modules)),
+        )
+        learned = {}
+        if profile is not None:
+            logger.info("Expert cache profile: %s", profile.path)
             learned = profile.load()
         runner.model_state.hybrid_expert_profile = profile
         for layer, (module, (device, count)) in enumerate(zip(modules, plan), start=20):

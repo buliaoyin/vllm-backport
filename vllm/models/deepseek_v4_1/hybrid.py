@@ -33,18 +33,20 @@ def apply_hybrid_defaults(args):
     }
     if unknown:
         raise ValueError(f"Unknown DeepSeek hybrid options: {sorted(unknown)}")
-    if "expert_profile" in settings and (
-        not isinstance(settings["expert_profile"], str)
-        or not settings["expert_profile"]
+    profile = settings.get("expert_profile")
+    if (
+        "expert_profile" in settings
+        and profile is not False
+        and (not isinstance(profile, str) or not profile)
     ):
-        raise ValueError("expert_profile must be a nonempty path")
+        raise ValueError("expert_profile must be a nonempty path or false")
     if "expert_profile_interval" in settings and (
-        "expert_profile" not in settings
+        profile is False
         or type(settings["expert_profile_interval"]) is not int
         or settings["expert_profile_interval"] < 1
     ):
         raise ValueError(
-            "expert_profile_interval requires a profile and positive count"
+            "expert_profile_interval requires enabled persistence and a positive count"
         )
     storage = settings.get("engram_storage", "ram")
     if storage not in ("ram", "ssd"):
