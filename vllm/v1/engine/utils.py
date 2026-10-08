@@ -37,6 +37,8 @@ from vllm.v1.utils import _SubprocessWrapper, get_engine_client_zmq_addr, shutdo
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
 
+    from vllm.models.deepseek_v4_1.hybrid_runtime import HybridMPS
+
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
@@ -55,10 +57,10 @@ def get_engine_process_shutdown_timeout(
     drain. A value of zero therefore tells EngineCore to abort requests as soon
     as it receives SIGTERM. The parent process manager still needs a separate
     window in which the EngineCore can release device resources before it is
-    force-killed. ``cleanup_timeout`` allows executor-owned resources such as
-    CUDA MPS to stop after the workers exit. ROCm teardown can take longer than
-    the generic best-effort window, and force-killing during teardown can leave
-    VRAM resident.
+    force-killed. ``cleanup_timeout`` allows workers to release their resources;
+    parent-owned CUDA MPS is closed separately after this window. ROCm teardown
+    can take longer than the generic best-effort window, and force-killing
+    during teardown can leave VRAM resident.
 
     ``process_timeout`` may be a remaining budget computed by an outer process
     manager. Keep it unchanged unless both values are zero: a zero remaining
@@ -173,6 +175,11 @@ class CoreEngineProcManager:
         self._process_cleanup_timeout = (
             60.0 if hybrid_settings(vllm_config) is not None else 0.0
         )
+        self._hybrid_mps: HybridMPS | None = None
+        if self._process_cleanup_timeout:
+            from vllm.models.deepseek_v4_1 import hybrid_runtime
+
+            self._hybrid_mps = hybrid_runtime.HybridMPS()
         context = get_mp_context()
         common_kwargs = {
             "vllm_config": vllm_config,
@@ -207,7 +214,10 @@ class CoreEngineProcManager:
                 )
             )
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self._finalizer = weakref.finalize(
+            self, self._shutdown, self.processes, self._hybrid_mps
+        )
+        self._shutdown_lock = threading.Lock()
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
@@ -217,6 +227,8 @@ class CoreEngineProcManager:
         # pickles process args at start() time, sequentially per rank.
         user_assigned_gpu_ids = vllm_config.parallel_config.assigned_physical_gpu_ids
         try:
+            if self._hybrid_mps is not None:
+                self._hybrid_mps.start(vllm_config)
             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
                 # Populate the logical-to-physical GPU mapping in DP for
                 # platforms that cannot rely on
@@ -245,7 +257,12 @@ class CoreEngineProcManager:
                     process_kind="EngineCore",
                 ):
                     proc.start()
+        except BaseException:
+            self.shutdown()
+            raise
         finally:
+            if self._hybrid_mps is not None:
+                self._hybrid_mps.restore_environment()
             # Kill other procs if not all are running.
             if self.finished_procs():
                 self.shutdown()
@@ -253,19 +270,35 @@ class CoreEngineProcManager:
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
         self.manager_stopped.set()
-        if self._finalizer.detach() is not None:
-            process_timeout = get_engine_process_shutdown_timeout(
-                self._request_shutdown_timeout,
-                timeout,
-                cleanup_timeout=self._process_cleanup_timeout,
-            )
-            if process_timeout != timeout:
-                logger.info(
-                    "[shutdown] EngineCore process manager: using %ss "
-                    "cleanup grace after immediate request abort",
-                    process_timeout,
+        # Wait for cleanup already started by the engine liveness monitor.
+        with self._shutdown_lock:
+            if self._finalizer.detach() is not None:
+                process_timeout = get_engine_process_shutdown_timeout(
+                    self._request_shutdown_timeout,
+                    timeout,
+                    cleanup_timeout=self._process_cleanup_timeout,
                 )
-            shutdown(self.processes, timeout=process_timeout)
+                if process_timeout != timeout:
+                    logger.info(
+                        "[shutdown] EngineCore process manager: using %ss "
+                        "cleanup grace after immediate request abort",
+                        process_timeout,
+                    )
+                self._shutdown(
+                    self.processes, self._hybrid_mps, timeout=process_timeout
+                )
+
+    @staticmethod
+    def _shutdown(
+        processes: list[BaseProcess],
+        hybrid_mps: "HybridMPS | None",
+        timeout: float | None = None,
+    ) -> None:
+        try:
+            shutdown(processes, timeout=timeout)
+        finally:
+            if hybrid_mps is not None:
+                hybrid_mps.close()
 
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""

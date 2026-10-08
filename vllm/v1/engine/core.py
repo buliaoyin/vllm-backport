@@ -1444,8 +1444,11 @@ class EngineCoreProc(EngineCore):
                 engine_core._send_engine_dead()
             raise e
         finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            # The API process may send SIGTERM after a terminal SIGINT has
+            # already started teardown. Let resource cleanup finish; the
+            # process manager still enforces its deadline with SIGKILL.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             if signal_callback is not None:
                 signal_callback.stop()
             if engine_core is not None:

@@ -92,6 +92,23 @@ GPU/CPU 既有数值舍入可能因缓存放置变化而改变生成内容和 DS
 16 道自然生成双方均为12/16正确，16/16条完整 token 序列一致；此小样本只用于
 迁移检查。并发8请求取消后继续生成384个 token、请求排空及在线缓存更新检查通过。
 
+## 自动 MPS 的退出清理
+
+跨进程 GPU 专家会创建私有 CUDA MPS 实例。MPS 是独立后台服务，
+需要通过控制命令关闭；参见 [NVIDIA MPS 管理说明](https://docs.nvidia.com/deploy/mps/appendix-tools-and-interface-reference.html)。
+现有父进程管理器持有私有 MPS 实例，EngineCore 和 worker 退出后，
+向此实例发送 `quit -t 10`。直接使用执行器时，由执行器自身负责关闭。
+EngineCore 在资源清理期间忽略后续 SIGINT/SIGTERM，防止 Ctrl+C 后 API 补发的
+终止信号打断清理；进程管理器仍用 SIGKILL 执行最终超时限制。
+EngineCore 超过 60 秒清理宽限期被强杀，或提前异常退出，父进程仍会清理 MPS。
+MPS 关闭命令单独最多等待 50 秒；命令失败、超时或仍有存活进程时，
+父进程按私有目录和进程身份定向强杀，再等待退出。只有确认进程已退出才删除目录；
+无法结束的进程会明确报错并保留目录。60 秒不是整个服务退出的总时限。
+此修复不增加守护进程。如果连同负责清理的父进程一起 SIGKILL，仍会跳过清理。
+
+显式设置 `CUDA_MPS_PIPE_DIRECTORY` 时，使用外部 MPS，vLLM 不启动或关闭该实例。
+旧版本已残留的实例不会被新服务自动接管，需确认没有客户端后，通过其私有控制目录关闭。
+
 ## Strata 来源
 
 参考 [Niko1221/Strata](https://github.com/Niko1221/Strata)，固定 commit

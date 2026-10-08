@@ -1264,11 +1264,80 @@ def test_owned_mps_respects_and_restores_work_queue_configuration(
         )
     )
     resources.close()
-    assert launched == ([] if external else [connections or "16"] * 2)
+    assert launched == ([] if external else [connections or "16", connections])
     assert os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == connections
     assert os.environ.get("CUDA_MPS_PIPE_DIRECTORY") == (
         "/external/mps" if external else None
     )
+
+
+@pytest.mark.parametrize("failure", ["timeout", "exit_code", "missing_command"])
+def test_owned_mps_quit_failure_still_reclaims_only_its_own_processes(
+    monkeypatch, tmp_path, failure
+):
+    from unittest.mock import Mock
+
+    from vllm.models.deepseek_v4_1 import hybrid_runtime as runtime
+
+    resources = runtime.HybridMPS()
+    resources.path = tmp_path / "owned"
+    resources.path.mkdir()
+    owned: list[Mock] = []
+    unrelated: list[Mock] = []
+    for name, pipe, uid, group in (
+        ("nvidia-cuda-mps-control", resources.path / "pipe", os.getuid(), owned),
+        ("nvidia-cuda-mps-server", resources.path / "pipe", os.getuid(), owned),
+        ("nvidia-cuda-mps-server", tmp_path / "external", os.getuid(), unrelated),
+        ("python", resources.path / "pipe", os.getuid(), unrelated),
+        ("nvidia-cuda-mps-server", resources.path / "pipe", os.getuid() + 1, unrelated),
+    ):
+        proc = Mock()
+        proc.info = {"name": name, "uids": SimpleNamespace(real=uid)}
+        proc.environ.return_value = {"CUDA_MPS_PIPE_DIRECTORY": str(pipe)}
+        group.append(proc)
+    monkeypatch.setattr(runtime.psutil, "process_iter", lambda _: owned + unrelated)
+    monkeypatch.setattr(
+        runtime.psutil, "wait_procs", Mock(side_effect=[([], owned), (owned, [])])
+    )
+    error = {
+        "timeout": runtime.subprocess.TimeoutExpired("mps-control", 50),
+        "exit_code": runtime.subprocess.CalledProcessError(1, "mps-control"),
+        "missing_command": FileNotFoundError("mps-control"),
+    }[failure]
+    monkeypatch.setattr(runtime.subprocess, "run", Mock(side_effect=error))
+
+    resources.close()
+    resources.close()
+
+    assert resources.path is None
+    assert not (tmp_path / "owned").exists()
+    for proc in owned:
+        proc.kill.assert_called_once_with()
+    for proc in unrelated:
+        proc.kill.assert_not_called()
+
+
+def test_owned_mps_reports_unreaped_processes_and_keeps_cleanup_directory(
+    monkeypatch, tmp_path
+):
+    from unittest.mock import Mock
+
+    from vllm.models.deepseek_v4_1 import hybrid_runtime as runtime
+
+    resources = runtime.HybridMPS()
+    resources.path = tmp_path
+    proc = Mock(pid=123, **{"status.return_value": runtime.psutil.STATUS_DISK_SLEEP})
+    monkeypatch.setattr(resources, "_processes", lambda: [proc])
+    monkeypatch.setattr(runtime.subprocess, "run", Mock())
+    monkeypatch.setattr(
+        runtime.psutil, "wait_procs", lambda *args, **kwargs: ([], [proc])
+    )
+
+    with pytest.raises(RuntimeError, match="still alive.*123"):
+        resources.close()
+
+    assert resources.path == tmp_path
+    assert tmp_path.exists()
 
 
 def test_registered_lru_dma_does_not_cross_registration_boundaries(monkeypatch):

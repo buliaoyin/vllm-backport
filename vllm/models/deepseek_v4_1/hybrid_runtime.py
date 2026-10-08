@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Executor-owned resources and post-KV expert allocation for hybrid serving."""
+"""MPS ownership and post-KV expert allocation for hybrid serving."""
 
 import os
 import random
 import shutil
 import subprocess
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+import psutil
 import torch
 
 from vllm.distributed import get_pp_group
@@ -40,11 +41,143 @@ def preserve_hybrid_cpu_affinity(config):
             )
 
 
-class HybridExecutorResources:
-    def __init__(self, config):
-        settings = hybrid_settings(config)
+class HybridMPS:
+    """Own a private MPS instance independently of EngineCore's lifetime."""
+
+    def __init__(self):
+        self.path: Path | None = None
+        self.previous: dict[str, str | None] = {}
+
+    def start(self, config):
+        if (
+            hybrid_settings(config) is None
+            or config.parallel_config.pipeline_parallel_size == 1
+        ):
+            return
+        if os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
+            logger.info("Hybrid workers use the configured CUDA MPS instance")
+            return
+        binary = shutil.which("nvidia-cuda-mps-control")
+        if binary is None:
+            raise RuntimeError(
+                "Cross-process hybrid GPU experts require nvidia-cuda-mps-control"
+            )
+        self.path = Path(tempfile.mkdtemp(prefix="dsv41-mps-"))
+        for name in ("pipe", "log"):
+            (self.path / name).mkdir(mode=0o700)
+        updates = {
+            "CUDA_MPS_PIPE_DIRECTORY": str(self.path / "pipe"),
+            "CUDA_MPS_LOG_DIRECTORY": str(self.path / "log"),
+            # MPS otherwise defaults to two work queues. PP communication and
+            # remote experts need independent queues to overlap with prefill.
+            "CUDA_DEVICE_MAX_CONNECTIONS": os.environ.get(
+                "CUDA_DEVICE_MAX_CONNECTIONS", "16"
+            ),
+        }
+        try:
+            # UUIDs retain their meaning after the daemon remaps device ordinals.
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if visible and all(part.strip().isdigit() for part in visible.split(",")):
+                rows = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                    text=True,
+                )
+                mapping = dict(line.strip().split(", ") for line in rows.splitlines())
+                updates["CUDA_VISIBLE_DEVICES"] = ",".join(
+                    mapping[p.strip()] for p in visible.split(",")
+                )
+            self.previous = {key: os.environ.get(key) for key in updates}
+            os.environ.update(updates)
+            subprocess.run([binary, "-d"], check=True, capture_output=True, timeout=30)
+        except BaseException:
+            self.close()
+            raise
+        logger.info(
+            "Started vLLM-owned CUDA MPS instance: %s (CUDA_DEVICE_MAX_CONNECTIONS=%s)",
+            self.path,
+            updates["CUDA_DEVICE_MAX_CONNECTIONS"],
+        )
+
+    def restore_environment(self):
+        for key, value in self.previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.previous.clear()
+
+    def _processes(self) -> list[psutil.Process]:
+        assert self.path is not None
+        result = []
+        for proc in psutil.process_iter(["name", "uids"]):
+            uids = proc.info["uids"]
+            if (
+                proc.info["name"]
+                not in (
+                    "nvidia-cuda-mps-control",
+                    "nvidia-cuda-mps-server",
+                )
+                or uids is None
+                or uids.real != os.getuid()
+            ):
+                continue
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                if proc.environ().get("CUDA_MPS_PIPE_DIRECTORY") == str(
+                    self.path / "pipe"
+                ):
+                    result.append(proc)
+        return result
+
+    def close(self):
+        self.restore_environment()
+        if self.path is None:
+            return
+        processes = self._processes()
+        try:
+            subprocess.run(
+                ["nvidia-cuda-mps-control"],
+                input="quit -t 10\n",
+                text=True,
+                capture_output=True,
+                check=True,
+                timeout=50,
+                env=os.environ | {"CUDA_MPS_PIPE_DIRECTORY": str(self.path / "pipe")},
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("CUDA MPS quit failed for %s: %s", self.path, exc)
+
+        # Keep process identities across quit, and find servers created while it ran.
+        processes = list(set(processes + self._processes()))
+        _, alive = psutil.wait_procs(processes, timeout=1)
+        if alive:
+            logger.warning(
+                "Force stopping private CUDA MPS instance %s: pids=%s",
+                self.path,
+                [proc.pid for proc in alive],
+            )
+            for proc in alive:
+                with suppress(psutil.NoSuchProcess):
+                    proc.kill()
+            _, alive = psutil.wait_procs(alive, timeout=5)
+            remaining = []
+            for proc in alive:
+                with suppress(psutil.NoSuchProcess):
+                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                        remaining.append(proc.pid)
+            if remaining:
+                raise RuntimeError(
+                    f"CUDA MPS processes still alive: {remaining}; "
+                    f"retaining {self.path} for cleanup"
+                )
+        logger.info("Stopped vLLM-owned CUDA MPS instance: %s", self.path)
+        shutil.rmtree(self.path, ignore_errors=True)
         self.path = None
-        self.previous = {}
+
+
+class HybridExecutorResources(HybridMPS):
+    def __init__(self, config):
+        super().__init__()
+        settings = hybrid_settings(config)
         if settings is None:
             return
         hf = config.model_config.hf_config
@@ -79,78 +212,7 @@ class HybridExecutorResources:
         os.environ.setdefault("OMP_WAIT_POLICY", "ACTIVE")
         os.environ.setdefault("GOMP_SPINCOUNT", "10000000")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-        if config.parallel_config.pipeline_parallel_size == 1:
-            return
-        if os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
-            logger.info(
-                "Hybrid workers use the explicitly configured CUDA MPS instance"
-            )
-            return
-        binary = shutil.which("nvidia-cuda-mps-control")
-        if binary is None:
-            raise RuntimeError(
-                "Cross-process hybrid GPU experts require nvidia-cuda-mps-control"
-            )
-        self.path = Path(tempfile.mkdtemp(prefix="dsv41-mps-"))
-        for name in ("pipe", "log"):
-            (self.path / name).mkdir(mode=0o700)
-        updates = {
-            "CUDA_MPS_PIPE_DIRECTORY": str(self.path / "pipe"),
-            "CUDA_MPS_LOG_DIRECTORY": str(self.path / "log"),
-            # MPS otherwise defaults to two work queues. PP communication and
-            # remote experts need independent queues to overlap with prefill.
-            "CUDA_DEVICE_MAX_CONNECTIONS": os.environ.get(
-                "CUDA_DEVICE_MAX_CONNECTIONS", "16"
-            ),
-        }
-        # The daemon remaps device ordinals. UUIDs have the same meaning in clients.
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if visible and all(part.strip().isdigit() for part in visible.split(",")):
-            rows = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
-                text=True,
-            )
-            mapping = dict(line.strip().split(", ") for line in rows.splitlines())
-            updates["CUDA_VISIBLE_DEVICES"] = ",".join(
-                mapping[p.strip()] for p in visible.split(",")
-            )
-        self.previous = {key: os.environ.get(key) for key in updates}
-        os.environ.update(updates)
-        try:
-            subprocess.run([binary, "-d"], check=True, capture_output=True, timeout=30)
-        except Exception:
-            self.close()
-            raise
-        logger.info(
-            "Started executor-owned CUDA MPS instance: %s "
-            "(CUDA_DEVICE_MAX_CONNECTIONS=%s)",
-            self.path,
-            updates["CUDA_DEVICE_MAX_CONNECTIONS"],
-        )
-
-    def close(self):
-        if self.path is None:
-            return
-        result = subprocess.run(
-            ["nvidia-cuda-mps-control"],
-            input="quit\n",
-            text=True,
-            capture_output=True,
-            timeout=30,
-            env=os.environ | {"CUDA_MPS_PIPE_DIRECTORY": str(self.path / "pipe")},
-        )
-        logger.info(
-            "Executor-owned CUDA MPS shutdown returned %d: %s",
-            result.returncode,
-            self.path,
-        )
-        for key, value in self.previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        shutil.rmtree(self.path, ignore_errors=True)
-        self.path = None
+        self.start(config)
 
 
 @torch.inference_mode()
