@@ -34,7 +34,7 @@ def apply_hybrid_defaults(args):
     }
     if unknown:
         raise ValueError(f"Unknown DeepSeek hybrid options: {sorted(unknown)}")
-    if type(settings.get("overlap_decode", False)) is not bool:
+    if type(settings.setdefault("overlap_decode", True)) is not bool:
         raise ValueError("overlap_decode must be a boolean")
     profile = settings.get("expert_profile")
     if (

@@ -385,6 +385,27 @@ def test_cpu_phase_threads_switch_only_after_pending_callbacks_finish(monkeypatc
     assert events == ["sync", 8, 8, "sync", 16, 16]
 
 
+@pytest.mark.parametrize(
+    "settings,enabled",
+    [
+        (None, False),
+        ({}, True),
+        ({"overlap_decode": False}, False),
+        ({"overlap_decode": True}, True),
+    ],
+)
+def test_hybrid_overlap_defaults_on_only_for_hybrid(monkeypatch, settings, enabled):
+    from vllm.models.deepseek_v4_1.nvidia import model_state
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+    monkeypatch.setattr(DefaultModelState, "__init__", lambda *args: None)
+    monkeypatch.setattr(model_state, "ced_prefill_enabled", lambda _: False)
+    config = SimpleNamespace(additional_config={"deepseek_v41_hybrid": settings})
+    model = SimpleNamespace(token_lookback_depth=0, modules=lambda: [])
+    state = model_state.DeepseekV41ModelState(config, model, None, torch.device("cpu"))
+    assert state.hybrid_overlap_decode is enabled
+
+
 @pytest.fixture
 def hybrid_completion_state(monkeypatch):
     from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState

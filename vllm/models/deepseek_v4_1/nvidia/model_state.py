@@ -85,7 +85,7 @@ class DeepseekV41ModelState(DefaultModelState):
         settings = hybrid_settings(vllm_config)
         if settings is not None:
             self.hybrid_requests: dict[str, int | None] = {}
-            self.hybrid_overlap_decode = settings.get("overlap_decode", False)
+            self.hybrid_overlap_decode = settings.get("overlap_decode", True)
         self.hybrid_ready = False
         self.hybrid_active: str | None = None
         self.hybrid_decoding = False

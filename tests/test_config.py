@@ -3107,6 +3107,7 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
         5, draft_tokens or 3
     )
     assert args.additional_config["cpu_phase_threads"] == [22, 22]
+    assert args.additional_config["deepseek_v41_hybrid"]["overlap_decode"] is True
     assert "gpu_cache_selections" not in args.additional_config["cpu_moe"]
 
 
@@ -3162,6 +3163,9 @@ def test_dsv41_overlap_decode_requires_explicit_boolean(monkeypatch, enabled):
     )
     if type(enabled) is bool:
         hybrid.apply_hybrid_defaults(args)
+        assert (
+            args.additional_config["deepseek_v41_hybrid"]["overlap_decode"] is enabled
+        )
     else:
         with pytest.raises(ValueError, match="overlap_decode must be a boolean"):
             hybrid.apply_hybrid_defaults(args)

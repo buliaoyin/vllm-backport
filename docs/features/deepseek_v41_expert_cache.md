@@ -12,7 +12,7 @@ GPU 常驻热点专家，其余路由由 CPU 处理。缓存根据 verification-
 | --- | --- | --- |
 | `expert_profile` | 按模型指纹生成路径 | 读取、保存学习状态的 JSON 路径，支持 `~`；`false` 关闭持久化。 |
 | `expert_profile_interval` | `16` | 两次保存尝试之间的请求组结束次数，正整数；默认路径也可设置，关闭持久化时不可设置。 |
-| `overlap_decode` | `false` | 实验性方案 A：先提交 draft，再完成 CPU 专家错误检查、采样计数及缓存维护。只接受布尔值。 |
+| `overlap_decode` | `true` | 方案 A：先提交 draft，再完成 CPU 专家错误检查、采样计数及缓存维护。只接受布尔值。 |
 
 未指定 `expert_profile` 时，自动使用
 `$VLLM_CACHE_ROOT/expert_profiles/deepseek_v41/<模型指纹>.json`。
@@ -68,9 +68,9 @@ GPU/CPU 既有数值舍入可能因缓存放置变化而改变生成内容和 DS
 
 ## Decode 后处理重叠（方案 A）
 
-在现有 `deepseek_v41_hybrid` 配置中加入 `"overlap_decode": true` 即可启用，
-不需要 benchmark worker、额外调度器或重建 native 库。删除此字段或设为 `false`
-恢复原同步路径。预填充和仅编码阶段沿用原处理方式。
+`deepseek_v41_hybrid` 默认启用方案 A，不需要 benchmark worker、额外调度器或
+重建 native 库。在此对象中设置 `"overlap_decode": false` 可恢复原同步路径；
+删除字段会恢复默认开启。预填充和仅编码阶段沿用原处理方式。
 
 方案 A 保留 GPU 状态更新的提交顺序，将 decode 的主机检查推迟到 draft 提交后。
 主机等待对应输出的完成事件，复用已回传的采样计数；CPU 回调错误在输出交付前抛出。
@@ -85,7 +85,7 @@ GPU/CPU 既有数值舍入可能因缓存放置变化而改变生成内容和 DS
   个百分点，不能认证质量等价。调度时序影响验证形状，既有浮点归约差异可能改变输出。
 
 上述结果来自迁移前的实验实现，不等于任意设备、上下文或流量的性能承诺。
-开关默认关闭，单独试用时应重新检查性能和模型质量。
+本分支默认开启；更换设备或负载时应重新检查性能和模型质量。
 
 正式实现与实验 A 的迁移回归使用固定 K=3、稳定 MoE 排序及在线学习：
 256/256 行 logits、批次形状和输入完全一致，20 层缓存名单及学习状态一致。
