@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -23,6 +24,9 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.async_utils import AsyncOutput
 
 
 class ModelSpecificAttnMetadata:
@@ -153,7 +157,12 @@ class ModelState(ABC):
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor,
         num_computed_tokens: torch.Tensor | None = None,
-    ) -> None:
+    ) -> Callable[["AsyncOutput"], None] | None:
+        """Update GPU state; optionally finish host work before output delivery.
+
+        The completion runs on the sampling rank after draft submission and must
+        wait for any copies it reads. Capture per-step state when returning it.
+        """
         return None
 
     def reset_expert_cache_stats(self) -> None:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any
+from functools import partial
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,9 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.async_utils import AsyncOutput
 
 logger = init_logger(__name__)
 
@@ -58,6 +62,8 @@ class DeepseekV41ModelState(DefaultModelState):
     produced their KV.
     """
 
+    hybrid_overlap_decode = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -76,10 +82,14 @@ class DeepseekV41ModelState(DefaultModelState):
         self.ced_disabled_requests: set[str] = set()
         from ..hybrid import hybrid_settings
 
-        if hybrid_settings(vllm_config) is not None:
+        settings = hybrid_settings(vllm_config)
+        if settings is not None:
             self.hybrid_requests: dict[str, int | None] = {}
+            self.hybrid_overlap_decode = settings.get("overlap_decode", False)
         self.hybrid_ready = False
         self.hybrid_active: str | None = None
+        self.hybrid_decoding = False
+        self.hybrid_decode_requests = 0
         self.hybrid_generated = 0
         self.hybrid_steps = 0
         self.hybrid_peak_batch = 0
@@ -196,6 +206,13 @@ class DeepseekV41ModelState(DefaultModelState):
     def postprocess_state(self, idx_mapping, num_sampled, num_computed_tokens=None):
         super().postprocess_state(idx_mapping, num_sampled, num_computed_tokens)
         if self.cpu_async_modules and self.cpu_experts_active:
+            if self.hybrid_overlap_decode and self.hybrid_decoding:
+                return partial(
+                    self._complete_hybrid_decode,
+                    active=self.hybrid_active,
+                    requests=self.hybrid_decode_requests,
+                    step=self.hybrid_steps,
+                )
             torch.cuda.current_stream().synchronize()
             for module in self.cpu_async_modules:
                 module.backend.check_cuda_errors()
@@ -204,6 +221,20 @@ class DeepseekV41ModelState(DefaultModelState):
                 self.hybrid_steps += 1
                 self.hybrid_request_steps += self.hybrid_decode_requests
                 self._refresh_decode_cache()
+
+    def _complete_hybrid_decode(
+        self, output: "AsyncOutput", *, active: str | None, requests: int, step: int
+    ) -> None:
+        output.copy_event.synchronize()
+        for module in self.cpu_async_modules:
+            module.backend.check_cuda_errors()
+        if (active, step) != (self.hybrid_active, self.hybrid_steps):
+            raise RuntimeError("Hybrid decode completion belongs to another step")
+        if active is not None:
+            self.hybrid_generated += int(output.num_sampled_tokens_np.sum())
+            self.hybrid_steps += 1
+            self.hybrid_request_steps += requests
+            self._refresh_decode_cache()
 
     def _refresh_decode_cache(self):
         # Each step visits one layer; each layer enforces its own minimum interval.

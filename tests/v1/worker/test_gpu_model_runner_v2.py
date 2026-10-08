@@ -22,6 +22,94 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
+@pytest.mark.parametrize("mode", ["immediate", "deferred", "failed"])
+def test_sampling_finishes_deferred_checks_after_draft_before_output(monkeypatch, mode):
+    """A failed host completion cannot deliver sampled output or cache stats."""
+    calls = []
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    batch = SimpleNamespace(
+        req_ids=["request"], idx_mapping=torch.tensor([0]), query_start_loc=None
+    )
+    runner.execute_model_state = SimpleNamespace(
+        input_batch=batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=torch.zeros(1, 1),
+        aux_hidden_states=None,
+        dp_sync=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        routed_experts=None,
+        scheduler_step_id=0,
+        num_spec_tokens_to_schedule=1,
+        cudagraph_stats=None,
+    )
+    runner.is_last_pp_rank = True
+    runner.pp_handler = runner.pcp_manager = runner.adaptive_verification = None
+    runner.main_stream = runner.output_copy_stream = None
+    runner.check_ep_fault = None
+    runner._draft_workspace_lane = 0
+    runner._begin_pp_recv_buffer_dspark = lambda: None
+    runner.num_speculative_steps = 1
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    buffer = SimpleNamespace(gpu=None, np=None)
+    runner.req_states = SimpleNamespace(
+        all_token_ids=buffer,
+        num_computed_tokens=buffer,
+        prompt_len=buffer,
+        last_sampled_tokens=None,
+        next_prefill_tokens=None,
+        draft_tokens=torch.zeros(1, 1, dtype=torch.int64),
+    )
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(temperature=buffer, seeds=buffer)
+    )
+    runner.sample = lambda *args: (SimpleNamespace(sampled_token_ids=None), None, None)
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        compute_prompt_logprobs=lambda *args: {}
+    )
+    runner.model = SimpleNamespace(compute_logits=None)
+    runner.kv_connector = SimpleNamespace(post_forward=lambda _: None)
+    runner.eplb = SimpleNamespace(step=lambda **kwargs: calls.append("eplb"))
+
+    def propose(*args, **kwargs):
+        calls.append("draft")
+        return torch.zeros(1, 1, dtype=torch.int64)
+
+    def cache_stats():
+        calls.append("stats")
+        return "cache-stats"
+
+    runner.speculator = SimpleNamespace(supports_mm_inputs=False, propose=propose)
+    runner.model_state = SimpleNamespace(take_expert_cache_stats=cache_stats)
+    monkeypatch.setattr(
+        model_runner_module, "use_workspace_lane", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        model_runner_module, "AsyncOutput", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+
+    def complete(output):
+        assert output.model_runner_output.req_ids == ["request"]
+        calls.append("complete")
+        if mode == "failed":
+            raise RuntimeError("callback failed")
+
+    runner.postprocess_sampled = lambda *args: None if mode == "immediate" else complete
+    if mode == "failed":
+        with pytest.raises(RuntimeError, match="callback failed"):
+            runner.sample_tokens(None)
+        assert calls == ["draft", "complete"]
+    else:
+        output = runner.sample_tokens(None)
+        assert output.model_runner_output.expert_cache_stats == "cache-stats"
+        assert calls == (
+            ["stats", "draft", "eplb"]
+            if mode == "immediate"
+            else ["draft", "complete", "stats", "eplb"]
+        )
+
+
 @pytest.mark.parametrize("with_drafter", [False, True])
 def test_kv_cache_specs_carry_draft_ownership(monkeypatch, with_drafter):
     """The worker RPC must retain ownership for attention and QSA side caches."""

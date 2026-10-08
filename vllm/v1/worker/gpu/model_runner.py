@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import replace
@@ -1606,7 +1607,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
-    ) -> None:
+    ) -> Callable[[AsyncOutput], None] | None:
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
             assert self.sampler is not None
@@ -1626,7 +1627,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.total_len.gpu,
         )
 
-        self.model_state.postprocess_state(
+        return self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
 
@@ -2145,16 +2146,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
+        complete_postprocess = self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
         )
-        model_runner_output.expert_cache_stats = (
-            self.model_state.take_expert_cache_stats()
-        )
+        if complete_postprocess is None:
+            model_runner_output.expert_cache_stats = (
+                self.model_state.take_expert_cache_stats()
+            )
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -2223,6 +2225,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
+        if complete_postprocess is not None:
+            complete_postprocess(async_output)
+            model_runner_output.expert_cache_stats = (
+                self.model_state.take_expert_cache_stats()
+            )
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

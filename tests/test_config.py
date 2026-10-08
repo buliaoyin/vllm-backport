@@ -3145,6 +3145,28 @@ def test_dsv41_expert_profile_rejects_invalid_paths_and_intervals(settings):
         apply_hybrid_defaults(args)
 
 
+@pytest.mark.parametrize("enabled", [False, True, "true", 1, None])
+def test_dsv41_overlap_decode_requires_explicit_boolean(monkeypatch, enabled):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1 import hybrid
+
+    monkeypatch.setattr(hybrid, "native_libraries", lambda: [Path("ik"), Path("cuda")])
+    args = EngineArgs(
+        pipeline_parallel_size=3,
+        additional_config={
+            "deepseek_v41_hybrid": {
+                "pipeline_layers": [7, 8, 25],
+                "overlap_decode": enabled,
+            }
+        },
+    )
+    if type(enabled) is bool:
+        hybrid.apply_hybrid_defaults(args)
+    else:
+        with pytest.raises(ValueError, match="overlap_decode must be a boolean"):
+            hybrid.apply_hybrid_defaults(args)
+
+
 @pytest.mark.parametrize(
     "extra", [{"kv_cache_memory_bytes": 1024}, {"num_gpu_blocks_override": 10}]
 )

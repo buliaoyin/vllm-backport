@@ -30,9 +30,12 @@ def apply_hybrid_defaults(args):
         "engram_cache_gib",
         "expert_profile",
         "expert_profile_interval",
+        "overlap_decode",
     }
     if unknown:
         raise ValueError(f"Unknown DeepSeek hybrid options: {sorted(unknown)}")
+    if type(settings.get("overlap_decode", False)) is not bool:
+        raise ValueError("overlap_decode must be a boolean")
     profile = settings.get("expert_profile")
     if (
         "expert_profile" in settings

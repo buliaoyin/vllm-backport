@@ -385,6 +385,105 @@ def test_cpu_phase_threads_switch_only_after_pending_callbacks_finish(monkeypatc
     assert events == ["sync", 8, 8, "sync", 16, 16]
 
 
+@pytest.fixture
+def hybrid_completion_state(monkeypatch):
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+    calls = []
+    monkeypatch.setattr(
+        DefaultModelState, "postprocess_state", lambda *args: calls.append("gpu")
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(synchronize=lambda: calls.append("stream")),
+    )
+    state = object.__new__(DeepseekV41ModelState)
+    state.cpu_async_modules = [
+        SimpleNamespace(
+            backend=SimpleNamespace(check_cuda_errors=lambda: calls.append("check"))
+        )
+    ]
+    state.cpu_experts_active = True
+    state.hybrid_decoding = True
+    state.hybrid_active = "request"
+    state.hybrid_generated = 7
+    state.hybrid_steps = 2
+    state.hybrid_request_steps = 4
+    state.hybrid_decode_requests = 2
+    state._refresh_decode_cache = lambda: calls.append("refresh")
+    output = SimpleNamespace(
+        copy_event=SimpleNamespace(synchronize=lambda: calls.append("ready")),
+        num_sampled_tokens_np=np.array([2, 3]),
+    )
+    return state, calls, output
+
+
+@pytest.mark.parametrize("mode", ["default", "warmup", "prefill", "encoder", "decode"])
+def test_hybrid_defers_only_opted_in_decode(hybrid_completion_state, mode):
+    """GPU updates stay ordered; only eligible decode avoids the stream wait."""
+    state, calls, output = hybrid_completion_state
+    if mode != "default":
+        state.hybrid_overlap_decode = True
+    state.hybrid_decoding = mode not in ("prefill", "warmup")
+    if mode == "warmup":
+        state.hybrid_active = None
+        state.hybrid_decode_requests = 0
+    state.cpu_experts_active = mode != "encoder"
+    complete = state.postprocess_state(None, torch.tensor([2, 3]))
+    if mode == "decode":
+        assert calls == ["gpu"]
+        state.hybrid_decode_requests = 8
+        complete(output)
+        assert calls == ["gpu", "ready", "check", "refresh"]
+        assert (state.hybrid_generated, state.hybrid_request_steps) == (12, 6)
+        output.num_sampled_tokens_np = np.array([1])
+        state.postprocess_state(None, None)(output)
+        assert (state.hybrid_generated, state.hybrid_request_steps) == (13, 14)
+    else:
+        assert complete is None
+        assert (
+            calls
+            == {
+                "default": ["gpu", "stream", "check", "refresh"],
+                "warmup": ["gpu", "stream", "check"],
+                "prefill": ["gpu", "stream", "check"],
+                "encoder": ["gpu"],
+            }[mode]
+        )
+
+
+@pytest.mark.parametrize("failure", ["callback", "request", "step"])
+def test_hybrid_completion_rejects_errors_before_learning(
+    hybrid_completion_state, failure
+):
+    """Failed callbacks and stale completions cannot update cache counters."""
+    state, calls, output = hybrid_completion_state
+    state.hybrid_overlap_decode = True
+    complete = state.postprocess_state(None, None)
+    if failure == "callback":
+
+        def check():
+            calls.append("check")
+            raise RuntimeError("callback failed")
+
+        state.cpu_async_modules[0].backend.check_cuda_errors = check
+    elif failure == "request":
+        state.hybrid_active = "next"
+    else:
+        state.hybrid_steps += 1
+    before = (state.hybrid_generated, state.hybrid_steps, state.hybrid_request_steps)
+    with pytest.raises(RuntimeError):
+        complete(output)
+    assert (
+        state.hybrid_generated,
+        state.hybrid_steps,
+        state.hybrid_request_steps,
+    ) == before
+    assert calls == ["gpu", "ready", "check"]
+
+
 @pytest.mark.parametrize(
     "replay,threads,feedback,decoder_requests",
     [
