@@ -177,9 +177,13 @@ class DecodeBenchmarkWorker:
                 if module.gpu_cache is not None:
                     wrap(module.gpu_cache, "adapt", f"admit:{name}")
             speculator = getattr(runner, "speculator", None)
-            draft = getattr(speculator, "query_cudagraph_manager", None)
-            if draft is not None:
-                wrap(draft, "run_fullgraph", "draft_graph")
+            drafts = [getattr(speculator, "query_cudagraph_manager", None)]
+            drafts.extend(getattr(speculator, "_draft_managers", {}).values())
+            seen = set()
+            for draft in drafts:
+                if draft is not None and id(draft) not in seen:
+                    wrap(draft, "run_fullgraph", "draft_graph")
+                    seen.add(id(draft))
             self.dsv41_decode_timing = records, restores
             return {"pid": os.getpid()}
         if action == "timing_finish":

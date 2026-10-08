@@ -21,6 +21,7 @@ def request(client, endpoint, payload, label):
     request_id = None
     events = []
     token_events = []
+    token_ids = []
     with client.stream("POST", endpoint, json=payload) as response:
         if response.status_code != 200:
             raise RuntimeError(response.read().decode())
@@ -31,7 +32,13 @@ def request(client, endpoint, payload, label):
             now = time.perf_counter()
             usage = event.get("usage") or usage
             request_id = event.get("id", request_id)
+            if event.get("usage"):
+                count = event["usage"]["completion_tokens"]
+                previous = token_events[-1][1] if token_events else 0
+                if count > previous:
+                    token_events.append([now, count])
             for choice in event.get("choices", []):
+                token_ids.extend(choice.get("token_ids") or [])
                 delta = choice.get("delta", {})
                 content = (
                     choice.get("text") or delta.get("content") or delta.get("reasoning")
@@ -41,13 +48,20 @@ def request(client, endpoint, payload, label):
                     last = now
                     text_parts.append(content)
                     events.append([now - started, content])
-                    if event.get("usage"):
-                        token_events.append([now, event["usage"]["completion_tokens"]])
     if first is None or last is None or usage is None:
         raise RuntimeError(f"Incomplete stream for {label}: {usage}")
     outputs = usage["completion_tokens"]
     if payload.get("ignore_eos") and outputs != payload["max_tokens"]:
         raise RuntimeError(f"Expected {payload['max_tokens']} outputs; got {outputs}")
+    first_count = 1
+    counting = "content_boundary_estimate"
+    if len(token_events) >= 2:
+        first, first_count = token_events[0]
+        last, last_count = token_events[-1]
+        decode_tps = (last_count - first_count) / (last - first)
+        counting = "cumulative_output_tokens"
+    else:
+        decode_tps = (outputs - 1) / (last - first) if last > first else None
     row = {
         "label": label,
         "request_id": request_id,
@@ -62,10 +76,13 @@ def request(client, endpoint, payload, label):
         "ttft_seconds": first - started,
         "request_seconds": last - started,
         "prefill_tps": usage["prompt_tokens"] / (first - started),
-        "decode_tps": (outputs - 1) / (last - first) if outputs > 1 else None,
+        "decode_tps": decode_tps,
+        "first_output_count": first_count,
+        "decode_counting": counting,
         "text": "".join(text_parts),
         "events": events,
         "token_events": token_events,
+        "token_ids": token_ids,
     }
     return row
 
@@ -77,6 +94,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--cases", nargs="+", default=None)
     parser.add_argument("--max-output-tokens", type=int, default=256)
     parser.add_argument("--prompt-tokens", type=int)
     parser.add_argument("--wait-ready", type=float, default=0)
@@ -88,8 +106,10 @@ def main():
     parser.add_argument("--vision-normal-eos", action="store_true")
     args = parser.parse_args()
     suite = json.loads(args.suite.read_text())
-    chosen = {"zh_analysis", "en_analysis", "code_python"}
+    chosen = set(args.cases or ("zh_analysis", "en_analysis", "code_python"))
     cases = [case for case in suite["cases"] if case["id"] in chosen]
+    if not cases:
+        parser.error("No selected cases in the input suite")
     if args.prompt_tokens is not None:
         if args.prompt_tokens < 608:
             raise ValueError("Resized text prompts must contain at least 608 tokens")
@@ -132,7 +152,7 @@ def main():
         "stream": True,
         "stream_options": {
             "include_usage": True,
-            "continuous_usage_stats": args.concurrency > 1,
+            "continuous_usage_stats": True,
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -208,7 +228,9 @@ def main():
                             "concurrency": args.concurrency,
                             "elapsed_seconds": last - started,
                             "output_tps": outputs / (last - started),
-                            "generation_window_tps": (outputs - len(rows))
+                            "generation_window_tps": (
+                                outputs - sum(row["first_output_count"] for row in rows)
+                            )
                             / (last - first),
                             "mean_ttft_seconds": sum(
                                 row["ttft_seconds"] for row in rows

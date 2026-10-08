@@ -14,12 +14,14 @@ import httpx
 async def run(args):
     cases = json.loads(args.suite.read_text())["cases"]
     cases = [
-        c for c in cases if c["id"] in {"zh_analysis", "en_analysis", "code_python"}
+        c
+        for c in cases
+        if c["id"] in set(args.cases or ("zh_analysis", "en_analysis", "code_python"))
     ]
     args.output.mkdir(parents=True, exist_ok=True)
     first = asyncio.Event()
     stop = asyncio.Event()
-    states = [{"first": False, "outputs": 0} for _ in range(16)]
+    states = [{"first": False, "outputs": 0} for _ in range(args.concurrency)]
     async with httpx.AsyncClient(base_url=args.url, timeout=1200) as client:
         model = (await client.get("/v1/models")).json()["data"][0]["id"]
 
@@ -44,7 +46,7 @@ async def run(args):
                 "prompt": cases[index % len(cases)]["prompt_token_ids"],
                 "temperature": 0,
                 "seed": 20260915,
-                "max_tokens": 1024,
+                "max_tokens": args.max_output_tokens,
                 "ignore_eos": True,
                 "stream": True,
                 "stream_options": {
@@ -74,9 +76,12 @@ async def run(args):
         async def profile():
             await first.wait()
             print(
-                "All 16 requests have output; starting decode diagnostics", flush=True
+                f"All {args.concurrency} requests have output; "
+                "starting decode diagnostics",
+                flush=True,
             )
-            await rpc("timing_start")
+            if not args.no_timing:
+                await rpc("timing_start")
             if args.torch:
                 await rpc("torch_profile_start")
             if args.native:
@@ -94,7 +99,8 @@ async def run(args):
             (args.output / "metrics-after.txt").write_text(
                 (await client.get("/metrics")).text
             )
-            save("timing.json", await rpc("timing_finish"))
+            if not args.no_timing:
+                save("timing.json", await rpc("timing_finish"))
             if args.native:
                 save(
                     "native.json",
@@ -107,18 +113,24 @@ async def run(args):
                 )
             stop.set()
             result = {
+                "start_monotonic": begin,
+                "end_monotonic": end,
                 "seconds": end - begin,
                 "tokens": sum(after) - sum(before),
                 "output_tps": (sum(after) - sum(before)) / (end - begin),
                 "before_outputs": before,
                 "after_outputs": after,
-                "timing_note": "Diagnostic overhead included; not formal throughput",
+                "timing_note": (
+                    "Client-only steady decode window; RPC snapshots at boundaries"
+                    if args.no_timing and not args.native and not args.torch
+                    else "Diagnostic overhead included; not formal throughput"
+                ),
             }
             save("window.json", result)
             print(json.dumps(result), flush=True)
 
         async with asyncio.TaskGroup() as group:
-            for index in range(16):
+            for index in range(args.concurrency):
                 group.create_task(consume(index))
             group.create_task(profile())
         for _ in range(60):
@@ -145,11 +157,17 @@ def main():
     parser.add_argument("--suite", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seconds", type=float, default=8)
+    parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--max-output-tokens", type=int, default=4096)
+    parser.add_argument("--cases", nargs="+")
+    parser.add_argument("--no-timing", action="store_true")
     parser.add_argument("--torch", action="store_true")
     parser.add_argument("--native", action="store_true")
     args = parser.parse_args()
     if not 0 < args.seconds <= 30:
         parser.error("Use a bounded profiling window of at most 30 seconds")
+    if args.concurrency < 1 or args.max_output_tokens < 1:
+        parser.error("Concurrency and output token count must be positive")
     asyncio.run(run(args))
 
 
