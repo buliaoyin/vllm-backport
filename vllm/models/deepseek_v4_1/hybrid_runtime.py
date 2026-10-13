@@ -201,7 +201,7 @@ class HybridExecutorResources(HybridMPS):
                     engram_bytes / GiB,
                 )
         check_host_headroom(
-            resident + int(settings.get("host_cache_gib", 12) * GiB) + 16 * GiB
+            resident + int(settings.get("host_cache_gib", 0) * GiB) + 16 * GiB
         )
         cpus = physical_cpus()
         phases = config.additional_config["cpu_phase_threads"]
@@ -339,6 +339,11 @@ def initialize_hybrid_cache(worker):
         free / GiB,
         available / GiB,
     )
+    if settings.get("r8_refill", True):
+        hf = config.model_config.hf_config
+        raw_workspace = 6 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
+        available = max(0, available - raw_workspace)
+        logger.info("R8 refill staging reserve: %.3f GiB", raw_workspace / GiB)
     stats: list[Any] = [None] * group.world_size
     torch.distributed.all_gather_object(
         stats, (available, free, transient, kv_bytes), group=group.cpu_group
@@ -355,7 +360,7 @@ def initialize_hybrid_cache(worker):
         plan = plan_expert_cache(
             capacities, len(modules), hf.n_routed_experts, group.rank_in_group
         )
-        host_budget = int(settings.get("host_cache_gib", 12) * GiB)
+        host_budget = int(settings.get("host_cache_gib", 0) * GiB)
         lru_slots = min(32, host_budget // max(1, len(modules) * expert_bytes))
         enabled = config.speculative_config is not None
         from .cache_profile import ExpertCacheProfile
@@ -386,6 +391,16 @@ def initialize_hybrid_cache(worker):
                 hf.num_experts_per_tok,
                 weight_source=module.backend.export_expert,
             )
+            if settings.get("r8_refill", True):
+                if module.backend.supports_r8_staging:
+                    from .r8_refill import R8Refill
+
+                    cache.r8_refill = R8Refill(module.backend, cache.device)
+                elif layer == 20:
+                    logger.warning(
+                        "Native R8 staging is unavailable; rebuild libdsv41_ik. "
+                        "Using checkpoint-layout expert refills."
+                    )
             cache.weight_shape = (hf.moe_intermediate_size, hf.hidden_size // 2)
             cache.loaded = set(module.backend._loaded)
             selected = random.Random(20260915 + layer).sample(
@@ -419,6 +434,8 @@ def initialize_hybrid_cache(worker):
                     "prepack_resident": False,
                     "host_lru_experts": lru_slots,
                     "host_cache_bytes": lru_slots * expert_bytes,
+                    "decode_interval": 16 if cache.r8_refill is not None else 64,
+                    "decode_budget_ms": 16.0 if cache.r8_refill is not None else 8.0,
                 }
             )
             cache.dynamic_enabled = False

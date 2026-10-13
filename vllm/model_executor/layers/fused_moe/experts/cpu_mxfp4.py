@@ -493,6 +493,44 @@ class CPUMXFP4Experts:
             raise RuntimeError(self._library.dsv41_moe_error().decode())
         return weight, scales
 
+    @property
+    def supports_r8_staging(self) -> bool:
+        return self.config.backend == "ik" and hasattr(
+            self._library, "dsv41_moe_stage_r8"
+        )
+
+    def stage_expert_r8(self, expert: int, output: torch.Tensor) -> None:
+        """Copy three native projections into a caller-owned byte buffer."""
+        expected = 3 * self.hidden_size * self.intermediate_size * 17 // 32
+        if not self.supports_r8_staging:
+            raise RuntimeError("R8 staging requires an updated IK backend")
+        if any((expert, p) not in self._loaded for p in range(3)):
+            raise ValueError("Invalid or unloaded R8 expert")
+        if (
+            output.device.type != "cpu"
+            or output.dtype != torch.uint8
+            or not output.is_contiguous()
+            or output.numel() != expected
+        ):
+            raise ValueError("R8 staging requires a contiguous CPU byte buffer")
+        copy_bytes = self._library.dsv41_moe_stage_r8
+        copy_bytes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        copy_bytes.restype = ctypes.c_int
+        if copy_bytes(
+            self._handle,
+            expert,
+            output.data_ptr(),
+            expected,
+            min(4, self.config.num_threads),
+        ):
+            raise RuntimeError(self._library.dsv41_moe_error().decode())
+
     def prepare(self) -> None:
         if len(self._loaded) != self.num_experts * 3:
             raise RuntimeError("CPU expert weights are incomplete")

@@ -3077,8 +3077,11 @@ def test_revision_resolved_when_weights_match_model(mock_resolve):
 
 @pytest.mark.parametrize("draft_tokens", [None, 3, 5, 7])
 @pytest.mark.parametrize("prefix_caching", [None, False, True])
+@pytest.mark.parametrize(
+    "cache_options", [{}, {"r8_refill": False, "host_cache_gib": 12}]
+)
 def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
-    monkeypatch, draft_tokens, prefix_caching
+    monkeypatch, draft_tokens, prefix_caching, cache_options
 ):
     from vllm.engine.arg_utils import EngineArgs
     from vllm.models.deepseek_v4_1 import hybrid
@@ -3089,7 +3092,12 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
     args = EngineArgs(
         pipeline_parallel_size=3,
         max_num_batched_tokens=4096,
-        additional_config={"deepseek_v41_hybrid": {"pipeline_layers": [7, 7, 26]}},
+        additional_config={
+            "deepseek_v41_hybrid": {
+                "pipeline_layers": [7, 7, 26],
+                **cache_options,
+            }
+        },
         speculative_config={"method": "dspark"},
         enable_prefix_caching=prefix_caching,
     )
@@ -3108,6 +3116,9 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
     )
     assert args.additional_config["cpu_phase_threads"] == [22, 22]
     assert args.additional_config["deepseek_v41_hybrid"]["overlap_decode"] is True
+    settings = args.additional_config["deepseek_v41_hybrid"]
+    assert settings["r8_refill"] is cache_options.get("r8_refill", True)
+    assert settings["host_cache_gib"] == cache_options.get("host_cache_gib", 0)
     assert "gpu_cache_selections" not in args.additional_config["cpu_moe"]
 
 
@@ -3146,8 +3157,11 @@ def test_dsv41_expert_profile_rejects_invalid_paths_and_intervals(settings):
         apply_hybrid_defaults(args)
 
 
+@pytest.mark.parametrize("option", ["overlap_decode", "r8_refill"])
 @pytest.mark.parametrize("enabled", [False, True, "true", 1, None])
-def test_dsv41_overlap_decode_requires_explicit_boolean(monkeypatch, enabled):
+def test_dsv41_cache_execution_options_require_explicit_boolean(
+    monkeypatch, option, enabled
+):
     from vllm.engine.arg_utils import EngineArgs
     from vllm.models.deepseek_v4_1 import hybrid
 
@@ -3157,17 +3171,15 @@ def test_dsv41_overlap_decode_requires_explicit_boolean(monkeypatch, enabled):
         additional_config={
             "deepseek_v41_hybrid": {
                 "pipeline_layers": [7, 8, 25],
-                "overlap_decode": enabled,
+                option: enabled,
             }
         },
     )
     if type(enabled) is bool:
         hybrid.apply_hybrid_defaults(args)
-        assert (
-            args.additional_config["deepseek_v41_hybrid"]["overlap_decode"] is enabled
-        )
+        assert args.additional_config["deepseek_v41_hybrid"][option] is enabled
     else:
-        with pytest.raises(ValueError, match="overlap_decode must be a boolean"):
+        with pytest.raises(ValueError, match=f"{option} must be a boolean"):
             hybrid.apply_hybrid_defaults(args)
 
 

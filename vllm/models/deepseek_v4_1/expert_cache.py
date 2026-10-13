@@ -60,6 +60,7 @@ class GPUExpertCache:
         self.weight_shape: tuple[int, int] | None = None
         self.loaded: set[tuple[int, int]] = set()
         self.weight_source = weight_source
+        self.r8_refill = None
         self.packed: tuple[torch.Tensor, ...] | None = None
         self.selected = []
         self.enabled = True
@@ -151,6 +152,9 @@ class GPUExpertCache:
         return packed
 
     def _pack_source_expert(self, expert):
+        refill = getattr(self, "r8_refill", None)
+        if refill is not None:
+            return refill.pack(expert)
         weights = {
             p: self.weight_source(expert, p)
             if self.weight_source is not None

@@ -31,11 +31,14 @@ def apply_hybrid_defaults(args):
         "expert_profile",
         "expert_profile_interval",
         "overlap_decode",
+        "r8_refill",
     }
     if unknown:
         raise ValueError(f"Unknown DeepSeek hybrid options: {sorted(unknown)}")
     if type(settings.setdefault("overlap_decode", True)) is not bool:
         raise ValueError("overlap_decode must be a boolean")
+    if type(settings.setdefault("r8_refill", True)) is not bool:
+        raise ValueError("r8_refill must be a boolean")
     profile = settings.get("expert_profile")
     if (
         "expert_profile" in settings
@@ -89,7 +92,7 @@ def apply_hybrid_defaults(args):
         or any(type(n) is not int or n < 1 for n in threads)
     ):
         raise ValueError("cpu_threads must be positive or [prefill, decode]")
-    budget = settings.get("host_cache_gib", 12)
+    budget = settings.setdefault("host_cache_gib", 0)
     if type(budget) not in (int, float) or not 0 <= budget <= 64:
         raise ValueError("host_cache_gib must be between 0 and 64")
     if (

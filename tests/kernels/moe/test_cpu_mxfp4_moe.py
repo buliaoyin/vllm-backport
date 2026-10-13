@@ -543,8 +543,84 @@ def test_native_export_preserves_bytes_after_checkpoint_is_released(
                     backend.export_expert(expert, projection), expected
                 ):
                     assert torch.equal(actual, reference_bytes)
+        if backend.supports_r8_staging:
+            staged = torch.empty(
+                3 * hidden * intermediate * 17 // 32, dtype=torch.uint8
+            )
+            for expert in range(2):
+                staged.fill_(0xAA)
+                backend.stage_expert_r8(expert, staged)
+                expected_r8 = staged.clone()
+                staged.fill_(0x55)
+                backend.stage_expert_r8(expert, staged)
+                torch.testing.assert_close(staged, expected_r8, atol=0, rtol=0)
+            with pytest.raises(ValueError, match="unloaded"):
+                backend.stage_expert_r8(2, staged)
+            with pytest.raises(ValueError, match="byte buffer"):
+                backend.stage_expert_r8(0, staged[:-1])
         with pytest.raises(ValueError, match="unloaded"):
             backend.export_expert(2, 0)
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("cache_device", [0, 1])
+@pytest.mark.parametrize("hidden,intermediate", [(64, 64), (128, 192), (5120, 2304)])
+def test_r8_refill_preserves_marlin_bytes_across_shared_staging_streams(
+    backend_config, hidden, intermediate, cache_device
+):
+    """Two streams reusing a bounded pool must retain every expert's packed bytes."""
+    if (
+        backend_config.backend != "ik"
+        or not torch.cuda.is_available()
+        or torch.accelerator.device_count() <= cache_device
+    ):
+        pytest.skip("Native R8 refill requires IK and the requested CUDA device")
+    from vllm.models.deepseek_v4_1.expert_cache import GPUExpertCache
+    from vllm.models.deepseek_v4_1.r8_refill import R8Refill
+
+    backend = CPUMXFP4Experts(
+        backend_config, 4, hidden, intermediate, 2, swiglu_limit=10.0, max_tokens=4
+    )
+    try:
+        if not backend.supports_r8_staging:
+            pytest.skip("Build the native R8 staging interface")
+        generator = torch.Generator().manual_seed(93)
+        for expert in range(4):
+            for projection in range(3):
+                rows, cols = intermediate, hidden
+                if projection == 1:
+                    rows, cols = cols, rows
+                weight = torch.randint(
+                    256, (rows, cols // 2), dtype=torch.uint8, generator=generator
+                )
+                scale = torch.randint(
+                    256, (rows, cols // 32), dtype=torch.uint8, generator=generator
+                )
+                backend.load_expert(expert, projection, weight, scale)
+        cache = GPUExpertCache(
+            2, 4, cache_device, 10.0, 2, weight_source=backend.export_expert
+        )
+        origin = torch.accelerator.current_device_index()
+        refills = [R8Refill(backend, cache.device) for _ in range(2)]
+        assert refills[0].workspace is refills[1].workspace
+        assert torch.accelerator.current_device_index() == origin
+        streams = [cache.stream, torch.cuda.Stream(device=cache.device)]
+        results = []
+        for step in range(8):
+            with torch.cuda.stream(streams[step % 2]):
+                results.append(
+                    (
+                        refills[step % 2].pack(step % 4),
+                        cache._pack_source_expert(step % 4),
+                    )
+                )
+        torch.accelerator.synchronize(cache.device.index)
+        for actual, expected in results:
+            for a, b in zip(actual, expected):
+                torch.testing.assert_close(
+                    a.view(torch.uint8), b.view(torch.uint8), atol=0, rtol=0
+                )
     finally:
         backend.close()
 

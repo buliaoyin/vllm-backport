@@ -371,6 +371,47 @@ int dsv41_moe_supports_export() {
 #endif
 }
 
+int dsv41_moe_stage_r8(void* handle, int expert, void* output, size_t capacity,
+                       int threads) {
+  try {
+#ifdef DSV41_IK
+    if (!handle || !output || threads < 1)
+      throw std::invalid_argument("Invalid R8 staging destination");
+    const auto* moe = static_cast<const MoE*>(handle);
+    if (expert < 0 || expert >= moe->experts)
+      throw std::invalid_argument("Invalid R8 staging expert");
+    const size_t bytes = size_t(moe->hidden) * moe->intermediate * 17 / 32;
+    if (capacity != 3 * bytes)
+      throw std::invalid_argument("Invalid R8 staging capacity");
+    std::array<const uint8_t*, 3> sources;
+    for (int p = 0; p < 3; ++p) {
+      const auto* weight = moe->weights[p];
+      if (!moe->loaded[p * moe->experts + expert] ||
+          weight->type != GGML_TYPE_MXFP4_R8 || weight->nb[2] != bytes)
+        throw std::invalid_argument(
+            "Invalid or unloaded R8 staging projection");
+      sources[p] = static_cast<const uint8_t*>(weight->data) + expert * bytes;
+    }
+    constexpr size_t chunk = 256 * 1024;
+    const size_t chunks = (bytes + chunk - 1) / chunk;
+    const int team = std::min(threads, moe->num_threads);
+  #pragma omp parallel for num_threads(team) schedule(static)
+    for (size_t task = 0; task < 3 * chunks; ++task) {
+      const size_t part = task / chunks;
+      const size_t start = task % chunks * chunk;
+      std::memcpy(static_cast<uint8_t*>(output) + part * bytes + start,
+                  sources[part] + start, std::min(chunk, bytes - start));
+    }
+    return 0;
+#else
+    throw std::runtime_error("R8 staging requires the IK backend");
+#endif
+  } catch (const std::exception& e) {
+    last_error = e.what();
+    return -1;
+  }
+}
+
 int dsv41_moe_export(void* handle, int expert, int projection, uint8_t* packed,
                      uint8_t* scales) {
   try {
