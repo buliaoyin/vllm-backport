@@ -137,6 +137,20 @@ class GPUExpertCache:
             assert self.host_lru is not None
             return tuple(part[slot : slot + 1] for part in self.host_lru)
         self.dynamic_stats["repacked_experts"] += 1
+        packed = self._pack_source_expert(expert)
+        if self.feedback_enabled and self.host_lru is not None:
+            capacity = self.host_lru[0].shape[0]
+            if len(self.host_lru_slots) == capacity:
+                _, slot = self.host_lru_slots.popitem(last=False)
+            else:
+                slot = len(self.host_lru_slots)
+            for destination, source in zip(self.host_lru, packed):
+                destination[slot : slot + 1].copy_(source, non_blocking=True)
+            self.host_lru_slots[expert] = slot
+            self.dynamic_stats["lru_fills"] += 1
+        return packed
+
+    def _pack_source_expert(self, expert):
         weights = {
             p: self.weight_source(expert, p)
             if self.weight_source is not None
@@ -155,7 +169,7 @@ class GPUExpertCache:
             )
         ]
         w13, w2, s13, s2 = raw
-        packed = prepare_moe_mxfp4_layer_for_marlin(
+        return prepare_moe_mxfp4_layer_for_marlin(
             SimpleNamespace(params_dtype=torch.bfloat16),
             w13,
             w2,
@@ -165,17 +179,6 @@ class GPUExpertCache:
             None,
             inplace=True,
         )[:4]
-        if self.feedback_enabled and self.host_lru is not None:
-            capacity = self.host_lru[0].shape[0]
-            if len(self.host_lru_slots) == capacity:
-                _, slot = self.host_lru_slots.popitem(last=False)
-            else:
-                slot = len(self.host_lru_slots)
-            for destination, source in zip(self.host_lru, packed):
-                destination[slot : slot + 1].copy_(source, non_blocking=True)
-            self.host_lru_slots[expert] = slot
-            self.dynamic_stats["lru_fills"] += 1
-        return packed
 
     def set_feedback_enabled(self, enabled):
         self.feedback_enabled = enabled and self.decode_feedback is not None
@@ -503,7 +506,11 @@ class GPUExpertCache:
         intermediate, packed_hidden = self.weight_shape
         hidden = packed_hidden * 2
         options = {"device": self.device, "dtype": torch.bfloat16}
-        with torch.cuda.stream(self.stream), self._allocation_context():
+        with (
+            torch.inference_mode(False),
+            torch.cuda.stream(self.stream),
+            self._allocation_context(),
+        ):
             return (
                 torch.empty((tokens, hidden), **options),
                 torch.empty(

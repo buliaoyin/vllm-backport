@@ -768,7 +768,8 @@ def test_cpu_experts_skip_padding_and_replay_new_inputs(backend_config):
             x[1:].fill_(float("nan"))
             ids[1:].fill_(-1)
             routes[1:].fill_(float("nan"))
-            module(x, ids, routes)
+            with torch.inference_mode():
+                module(x, ids, routes)
             capture = BreakableCUDAGraphCapture()
             with capture:
                 output = module(x, ids, routes) * 2
@@ -853,7 +854,10 @@ def test_native_cpu_callback_replays_without_python_and_masks_padding(
         replace(backend_config, cuda_library_path=cuda_library), config
     )
     load_weights(module.backend)
-    module.finalize()
+    with torch.inference_mode():
+        module.finalize()
+    for buffer in module.async_host:
+        buffer.zero_()
     hidden = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
     ids = torch.tensor([[0, 1, 3]] * 128, device="cuda")
     routes = torch.full((128, 3), 0.5, device="cuda")
@@ -983,6 +987,8 @@ def test_gpu_cache_preserves_mixed_routes_across_prefill_and_graph_replay(
     )
     weights = load_weights(module.backend, module.gpu_cache)
     module.finalize()
+    with torch.inference_mode():
+        module.gpu_cache.device_io = module.gpu_cache._allocate_io(decode_tokens)
     module.gpu_cache.warmup()
     assert current_stream().device == origin
     shared_layer = torch.nn.Linear(

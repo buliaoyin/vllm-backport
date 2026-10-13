@@ -199,20 +199,25 @@ class CPUExpertModule(nn.Module):
                 self.gpu_cache.prepare_dynamic(self.backend.config.gpu_cache_dynamic)
         if self.backend.config.cuda_library_path and self.async_host is None:
             kwargs = {"device": "cpu", "pin_memory": True}
-            self.async_host = (
-                torch.empty(
-                    (self.async_tokens, self.hidden_size), dtype=torch.float32, **kwargs
-                ),
-                torch.empty(
-                    (self.async_tokens, self.top_k), dtype=torch.int32, **kwargs
-                ),
-                torch.empty(
-                    (self.async_tokens, self.top_k), dtype=torch.float32, **kwargs
-                ),
-                torch.empty(
-                    (self.async_tokens, self.hidden_size), dtype=torch.float32, **kwargs
-                ),
-            )
+            with torch.inference_mode(False):
+                self.async_host = (
+                    torch.empty(
+                        (self.async_tokens, self.hidden_size),
+                        dtype=torch.float32,
+                        **kwargs,
+                    ),
+                    torch.empty(
+                        (self.async_tokens, self.top_k), dtype=torch.int32, **kwargs
+                    ),
+                    torch.empty(
+                        (self.async_tokens, self.top_k), dtype=torch.float32, **kwargs
+                    ),
+                    torch.empty(
+                        (self.async_tokens, self.hidden_size),
+                        dtype=torch.float32,
+                        **kwargs,
+                    ),
+                )
 
     def take_cache_stats(self) -> ExpertCacheStats:
         """Collect deltas after the existing postprocess stream synchronization."""
@@ -302,16 +307,17 @@ class CPUExpertModule(nn.Module):
         if tokens > self.host_tokens:
             self.host_tokens = tokens
             kwargs = {"device": "cpu", "pin_memory": True}
-            self.host_hidden = torch.empty(
-                (tokens, self.hidden_size), dtype=torch.bfloat16, **kwargs
-            )
-            self.host_ids = torch.empty(
-                (tokens, self.top_k), dtype=torch.int64, **kwargs
-            )
-            self.host_routes = torch.empty(
-                (tokens, self.top_k), dtype=torch.float32, **kwargs
-            )
-            self.host_output = torch.empty_like(self.host_hidden, **kwargs)
+            with torch.inference_mode(False):
+                self.host_hidden = torch.empty(
+                    (tokens, self.hidden_size), dtype=torch.bfloat16, **kwargs
+                )
+                self.host_ids = torch.empty(
+                    (tokens, self.top_k), dtype=torch.int64, **kwargs
+                )
+                self.host_routes = torch.empty(
+                    (tokens, self.top_k), dtype=torch.float32, **kwargs
+                )
+                self.host_output = torch.empty_like(self.host_hidden, **kwargs)
         hidden_cpu = self.host_hidden[:tokens]
         ids_cpu = self.host_ids[:tokens]
         routes_cpu = self.host_routes[:tokens]
