@@ -19,6 +19,7 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 
 if TYPE_CHECKING:
+    from vllm.models.deepseek_v4_1.cache_capacity import SharedExpertPool
     from vllm.v1.worker.gpu.async_utils import AsyncOutput
 
 logger = init_logger(__name__)
@@ -63,6 +64,7 @@ class DeepseekV41ModelState(DefaultModelState):
     """
 
     hybrid_overlap_decode = False
+    hybrid_capacity_pools: tuple["SharedExpertPool", ...] = ()
 
     def __init__(
         self,
@@ -155,9 +157,13 @@ class DeepseekV41ModelState(DefaultModelState):
             request = input_batch.req_ids[0]
             if self.hybrid_active is None:
                 self.hybrid_active = request
+                for pool in self.hybrid_capacity_pools:
+                    pool.begin_request()
                 for module in self.cpu_async_modules:
                     if module.gpu_cache is not None:
                         module.gpu_cache.begin_request(self.hybrid_requests[request])
+                for pool in self.hybrid_capacity_pools:
+                    pool.refresh(0, self.hybrid_requests[request], history=True)
             for module in self.cpu_async_modules:
                 if module.gpu_cache is not None:
                     feedback = module.gpu_cache.decode_feedback
@@ -241,8 +247,6 @@ class DeepseekV41ModelState(DefaultModelState):
         module = self.cpu_async_modules[
             (self.hybrid_steps - 1) % len(self.cpu_async_modules)
         ]
-        if module.gpu_cache is None:
-            return
         remaining_steps = None
         if (
             self.hybrid_request_steps == self.hybrid_steps
@@ -255,9 +259,12 @@ class DeepseekV41ModelState(DefaultModelState):
                 remaining_steps = (
                     max(0, limit - 1 - self.hybrid_generated) / outputs_per_step
                 )
-        module.gpu_cache.refresh_decode(
-            self.hybrid_steps, remaining_steps=remaining_steps
-        )
+        if module.gpu_cache is not None:
+            module.gpu_cache.refresh_decode(
+                self.hybrid_steps, remaining_steps=remaining_steps
+            )
+        for pool in self.hybrid_capacity_pools:
+            pool.refresh(self.hybrid_steps, remaining_steps)
 
     def reset_expert_cache_stats(self) -> None:
         self._expert_cache_stats_enabled = any(

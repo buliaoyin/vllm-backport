@@ -250,6 +250,7 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
+    expert_sort_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -320,9 +321,13 @@ def fused_marlin_moe(
         topk_ids,
         block_size_m,
         global_num_experts,
-        expert_map,
+        expert_sort_map if expert_sort_map is not None else expert_map,
         ignore_invalid_experts=True,
     )
+    if expert_sort_map is not None:
+        assert expert_map is not None
+        # Sort in logical expert space before translating to shared physical slots.
+        expert_ids = expert_map[expert_ids]
 
     assert activation is not None
     moe_output = _fused_marlin_moe(

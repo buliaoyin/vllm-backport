@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""A fixed-capacity GPU expert cache with stable addresses across graph replays."""
+"""A GPU expert cache with stable addresses across graph replays."""
 
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
 import torch
@@ -23,6 +24,9 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
 from vllm.scalar_type import scalar_types
 
 from .cache_policy import TailCachePolicy
+
+if TYPE_CHECKING:
+    from .cache_capacity import SharedExpertPool
 
 
 class DynamicCacheStats(TypedDict):
@@ -50,6 +54,11 @@ class DynamicCacheStats(TypedDict):
 
 
 class GPUExpertCache:
+    capacity_pool: "SharedExpertPool | None" = None
+    slot_ids: list[int] | None = None
+    sort_map: torch.Tensor | None = None
+    cpu_stats: Callable[[], dict[str, Any] | None] | None = None
+
     def __init__(self, capacity, num_experts, device, limit, top_k, weight_source=None):
         self.capacity = capacity
         self.num_experts = num_experts
@@ -197,6 +206,7 @@ class GPUExpertCache:
             "requests": self.feedback_requests,
             "mass": self.feedback_mass,
             "decode_snapshot": self._decode_snapshot.tolist(),
+            "decode_policy_snapshot": self._decode_policy_snapshot.tolist(),
             "decode_totals": [
                 self._decode_hits,
                 self._decode_routes,
@@ -213,6 +223,9 @@ class GPUExpertCache:
         self._reset_decode_accounting()
         if (snapshot := state.get("decode_snapshot")) is not None:
             self._decode_snapshot = np.asarray(snapshot, dtype=np.int64)
+        self._decode_policy_snapshot = np.array(
+            state.get("decode_policy_snapshot", self._decode_snapshot), dtype=np.int64
+        )
         self._decode_hits, self._decode_routes, self._decode_steps = state.get(
             "decode_totals", (0, 0, 0)
         )
@@ -230,6 +243,8 @@ class GPUExpertCache:
                 self.decode_feedback.counts.copy_(torch.tensor(pending))
 
     def select(self, experts, *, preserve_slots=True):
+        if self.capacity_pool is not None:
+            return self.capacity_pool.select(self, experts, preserve_slots)
         selected = set(experts)
         if len(experts) != self.capacity or len(selected) != self.capacity:
             raise ValueError("GPU expert cache selection must fill every slot once")
@@ -280,12 +295,16 @@ class GPUExpertCache:
         self.enabled = enabled
         mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device="cpu")
         if enabled:
-            mapping[self.selected] = torch.arange(
-                len(self.selected), dtype=torch.int32, device="cpu"
+            slots = (
+                range(len(self.selected)) if self.slot_ids is None else self.slot_ids
             )
+            mapping[self.selected] = torch.tensor(list(slots), dtype=torch.int32)
         with torch.cuda.stream(self.stream):
             self.expert_map.copy_(mapping)
             self.membership.copy_(mapping >= 0)
+            if self.sort_map is not None:
+                logical = torch.arange(self.num_experts, dtype=torch.int32)
+                self.sort_map.copy_(logical.masked_fill(mapping < 0, -1))
         self.stream.synchronize()
 
     def select_static(self, experts):
@@ -324,6 +343,8 @@ class GPUExpertCache:
                     if not policy.prepack_resident:
                         continue
                     slot = self.selected.index(expert)
+                    if self.slot_ids is not None:
+                        slot = self.slot_ids[slot]
                     packed = tuple(part[slot : slot + 1] for part in self.packed)
                 else:
                     packed = self._pack_expert(expert)
@@ -360,6 +381,7 @@ class GPUExpertCache:
 
     def _reset_decode_accounting(self):
         self._decode_snapshot = np.zeros(2 * self.num_experts + 2, dtype=np.int64)
+        self._decode_policy_snapshot = np.zeros_like(self._decode_snapshot)
         self._decode_hits = self._decode_routes = self._decode_steps = 0
         self._last_decode_check = 0
 
@@ -369,17 +391,17 @@ class GPUExpertCache:
         self._decode_routes += int(delta[: self.num_experts].sum())
         self._decode_steps += int(delta[-2])
         self._decode_snapshot = np.zeros_like(snapshot) if consumed else snapshot
+        if consumed:
+            self._decode_policy_snapshot = np.zeros_like(snapshot)
         return delta
 
     def _transfer_costs(self, policy):
-        return np.array(
-            [
-                policy.transfer_ms
-                if e in self.host_packed or e in self.host_lru_slots
-                else policy.repack_transfer_ms
-                for e in range(self.num_experts)
-            ]
-        )
+        costs = np.full(self.num_experts, policy.repack_transfer_ms, dtype=np.float64)
+        for expert in self.host_packed:
+            costs[expert] = policy.transfer_ms
+        for expert in self.host_lru_slots:
+            costs[expert] = policy.transfer_ms
+        return costs
 
     def refresh_decode(self, step, *, remaining_steps=None):
         """Update one layer outside graph replay after its routes have completed."""
@@ -397,7 +419,12 @@ class GPUExpertCache:
             raise RuntimeError("Decode expert admission must run outside graph capture")
         self._last_decode_check = step
         start = time.perf_counter()
-        delta = self._track_decode_snapshot(self.decode_feedback.snapshot())
+        snapshot = self.decode_feedback.snapshot()
+        delta = self._track_decode_snapshot(snapshot)
+        if self.capacity_pool is not None:
+            # Capacity moves account for hits without shortening the demand window.
+            delta = snapshot - self._decode_policy_snapshot
+            self._decode_policy_snapshot = snapshot
         steps = int(delta[-2])
         if not steps:
             return
@@ -458,6 +485,8 @@ class GPUExpertCache:
             assert self.decode_feedback is not None
             snapshot = self.decode_feedback.consume()
             self._track_decode_snapshot(snapshot, consumed=True)
+            if self.capacity_pool is not None:
+                self.capacity_pool.snapshots.pop(self, None)
             steps, tokens = snapshot[-2:]
             self.dynamic_stats["feedback_steps"] = int(steps)
             self.dynamic_stats["feedback_tokens"] = int(tokens)
@@ -597,6 +626,7 @@ class GPUExpertCache:
                 scalar_types.float4_e2m1f.id,
                 global_num_experts=self.num_experts,
                 expert_map=self.expert_map,
+                expert_sort_map=self.sort_map,
                 workspace=self.workspace,
                 intermediate_cache13=io[4],
                 intermediate_cache2=io[5],

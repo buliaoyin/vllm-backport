@@ -3122,6 +3122,66 @@ def test_dsv41_hybrid_defaults_keep_hardware_options_explicit(
     assert "gpu_cache_selections" not in args.additional_config["cpu_moe"]
 
 
+@pytest.mark.parametrize("value", [False, True, {"interval": 64, "max_swaps": 4}])
+def test_dsv41_adaptive_capacity_is_opt_in_and_keeps_speculation_disabled(
+    monkeypatch, value
+):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1 import hybrid
+
+    monkeypatch.setattr(hybrid, "native_libraries", lambda: [Path("ik"), Path("cuda")])
+    args = EngineArgs(
+        pipeline_parallel_size=3,
+        additional_config={
+            "deepseek_v41_hybrid": {
+                "pipeline_layers": [7, 7, 26],
+                "adaptive_cache": value,
+            }
+        },
+    )
+    hybrid.apply_hybrid_defaults(args)
+    hybrid.apply_hybrid_defaults(args)
+    settings = args.additional_config["deepseek_v41_hybrid"]
+    assert args.speculative_config is None
+    if value is False:
+        assert "adaptive_cache" not in settings
+    else:
+        assert settings["adaptive_cache"]["interval"] == (
+            64 if value is not True else 128
+        )
+        assert settings["adaptive_cache"]["capacity_only"] is True
+    assert "gpu_cache_selections" not in args.additional_config["cpu_moe"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        1,
+        "true",
+        {"interval": 0},
+        {"decay": 1},
+        {"unknown": 2},
+        {"history": 1},
+        {"online": "false"},
+        {"horizon": 0},
+        {"horizon": True},
+        {"safety_factor": 0},
+        {"safety_factor": True},
+        {"safety_factor": float("nan")},
+    ],
+)
+def test_dsv41_adaptive_capacity_rejects_invalid_policy(value):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1.hybrid import apply_hybrid_defaults
+
+    args = EngineArgs(
+        additional_config={"deepseek_v41_hybrid": {"adaptive_cache": value}}
+    )
+    with pytest.raises(ValueError, match="adaptive"):
+        apply_hybrid_defaults(args)
+
+
 @pytest.mark.parametrize(
     "settings",
     [{"expert_profile_interval": 8}, {"expert_profile": False}],

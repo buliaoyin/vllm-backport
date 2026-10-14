@@ -360,6 +360,16 @@ def initialize_hybrid_cache(worker):
         plan = plan_expert_cache(
             capacities, len(modules), hf.n_routed_experts, group.rank_in_group
         )
+        pools = {}
+        if "adaptive_cache" in settings:
+            from .cache_capacity import CapacityPolicy, SharedExpertPool
+
+            policy = CapacityPolicy(**settings["adaptive_cache"])
+            for device in range(group.world_size):
+                capacity = sum(count for d, count in plan if d == device)
+                if capacity:
+                    pools[device] = SharedExpertPool(capacity, policy)
+            runner.model_state.hybrid_capacity_pools = tuple(pools.values())
         host_budget = int(settings.get("host_cache_gib", 0) * GiB)
         lru_slots = min(32, host_budget // max(1, len(modules) * expert_bytes))
         enabled = config.speculative_config is not None
@@ -410,6 +420,9 @@ def initialize_hybrid_cache(worker):
             if entry is not None:
                 assert profile is not None
                 selected = profile.selection(entry, count)
+            if device in pools:
+                pools[device].register(cache, layer, selected)
+                cache.cpu_stats = module.backend.cuda_stats
             # Packing alternates native export with small Torch CPU copies.
             # Keep those copies serial instead of repeatedly resizing the team.
             with set_default_torch_num_threads(1):
@@ -453,6 +466,13 @@ def initialize_hybrid_cache(worker):
                 count,
                 count * expert_bytes,
                 lru_slots,
+            )
+        for device, pool in pools.items():
+            logger.info(
+                "Adaptive expert capacity: device=%d slots=%d layers=%s",
+                device,
+                pool.capacity,
+                [cache.layer_idx for cache in pool.caches],
             )
         cached_experts = sum(count for _, count in plan)
         if learned:

@@ -476,8 +476,8 @@ def backend_config(request):
     return CPUMoEConfig(backend=name, num_threads=4, library_path=path)
 
 
-def load_weights(backend, gpu_cache=None):
-    generator = torch.Generator(device="cpu").manual_seed(13)
+def load_weights(backend, gpu_cache=None, *, seed=13):
+    generator = torch.Generator(device="cpu").manual_seed(seed)
     values = torch.tensor(
         [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
         dtype=torch.float32,
@@ -1581,6 +1581,164 @@ def test_decode_cache_policy_uses_observed_groups_and_bounded_transfer_budget():
     ]
 
 
+def test_adaptive_capacity_preserves_floor_pins_and_transfer_budget():
+    import numpy as np
+
+    from vllm.models.deepseek_v4_1.cache_capacity import CapacityPolicy
+    from vllm.models.deepseek_v4_1.cache_policy import TailCachePolicy
+    from vllm.models.deepseek_v4_1.expert_cache import GPUExpertCache
+
+    donor, target = (object.__new__(GPUExpertCache) for _ in range(2))
+    for cache, selected in ((donor, [0, 1, 2]), (target, [0, 1])):
+        cache.num_experts, cache.selected = 5, selected
+        cache.dynamic_policy = TailCachePolicy(
+            tuple(selected), cpu_call_ms=1, decode_budget_ms=8
+        )
+        cache.host_packed, cache.host_lru_slots = {}, {}
+    caches = [donor, target]
+    scores = {
+        donor: np.array([0.8, 0.01, 0.03, 0, 0]),
+        target: np.array([0.6, 0.7, 0.9, 0.8, 0.65]),
+    }
+    protected = {donor: {0}, target: set()}
+    policy = CapacityPolicy(min_experts=1)
+    diagnostics: dict[str, int] = {}
+    plan = policy.plan(caches, scores, 128, protected, diagnostics=diagnostics)
+    assert [move[:4] for move in plan] == [(donor, 1, target, 2)]
+    assert diagnostics["accepted"] == 1
+    assert diagnostics["transfer_budget"] == 2
+    assert diagnostics["candidates"] == 3
+    assert donor.selected == [0, 1, 2]  # Planning cannot change live graph maps.
+    diagnostics = {}
+    assert policy.plan(caches, scores, 1, protected, diagnostics=diagnostics) == []
+    assert diagnostics == {"candidates": 3, "gross_payback": 3}
+    target.dynamic_policy = replace(target.dynamic_policy, decode_budget_ms=20)
+    plan = policy.plan(caches, scores, 128, protected)
+    assert [move[:4] for move in plan] == [(donor, 1, target, 2), (donor, 2, target, 3)]
+    assert (
+        policy.plan(caches, scores, 128, protected, cpu_costs={donor: 100, target: 1})
+        == []
+    )
+    assert replace(policy, resize=False).plan(caches, scores, 128, protected) == []
+
+
+@pytest.mark.parametrize("cache_device", [0, 1])
+def test_adaptive_capacity_moves_shared_slots_without_recapturing_mixed_decode(
+    backend_config, cache_device
+):
+    """Physical slots beyond a layer's expert IDs remain valid after a transfer."""
+    bridge = os.environ.get("DSV41_TEST_CUDA_LIBRARY")
+    if backend_config.backend != "ik" or not bridge:
+        pytest.skip("Requires the IK CUDA callback bridge")
+    if torch.accelerator.device_count() <= cache_device:
+        pytest.skip("Requires the requested cache GPU")
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.deepseek_v4_1.cache_capacity import (
+        CapacityPolicy,
+        SharedExpertPool,
+    )
+    from vllm.models.deepseek_v4_1.cpu_moe import CPUExpertModule
+
+    torch.accelerator.set_device_index(0)
+    torch.cuda.set_stream(torch.cuda.current_stream(0))
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                n_routed_experts=8,
+                hidden_size=128,
+                moe_intermediate_size=128,
+                num_experts_per_tok=3,
+                swiglu_limit=0.125,
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=16),
+    )
+    pool = SharedExpertPool(12, CapacityPolicy(min_experts=1))
+    modules, weights = [], []
+    graph = None
+    try:
+        for layer in range(2):
+            module = CPUExpertModule(
+                replace(
+                    backend_config,
+                    cuda_library_path=bridge,
+                    gpu_cache_experts=6,
+                    gpu_cache_prefill=True,
+                    gpu_cache_device=cache_device,
+                    gpu_cache_static_experts=tuple(range(6)),
+                    gpu_cache_dynamic={
+                        "mutable_experts": tuple(range(6)),
+                        "feedback_weight": 0.9,
+                        "host_cache_bytes": 0,
+                        "prepack_resident": False,
+                    },
+                ),
+                config,
+            )
+            modules.append(module)
+            pool.register(module.gpu_cache, 20 + layer, list(range(6)))
+            weights.append(
+                load_weights(module.backend, module.gpu_cache, seed=13 + layer)
+            )
+            module.finalize()
+            module.gpu_cache.warmup()
+        caches = [module.gpu_cache for module in modules]
+        assert max(caches[1].slot_ids) >= caches[1].num_experts
+        addresses = [part.data_ptr() for part in pool.packed]
+        map_addresses = [cache.expert_map.data_ptr() for cache in caches]
+        hidden = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+        ids = torch.tensor([[5, 6, 7]] * 8, device="cuda")
+        routes = torch.full((8, 3), 0.7, device="cuda")
+        context = ForwardContext({}, {}, {})
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with override_forward_context(context):
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    for module in modules:
+                        module(hidden, ids, routes)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = [module(hidden, ids, routes) for module in modules]
+            for phase in range(4):
+                if phase == 1:
+                    pool.move(caches[0], 5, caches[1], 6)
+                    assert [cache.capacity for cache in caches] == [5, 7]
+                elif phase == 2:
+                    caches[1].select([1, 2, 3, 4, 5, 6, 7])
+                elif phase == 3:
+                    pool.restore_initial()
+                    assert [cache.capacity for cache in caches] == [6, 6]
+                graph.replay()
+                torch.accelerator.synchronize(0)
+                torch.accelerator.synchronize(cache_device)
+                for i, module in enumerate(modules):
+                    module.backend.check_cuda_errors()
+                    expected = reference(
+                        hidden.cpu(), ids.cpu(), routes.cpu(), weights[i], 0.125
+                    )
+                    error = (outputs[i].float().cpu() - expected).norm()
+                    assert error / expected.norm() < 0.035
+                    assert (
+                        module.gpu_cache.membership.sum().item()
+                        == module.gpu_cache.capacity
+                    )
+                assert sum(cache.capacity for cache in caches) == pool.capacity
+                assert [part.data_ptr() for part in pool.packed] == addresses
+                assert [
+                    cache.expert_map.data_ptr() for cache in caches
+                ] == map_addresses
+                assert all(cache.packed is pool.packed for cache in caches)
+    finally:
+        torch.accelerator.synchronize(0)
+        torch.accelerator.synchronize(cache_device)
+        del graph
+        for module in modules:
+            module.backend.close()
+
+
 @pytest.fixture
 def decode_refresh_cache(monkeypatch):
     from collections import OrderedDict
@@ -1634,6 +1792,83 @@ def decode_refresh_cache(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     cache.begin_request(1000)
     return cache
+
+
+@pytest.mark.parametrize("history", [False, True])
+def test_adaptive_capacity_counts_hits_before_and_after_layer_transfer(
+    decode_refresh_cache, monkeypatch, history
+):
+    import copy
+
+    from vllm.models.deepseek_v4_1.cache_capacity import (
+        CapacityPolicy,
+        SharedExpertPool,
+    )
+    from vllm.models.deepseek_v4_1.cache_feedback import DecodeRouteFeedback
+
+    donor = decode_refresh_cache
+    target = copy.copy(donor)
+    target.decode_feedback = DecodeRouteFeedback(4, target.origin)
+    target.dynamic_stats = dict(donor.dynamic_stats)
+    target.expert_map = donor.expert_map.clone()
+    target.membership = donor.membership.clone()
+    pool = SharedExpertPool(
+        4,
+        CapacityPolicy(interval=4, min_experts=1, history=history, online=not history),
+    )
+    monkeypatch.setattr(pool, "_wait", lambda cache: None)
+    for i, cache in enumerate((donor, target)):
+        pool.register(cache, 20 + i, [0, 1])
+        cache.selected = []
+        cache.packed = None
+        pool.select(cache, [0, 1])
+        cache.begin_request(100)
+    pool.begin_request()
+    donor_window = torch.tensor([4, 0, 0, 0, 4, 0, 0, 0, 4, 4])
+    target_window = torch.tensor([4, 4, 4, 0, 4, 4, 4, 0, 4, 4])
+    donor.decode_feedback.counts.add_(donor_window)
+    target.decode_feedback.counts.add_(target_window)
+    for cache, window in ((donor, donor_window), (target, target_window)):
+        cache.feedback_history = window[4:8].numpy() / 4
+    pool.refresh(4, 96, history=not history)
+    assert pool.stats["checks"] == 0
+    pool.refresh(3, 96)
+    assert pool.stats["swaps"] == 0
+    pool.refresh(4, 96, history=history)
+    phase = "history" if history else "decode"
+    assert pool.stats[f"{phase}_swaps"] == 1
+    assert pool.stats[f"{phase}_decisions"]["accepted"] == 1
+    assert donor.selected == [0]
+    assert target.selected == [0, 1, 2]
+    assert pool.stats["cross_layer_swaps"] == 1
+    donor.decode_feedback.counts.add_(donor_window)
+    target.decode_feedback.counts.add_(target_window)
+    assert donor.finish_request() == (8, 8, 8)
+    assert target.finish_request() == (20, 24, 8)
+    pool.restore_initial()
+    assert [donor.capacity, target.capacity] == [2, 2]
+    assert donor.selected == target.selected == [0, 1]
+    assert pool.stats["swaps"] == 0
+
+
+def test_capacity_hit_accounting_does_not_shorten_local_admission_window(
+    decode_refresh_cache,
+):
+    from unittest.mock import Mock
+
+    cache = decode_refresh_cache
+    pool = Mock()
+    cache.capacity_pool = pool
+    window = torch.tensor([2, 0, 2, 0, 2, 0, 2, 0, 2, 2])
+    cache.decode_feedback.counts.add_(window)
+    cache._track_decode_snapshot(cache.decode_feedback.snapshot())
+    cache.decode_feedback.counts.add_(window)
+    cache.refresh_decode(4)
+    pool.select.assert_called_once_with(cache, [0, 2], True)
+    saved = cache.learning_state()
+    cache.restore_learning_state(saved)
+    assert cache.learning_state() == saved
+    assert cache.finish_request() == (4, 8, 4)
 
 
 def test_decode_refresh_follows_changing_hot_experts_with_stable_cache_storage(
@@ -1692,6 +1927,7 @@ def test_decode_refresh_visits_one_layer_per_step_and_limits_nearly_finished_req
     state.cpu_async_modules = [SimpleNamespace(gpu_cache=Mock()) for _ in range(20)]
     state.hybrid_active = "request"
     state.hybrid_requests = {"request": 1000}
+    state.hybrid_capacity_pools = (Mock(),)
     for step in range(1, 81):
         state.hybrid_steps = state.hybrid_request_steps = step
         state.hybrid_generated = step * 3
@@ -1708,6 +1944,10 @@ def test_decode_refresh_visits_one_layer_per_step_and_limits_nearly_finished_req
     assert state.cpu_async_modules[-1].gpu_cache.refresh_decode.call_args.kwargs == {
         "remaining_steps": pytest.approx(1 / 3)
     }
+    state.hybrid_capacity_pools[0].refresh.assert_called_with(80, pytest.approx(1 / 3))
+    state.cpu_async_modules[-1].gpu_cache = None
+    state._refresh_decode_cache()
+    assert state.hybrid_capacity_pools[0].refresh.call_count == 82
 
 
 @pytest.fixture

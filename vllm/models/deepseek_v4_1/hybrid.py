@@ -32,6 +32,7 @@ def apply_hybrid_defaults(args):
         "expert_profile_interval",
         "overlap_decode",
         "r8_refill",
+        "adaptive_cache",
     }
     if unknown:
         raise ValueError(f"Unknown DeepSeek hybrid options: {sorted(unknown)}")
@@ -39,6 +40,14 @@ def apply_hybrid_defaults(args):
         raise ValueError("overlap_decode must be a boolean")
     if type(settings.setdefault("r8_refill", True)) is not bool:
         raise ValueError("r8_refill must be a boolean")
+    if "adaptive_cache" in settings:
+        from .cache_capacity import capacity_settings
+
+        adaptive = capacity_settings(settings["adaptive_cache"])
+        if adaptive is None:
+            settings.pop("adaptive_cache")
+        else:
+            settings["adaptive_cache"] = adaptive
     profile = settings.get("expert_profile")
     if (
         "expert_profile" in settings

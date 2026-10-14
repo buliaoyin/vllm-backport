@@ -270,12 +270,25 @@ class HybridBenchmarkWorker(HybridValidationWorker):
                 "reloaded_experts": module.gpu_cache.reloaded_experts,
                 "reload_seconds": module.gpu_cache.reload_seconds,
                 "resident_bytes": sum(
-                    t.numel() * t.element_size() for t in module.gpu_cache.packed
+                    t[0].numel() * t.element_size() * module.gpu_cache.capacity
+                    for t in module.gpu_cache.packed
                 ),
             }
             for name, module in self.model_runner.model.named_modules()
             if isinstance(module, CPUExpertModule) and module.gpu_cache is not None
         }
+
+    def dsv41_capacity_stats(self):
+        pools = getattr(self.model_runner.model_state, "hybrid_capacity_pools", ())
+        return [
+            {
+                "device": str(pool.caches[0].device),
+                "capacity": pool.capacity,
+                "layers": {cache.layer_idx: cache.capacity for cache in pool.caches},
+                "stats": pool.stats,
+            }
+            for pool in pools
+        ]
 
     def dsv41_cache_policy(self, policy, reference=None):
         import torch
