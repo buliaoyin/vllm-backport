@@ -56,7 +56,10 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadataBuilder,
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadataBuilder,
+    get_max_prefill_buffer_size,
+)
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
     split_prefill_chunks,
@@ -1431,6 +1434,26 @@ def test_split_indexer_prefill_chunks(
         max_logits_bytes,
     )
     assert out == expected
+
+
+@pytest.mark.parametrize("requests", [1, 4, 8, 40, 64])
+def test_indexer_workspace_covers_long_requests_without_unused_concurrency(requests):
+    """The gather bound must cover every emitted chunk at the context limit."""
+    length = 131328
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=length),
+        scheduler_config=SimpleNamespace(max_num_seqs=requests),
+    )
+    capacity = get_max_prefill_buffer_size(config)
+    assert capacity == length * min(requests, 40)
+    chunks = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
+        torch.full((requests,), length),
+        torch.full((requests,), 8192),
+        capacity,
+        512 * 1024**2,
+    )
+    assert sum(q.stop - q.start for _, q in chunks) == requests * 8192
+    assert all((r.stop - r.start) * length <= capacity for r, _ in chunks)
 
 
 def test_split_indexer_prefill_chunks_single_request_overflow():

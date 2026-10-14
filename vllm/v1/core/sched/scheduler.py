@@ -765,6 +765,14 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if request.spec_token_ids and request.num_computed_tokens >= (
+                request.num_tokens + request.num_output_placeholders
+            ):
+                # A PP stage can deliver drafts before the corresponding sampled
+                # target token. Wait until there is a target token to verify.
+                req_index += 1
+                continue
+
             if (
                 self.ec_connector is not None
                 and request.mm_features
@@ -938,6 +946,10 @@ class Scheduler(SchedulerInterface):
                     + request.num_computed_tokens
                     - request.num_tokens
                     - request.num_output_placeholders
+                )
+                num_scheduled_spec_tokens = min(
+                    num_scheduled_spec_tokens,
+                    num_new_tokens - self.num_sampled_tokens_per_step,
                 )
                 if num_scheduled_spec_tokens > 0:
                     spec_token_ids = request.spec_token_ids

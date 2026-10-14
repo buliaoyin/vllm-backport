@@ -1384,6 +1384,27 @@ def test_reset_connector_cache_no_connector_is_no_op_success():
     assert scheduler.reset_prefix_cache(reset_connector=True) is True
 
 
+def test_spec_decode_waits_for_sampled_token_before_verifying_draft():
+    scheduler = create_scheduler(num_speculative_tokens=1)
+    request = create_requests(num_requests=1, num_tokens=2)[0]
+    request.num_computed_tokens = request.num_tokens
+    request.spec_token_ids = [10]
+    request.status = RequestStatus.RUNNING
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    pending = scheduler.schedule()
+
+    assert not pending.num_scheduled_tokens
+    assert request.spec_token_ids == [10]
+
+    request.append_output_token_ids(42)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 2
+    assert output.scheduled_spec_decode_tokens[request.request_id] == [10]
+
+
 def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     (tmp_path / "config.json").write_text(
@@ -3591,6 +3612,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.grammar_compile_error_reqs = set()
     scheduler.vllm_config = Mock()
     scheduler.vllm_config.model_config.enable_return_routed_experts = False
+    scheduler.adaptive_draft_budget = None
     scheduler.enable_return_routed_experts = False
     scheduler.return_sampling_mask = False
     scheduler.recompute_kv_load_failures = False

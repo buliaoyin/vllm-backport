@@ -834,7 +834,8 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    return max_model_len * min(40, max_num_seqs)
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:

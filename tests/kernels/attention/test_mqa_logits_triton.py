@@ -375,6 +375,59 @@ def test_fp8_paged_mqa_logits_triton_matches_torch(
         )
 
 
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+@pytest.mark.parametrize("strided", [False, True])
+def test_fp8_paged_mqa_logits_triton_uses_per_query_context_lengths(
+    compress_ratio, strided
+):
+    """Two-token verification must see each query's causal KV prefix."""
+    torch.manual_seed(0)
+    device = "cuda"
+    block_size = 64
+    head_dim = 128
+    num_heads = 16
+    context_lens = torch.tensor(
+        [[2304, 2305], [2432, 2433]], dtype=torch.int32, device=device
+    )
+    context_lens //= compress_ratio
+    if strided:
+        storage = torch.zeros((2, 4), dtype=torch.int32, device=device)
+        storage[:, ::2] = context_lens
+        context_lens = storage[:, ::2]
+    max_model_len = int(context_lens.max().item())
+    total_blocks = cdiv(max_model_len, block_size)
+    kv_bf16 = torch.randn(
+        total_blocks, block_size, head_dim, dtype=torch.bfloat16, device=device
+    )
+    kv_packed = _pack_paged_kv(kv_bf16)
+    q_fp8 = torch.randn(
+        2, 2, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    ).to(torch.float8_e4m3fn)
+    weights = torch.rand(4, num_heads, dtype=torch.float32, device=device)
+    block_tables = torch.arange(total_blocks, dtype=torch.int32, device=device).repeat(
+        2, 1
+    )
+
+    actual = fp8_paged_mqa_logits_triton(
+        q_fp8,
+        kv_packed,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+    )
+    expected = _fp8_paged_mqa_logits_ref(
+        q_fp8.reshape(4, 1, num_heads, head_dim),
+        kv_packed,
+        weights,
+        context_lens.reshape(-1),
+        block_tables.repeat_interleave(2, dim=0),
+        max_model_len,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=_ATOL, rtol=_RTOL)
+
+
 @pytest.mark.parametrize("device_id", [0, 3])
 def test_paged_logits_context_growth_reuses_loaded_kernel(device_id, monkeypatch):
     """Active context lengths must not load modules behind pending PP work."""

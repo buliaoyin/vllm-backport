@@ -149,6 +149,8 @@ def _fp8_paged_mqa_logits_kernel(
     weights_ptr,
     fp8_lut_ptr,
     context_lens_ptr,
+    stride_context_lens_b,
+    stride_context_lens_q,
     block_tables_ptr,
     logits_ptr,
     stride_q_b,
@@ -174,6 +176,7 @@ def _fp8_paged_mqa_logits_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     Q_IS_BF16: tl.constexpr,
+    HAS_PER_QUERY_CONTEXT: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     block_rk = tl.program_id(1)
@@ -181,11 +184,15 @@ def _fp8_paged_mqa_logits_kernel(
     batch_id = token_id // next_n
     next_n_id = token_id % next_n
 
-    context_len = tl.load(context_lens_ptr + batch_id)
+    context_base = context_lens_ptr + batch_id * stride_context_lens_b
+    context_len = tl.load(context_base + (next_n - 1) * stride_context_lens_q)
     if block_rk * block_size >= context_len:
         return
 
-    q_offset = context_len - next_n + next_n_id
+    if HAS_PER_QUERY_CONTEXT:
+        q_offset = tl.load(context_base + next_n_id * stride_context_lens_q) - 1
+    else:
+        q_offset = context_len - next_n + next_n_id
 
     # int64: unified-KV-pool layer views carry a large block stride (~1e6
     # elements), so int32 `block_idx * stride` wraps once a batch touches
@@ -268,7 +275,7 @@ def fp8_paged_mqa_logits_triton(
         q:             [B, next_n, H, D] fp8_e4m3fn
         kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
         weights:       [B*next_n, H] float32
-        context_lens:  [B] int32
+        context_lens:  [B] or [B, next_n] int32
         block_tables:  [B, max_blocks] int32
         max_model_len: output width. Caller passes the active batch max so
             the logits buffer and grid stay tight.
@@ -278,6 +285,10 @@ def fp8_paged_mqa_logits_triton(
         logits:        [B*next_n, max_model_len] float32
     """
     B, next_n, num_heads, head_dim = q.shape
+    assert context_lens.ndim in (1, 2)
+    assert context_lens.shape[0] == B
+    if context_lens.ndim == 2:
+        assert context_lens.shape[1] == next_n
     _, block_size, one, d_plus_4 = kv_cache.shape
     assert one == 1
     assert d_plus_4 == head_dim + 4
@@ -337,6 +348,8 @@ def fp8_paged_mqa_logits_triton(
         weights,
         fp8_lut,
         context_lens,
+        context_lens.stride(0),
+        context_lens.stride(1) if context_lens.ndim == 2 else 0,
         block_tables,
         logits,
         q_in.stride(0),
@@ -362,6 +375,7 @@ def fp8_paged_mqa_logits_triton(
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
         Q_IS_BF16=q_is_bf16,
+        HAS_PER_QUERY_CONTEXT=context_lens.ndim == 2,
     )
     return logits
 
