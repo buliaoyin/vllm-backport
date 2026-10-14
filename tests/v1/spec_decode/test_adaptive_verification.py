@@ -934,6 +934,45 @@ def test_low_acceptance_batch_does_not_explore_every_long_budget(num_reqs, mixed
     assert selected[-3:] == [1, 1, 1]
 
 
+@pytest.mark.parametrize("feedback_delay", [0, 2])
+@pytest.mark.parametrize("recover", [False, True])
+def test_confidence_budget_refreshes_censored_suffix_with_bounded_trials(
+    feedback_delay, recover
+):
+    """A five-query block must not permanently hide recovery of drafts 6 and 7."""
+    budget = ConfidenceDraftBudget(7)
+    pending: deque[tuple[int, float, int, list[float]]] = deque()
+    previous, now = 3, 0.0
+    choices = []
+    for step in range(1536):
+        accepted = 7 if step < 64 or (recover and step >= 256) else 5
+        k = budget.choose(["request"], 32000, False)
+        choices.append(k)
+        budget.scheduled(
+            step, now, 32000, False, {"request": previous}, proposal_drafts=k
+        )
+        now += 0.02 + 0.002 * k
+        # Short DSpark queries predict at most one already-computed next position.
+        known = min(k + 1, max(5, k), 7)
+        confidence = [0.99 if i < accepted else 0.01 for i in range(known)]
+        confidence += [float("nan")] * (7 - known)
+        pending.append((step, now, 1 + min(previous, accepted), confidence))
+        if len(pending) > feedback_delay:
+            completed, finished, sampled, confidence = pending.popleft()
+            budget.complete(completed, finished, {"request": sampled})
+            budget.observe_confidences("request", completed, confidence)
+        previous = k
+    assert choices[64:256].count(5) >= 160
+    if recover:
+        assert choices[-128:].count(7) >= 120
+    else:
+        assert choices[-1024:].count(5) >= 960
+        assert choices[-1024:].count(6) > 0
+    budget.retain_requests(set())
+    assert not budget.confidence_updated
+    assert not budget.shapes
+
+
 @pytest.mark.parametrize("budget_cls", [AdaptiveDraftBudget, ConfidenceDraftBudget])
 def test_short_proposal_confidence_keeps_unobserved_suffix(budget_cls):
     budget = budget_cls(7)

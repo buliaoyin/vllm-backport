@@ -852,6 +852,10 @@ class ConfidenceCosts:
     selected: int
     completed: int = 0
     changed: int = 0
+    probing: int | None = None
+    probe_remaining: int = 0
+    probe_interval: int = 64
+    next_probe: int = 64
 
 
 class ConfidenceDraftBudget(AdaptiveDraftBudget):
@@ -866,6 +870,7 @@ class ConfidenceDraftBudget(AdaptiveDraftBudget):
         # cost prior instead of feeding those fluctuations back into decoding.
         self.relative_costs = {k: 1 + 0.08 * (k - self.default) for k in self.lengths}
         self.smoothed_confidences: dict[str, list[float]] = {}
+        self.confidence_updated: dict[str, list[int]] = {}
         self.confidence_bias: dict[str, list[float]] = {}
         self.last_observations: dict[str, tuple[int, int, int]] = {}
 
@@ -886,12 +891,20 @@ class ConfidenceDraftBudget(AdaptiveDraftBudget):
         if previous is None:
             previous = [float("nan")] * self.max_drafts
             self.smoothed_confidences[req_id] = previous
+        observations = (
+            self.requests[req_id].observations if req_id in self.requests else 0
+        )
+        updated = self.confidence_updated.setdefault(req_id, [0] * self.max_drafts)
         for index, value in enumerate(values):
+            stale = observations - updated[index] >= 64
             previous[index] = (
                 value
-                if math.isnan(previous[index])
+                if math.isnan(previous[index]) or stale
                 else 0.85 * previous[index] + 0.15 * value
             )
+            if stale and req_id in self.confidence_bias:
+                self.confidence_bias[req_id][index] = 0.0
+            updated[index] = observations
 
     def _shape(
         self, req_ids: Collection[str], key: tuple[int, int, bool]
@@ -933,6 +946,11 @@ class ConfidenceDraftBudget(AdaptiveDraftBudget):
         has_prediction = all(r in self.confidences for r in req_ids)
         if not has_prediction and state.completed >= 4:
             return measured_budget
+        probe = state.probing
+        if probe is not None:
+            if state.probe_remaining:
+                return probe
+            state.probing = None
         if not has_prediction or (
             state.completed >= 3 and state.completed - state.changed < 3
         ):
@@ -945,6 +963,23 @@ class ConfidenceDraftBudget(AdaptiveDraftBudget):
         if scores[best] > 1.02 * scores[state.selected]:
             state.selected = best
             state.changed = state.completed
+        if probe is not None:
+            state.probe_interval = (
+                64 if state.selected >= probe else min(512, 2 * state.probe_interval)
+            )
+            state.next_probe = state.completed + state.probe_interval
+        elif state.selected < self.max_drafts and state.completed >= state.next_probe:
+            req_id = req_ids[0]
+            acceptance = self.requests[req_id]
+            updated = self.confidence_updated[req_id][state.selected]
+            if (
+                acceptance.observations - updated >= state.probe_interval
+                and math.prod(acceptance.conditional[: state.selected]) >= 0.65
+            ):
+                # Wait for actual longer verifications, including PP feedback lag.
+                state.probing = state.selected + 1
+                state.probe_remaining = 8
+                return state.probing
         return state.selected
 
     def _choose_batch(self, req_ids: list[str], context: int, mixed: bool) -> int:
@@ -987,11 +1022,18 @@ class ConfidenceDraftBudget(AdaptiveDraftBudget):
             return
         state = self._shape(drafts, key)
         state.completed += 1
+        if (
+            state.probing in lengths
+            and entry[3] in (None, state.probing)
+            and state.probe_remaining
+        ):
+            state.probe_remaining -= 1
 
     def retain_requests(self, req_ids: Collection[str]) -> None:
         super().retain_requests(req_ids)
         for req_id in self.smoothed_confidences.keys() - req_ids:
             del self.smoothed_confidences[req_id]
+            self.confidence_updated.pop(req_id, None)
             self.confidence_bias.pop(req_id, None)
         for req_id in self.last_observations.keys() - req_ids:
             del self.last_observations[req_id]
