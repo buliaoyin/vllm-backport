@@ -113,6 +113,24 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def get_workspace_sizes(self) -> list[int]:
+        """Return the allocated bytes for each ubatch/lane slot."""
+        return [self._workspace_size_bytes(ws) for ws in self._current_workspaces]
+
+    def reserve_workspace_sizes(self, sizes: list[int]) -> None:
+        """Restore profiled capacities before capturing graphs."""
+        if len(sizes) != len(self._current_workspaces) or any(
+            type(size) is not int or size < 0 for size in sizes
+        ):
+            raise ValueError("Invalid workspace capacities")
+        if self._locked:
+            raise RuntimeError("Cannot restore workspace capacities after locking")
+        for slot, (size, current) in enumerate(zip(sizes, self.get_workspace_sizes())):
+            if size > current:
+                self._current_workspaces[slot] = torch.empty(
+                    size, dtype=torch.uint8, device=self._device
+                )
+
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> list[torch.Tensor]:

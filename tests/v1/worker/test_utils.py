@@ -3,11 +3,59 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-from vllm.v1.worker.utils import bind_kv_cache
+from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.mem_utils import MemorySnapshot
+from vllm.v1.worker.utils import bind_kv_cache, request_memory
+
+
+@pytest.mark.parametrize("initial_usage", [2 * GiB_bytes, 16 * GiB_bytes])
+def test_startup_usage_is_charged_to_the_remaining_memory_budget(initial_usage):
+    """Own contexts and external allocations must not expand the GPU limit."""
+    snapshot = MemorySnapshot(
+        total_memory=100 * GiB_bytes,
+        free_memory=100 * GiB_bytes - initial_usage,
+        device="cuda:0",
+        auto_measure=False,
+    )
+    config = SimpleNamespace(gpu_memory_utilization=0.99)
+
+    remaining = request_memory(snapshot, config, account_for_initial_usage=True)
+
+    assert remaining + initial_usage == 99 * GiB_bytes
+    assert snapshot.free_memory - remaining == GiB_bytes
+
+
+def test_startup_usage_cannot_consume_the_reserved_memory():
+    snapshot = MemorySnapshot(
+        total_memory=100 * GiB_bytes,
+        free_memory=GiB_bytes,
+        device="cuda:0",
+        auto_measure=False,
+    )
+    config = SimpleNamespace(gpu_memory_utilization=0.99)
+
+    with pytest.raises(ValueError, match="leaves no memory for the model"):
+        request_memory(snapshot, config, account_for_initial_usage=True)
+
+
+def test_default_memory_request_keeps_the_startup_free_memory_check():
+    snapshot = MemorySnapshot(
+        total_memory=100 * GiB_bytes,
+        free_memory=98 * GiB_bytes,
+        device="cuda:0",
+        auto_measure=False,
+    )
+    config = SimpleNamespace(gpu_memory_utilization=0.99)
+
+    with pytest.raises(ValueError, match="Free memory on device"):
+        request_memory(snapshot, config)
+    snapshot.free_memory = 100 * GiB_bytes
+    assert request_memory(snapshot, config) == 99 * GiB_bytes
 
 
 class _TestReplaySSMMixer(MambaMixer2):

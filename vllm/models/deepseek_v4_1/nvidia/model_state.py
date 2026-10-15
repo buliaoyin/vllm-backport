@@ -157,6 +157,9 @@ class DeepseekV41ModelState(DefaultModelState):
             request = input_batch.req_ids[0]
             if self.hybrid_active is None:
                 self.hybrid_active = request
+                observer = getattr(self, "hybrid_budget_observer", None)
+                if observer is not None:
+                    observer.begin()
                 for pool in self.hybrid_capacity_pools:
                     pool.begin_request()
                 for module in self.cpu_async_modules:
@@ -268,7 +271,8 @@ class DeepseekV41ModelState(DefaultModelState):
 
     def reset_expert_cache_stats(self) -> None:
         self._expert_cache_stats_enabled = any(
-            module.gpu_cache is not None for module in self.cpu_expert_modules
+            module.gpu_cache is not None or module.backend.route_tail_skip
+            for module in self.cpu_expert_modules
         )
         if self._expert_cache_stats_enabled:
             torch.cuda.current_stream().synchronize()
@@ -298,6 +302,9 @@ class DeepseekV41ModelState(DefaultModelState):
     def _finish_hybrid_request(self):
         if self.hybrid_active is None:
             return
+        observer = getattr(self, "hybrid_budget_observer", None)
+        if observer is not None:
+            observer.finish()
         rate = (
             self.hybrid_generated / self.hybrid_request_steps
             if self.hybrid_request_steps

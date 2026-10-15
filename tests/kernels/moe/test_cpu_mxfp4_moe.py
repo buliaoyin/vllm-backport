@@ -244,6 +244,55 @@ def test_expert_cache_profile_preserves_inactive_layer_history(tmp_path):
     assert restored["21"] == initial["21"]
 
 
+@pytest.mark.parametrize(
+    "rank,requests,mode,valid",
+    [
+        (4, 1, "FULL_DECODE_ONLY", True),
+        (6, 1, "FULL_DECODE_ONLY", False),
+        (4, 2, "FULL_DECODE_ONLY", True),
+        (4, 8, "FULL_DECODE_ONLY", True),
+        (4, 32, "FULL_DECODE_ONLY", False),
+        (4, 1, "FULL", False),
+        (4, 8, "NONE", False),
+    ],
+)
+def test_route_tail_skip_requires_model_topk_and_decode_graph(
+    rank, requests, mode, valid
+):
+    from vllm.config import CUDAGraphMode
+    from vllm.models.deepseek_v4_1.cpu_moe import cpu_moe_config
+
+    config = SimpleNamespace(
+        additional_config={
+            "cpu_moe": {
+                "backend": "ik",
+                "cuda_library_path": "unused.so",
+                "route_tail_skip": rank,
+            }
+        },
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=40, num_experts_per_tok=6)
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            enable_expert_parallel=False,
+            enable_eplb=False,
+            use_ubatching=False,
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode[mode],
+            max_cudagraph_capture_size=max(16, requests * 8),
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=requests),
+        uniform_decode_query_len=8,
+    )
+    if valid:
+        assert cpu_moe_config(config, 20).route_tail_skip == rank
+    else:
+        with pytest.raises(ValueError, match="route_tail_skip"):
+            cpu_moe_config(config, 20)
+
+
 @pytest.mark.parametrize("draft_tokens", [3, 5, 7])
 def test_cpu_callbacks_accept_reachable_decode_graphs(draft_tokens):
     """Unused capture candidates must not reject a supported 16-request batch."""
@@ -986,6 +1035,142 @@ def test_native_cpu_callback_replays_without_python_and_masks_padding(
         module.backend.close()
 
 
+@pytest.mark.parametrize("initial_rank", [0, 2])
+def test_route_tail_skip_preserves_batch_heads_and_gpu_hits_in_graph_replay(
+    backend_config,
+    initial_rank,
+):
+    """Heads in another request protect all routes; padding must not protect them."""
+    bridge = os.environ.get("DSV41_TEST_CUDA_LIBRARY")
+    if backend_config.backend != "ik" or not bridge or not torch.cuda.is_available():
+        pytest.skip("An IK backend and CUDA bridge are required")
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.deepseek_v4_1.cpu_moe import CPUExpertModule
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                n_routed_experts=8,
+                hidden_size=128,
+                moe_intermediate_size=128,
+                num_experts_per_tok=4,
+                swiglu_limit=0.125,
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128, max_num_seqs=8),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=16),
+    )
+    module = CPUExpertModule(
+        replace(
+            backend_config,
+            cuda_library_path=bridge,
+            gpu_cache_experts=2,
+            gpu_cache_device=0,
+            gpu_cache_static_experts=(3, 7),
+            route_tail_skip=initial_rank,
+        ),
+        config,
+    )
+    load_weights(module.backend, module.gpu_cache)
+    with torch.inference_mode():
+        module.finalize()
+    hidden = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 1, 2, 3]] * 4, device="cuda")
+    routes = torch.tensor(
+        [
+            [0.6, 0.05, 0.2, 0.03],
+            [0.06, 0.02, 0.7, 0.01],
+            [0.02, 0.01, 0.7, 0.2],
+            [0.01, 0.9, 0.02, 0.01],
+        ],
+        device="cuda",
+    )
+    padding = torch.tensor([False, False, False, True], device="cuda")
+    hidden[3].fill_(float("nan"))
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        is_padding=padding,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with override_forward_context(context), torch.cuda.stream(stream):
+            module(hidden, ids, routes)
+            torch.accelerator.synchronize()
+            with torch.cuda.graph(graph, stream=stream):
+                output = module(hidden, ids, routes)
+            for rank, valid in ((0, 3), (2, 3), (2, 4), (2, 1), (2, 0), (3, 3), (0, 3)):
+                torch.accelerator.synchronize()
+                hidden.normal_()
+                hidden[valid:].fill_(float("nan"))
+                padding.fill_(True)
+                padding[:valid].fill_(False)
+                module.backend.set_route_tail_skip(rank)
+                before = module.backend.cuda_stats()
+                graph.replay()
+                torch.accelerator.synchronize()
+                module.backend.check_cuda_errors()
+                after = module.backend.cuda_stats()
+                skipped = valid if rank == 2 and valid < 4 else 0
+                assert after["cached_routes"] - before["cached_routes"] == valid
+                assert (
+                    after["tail_skipped_routes"] - before["tail_skipped_routes"]
+                    == skipped
+                )
+                assert after["tail_skipped_experts"] - before[
+                    "tail_skipped_experts"
+                ] == bool(skipped)
+                assert after["tail_candidate_routes"] - before[
+                    "tail_candidate_routes"
+                ] == (3 * valid if rank else 0)
+                cpu_routes = sum(after["expert_counts"]) - sum(before["expert_counts"])
+                assert cpu_routes + skipped + valid == valid * 4
+                assert torch.count_nonzero(output[valid:]) == 0
+                if not valid:
+                    continue
+                expected_ids = ids[:valid].cpu().clone()
+                expected_ids[:, 3] = -2
+                if skipped:
+                    expected_ids[:, 1] = -2
+                cpu = module.backend.forward(
+                    hidden[:valid].cpu(), expected_ids, routes[:valid].cpu()
+                ).to(hidden.dtype)
+                gpu = module.gpu_cache.launch(
+                    hidden[:valid], ids[:valid], routes[:valid]
+                )
+                module.gpu_cache.join(gpu)
+                torch.testing.assert_close(
+                    output[:valid].cpu(), cpu.add_(gpu.cpu()), atol=0, rtol=0
+                )
+            module.backend.set_route_tail_skip(2)
+            context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            before = module.backend.cuda_stats()
+            unfiltered = module(hidden, ids, routes)
+            torch.accelerator.synchronize()
+            after = module.backend.cuda_stats()
+            assert after["tail_skipped_routes"] == before["tail_skipped_routes"]
+            assert after["tail_candidate_routes"] == before["tail_candidate_routes"]
+            torch.testing.assert_close(
+                unfiltered[:3].cpu(), output[:3].cpu(), atol=0, rtol=0
+            )
+            context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+            module.async_host[1][0, 1] = 99
+            module.backend.enqueue_cuda(
+                4, *module.async_host, stream.cuda_stream, allow_tail_skip=True
+            )
+            torch.accelerator.synchronize()
+            with pytest.raises(RuntimeError, match="invalid or unloaded"):
+                module.backend.check_cuda_errors()
+    finally:
+        del graph
+        module.backend.close()
+
+
 @pytest.mark.parametrize("decode_tokens", [8, 64, 96])
 @pytest.mark.parametrize("origin_device,cache_device", [(0, 0), (0, 1), (1, 0), (1, 1)])
 @pytest.mark.parametrize("hidden_size", [128, 5120])
@@ -1283,7 +1468,16 @@ def test_gpu_cache_preserves_mixed_routes_across_prefill_and_graph_replay(
 
 
 @pytest.mark.parametrize(
-    "capacities", [[600, 600, 160], [1700, 1500, 1500, 2000], [0, 8, 0]]
+    "capacities",
+    [
+        [600, 600, 160],
+        [1700, 1500, 1500, 2000],
+        [345, 64, 402],
+        [327, 46, 384],
+        [15000, 15000, 15000, 15000],
+        [0, 8, 0],
+        [0, 0, 0],
+    ],
 )
 def test_automatic_cache_respects_each_devices_remaining_budget(capacities):
     from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
@@ -1293,8 +1487,478 @@ def test_automatic_cache_respects_each_devices_remaining_budget(capacities):
     for device, budget in enumerate(capacities):
         assert sum(count for owner, count in plan if owner == device) <= budget
     assert all(0 <= count < 384 for _, count in plan)
+    assert all(count % 8 == 0 for _, count in plan)
     if sum(capacities) > 20 * 8:
         assert all(count > 0 for _, count in plan)
+
+
+def test_automatic_cache_fills_aligned_spare_budget_on_assigned_device():
+    """The three-card startup must use PP1's spare 24 slots within its budget."""
+    from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
+
+    capacities = [345, 64, 402]
+    plan = plan_expert_cache(capacities, local_device=2)
+    assert [sum(n for d, n in plan if d == device) for device in range(3)] == [
+        344,
+        64,
+        400,
+    ]
+    assert plan[18] == (1, 64)
+    assert [device for device, _ in plan] == [2] * 10 + [0] * 8 + [1, 0]
+    assert capacities == [345, 64, 402]
+
+
+@pytest.mark.parametrize(
+    "capacities,layers,expected",
+    [
+        ([1960, 1736, 2104, 64], 20, [1960, 1736, 2104, 64]),
+        ([16, 16, 19], 20, [16, 16, 16]),
+        ([24, 16], 1, [24, 0]),
+    ],
+)
+def test_automatic_cache_uses_small_device_only_when_total_capacity_grows(
+    capacities, layers, expected
+):
+    """An unused GPU can hold a partial layer without losing more slots elsewhere."""
+    from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
+
+    plan = plan_expert_cache(
+        capacities, num_layers=layers, local_device=len(capacities) - 1
+    )
+    assert [
+        sum(n for d, n in plan if d == device) for device in range(len(capacities))
+    ] == (expected)
+    assert all(count % 8 == 0 and 0 <= count < 384 for _, count in plan)
+
+
+def test_measured_expert_budget_can_expand_beyond_previous_total():
+    """808 slots are a previous result, not a limit on measured free space."""
+    from vllm.models.deepseek_v4_1.hybrid import expand_expert_cache, plan_expert_cache
+
+    before = plan_expert_cache([345, 64, 402], local_device=2)
+    after = expand_expert_cache(before, [345, 112, 402])
+    assert sum(count for _, count in before) == 808
+    assert sum(count for _, count in after) == 856
+    assert after[18] == (1, 112)
+    assert [d for d, _ in before] == [d for d, _ in after]
+    assert before[18] == (1, 64)
+
+
+def test_calibrated_expert_budget_accounts_for_existing_weights_and_peak():
+    from vllm.models.deepseek_v4_1.hybrid import GiB, calibrated_expert_capacities
+
+    memory = [
+        (5 * GiB // 2, 16 * GiB, GiB // 4),
+        (3 * GiB, 16 * GiB, GiB // 2),
+        (GiB // 2, 16 * GiB, GiB // 2),
+    ]
+    assert calibrated_expert_capacities(
+        memory, [(0, 8), (1, 4), (2, 8)], GiB // 8, 15 / 16
+    ) == [18, 16, 0]
+
+
+@pytest.mark.parametrize(
+    "minimum_free, expected", [(149, 21), (150, 32), (249, 32), (250, 32), (330, 40)]
+)
+def test_cache_retains_slots_within_forty_percent_reserve_shortfall(
+    minimum_free, expected
+):
+    """Retain at the 60% boundary; expansion still needs the full reserve."""
+    from vllm.models.deepseek_v4_1.hybrid import calibrated_expert_capacities
+
+    memory = [(minimum_free + 40, 1000, 40)]
+    assert calibrated_expert_capacities(memory, [(0, 32)], 10, 0.75) == [expected]
+
+
+@pytest.mark.parametrize("additional_peak", [0, 400 * 1024**2])
+def test_recorded_peak_shortfall_retains_856_slots_until_tolerance_is_exceeded(
+    additional_peak,
+):
+    """Replay the measured 614/578 MiB margins that previously removed 16 slots."""
+    from vllm.models.deepseek_v4_1.cache_budget import (
+        cached_expert_capacities,
+        fit_cached_plan,
+    )
+
+    plan = (
+        [(2, 48)] * 3
+        + [(2, 40)] * 5
+        + [(0, 40)] * 5
+        + [(0, 48), (0, 48), (1, 48), (0, 48), (1, 48), (0, 40), (1, 32)]
+    )
+    expert_bytes = 18800640
+    slots = [sum(n for d, n in plan if d == i) for i in range(3)]
+    growth = [1064304640, 871366656, 2128805888]
+    capture_free = [1778515968, 1524760576, 2572353536]
+    saved = {
+        "plan": plan,
+        "growth": growth,
+        "headroom": [1134559232 + additional_peak, 918552576, 1656750080],
+        "capture_free": capture_free,
+    }
+    memory = [
+        (free + retained + count * expert_bytes, 68063395840, 0)
+        for free, retained, count in zip(capture_free, growth, slots)
+    ]
+    capacities = cached_expert_capacities(memory, saved, expert_bytes, 0.99)
+    fitted = fit_cached_plan(plan, capacities, 384)
+    assert fitted is not None
+    counts = [sum(n for d, n in fitted if d == i) for i in range(3)]
+    assert counts[1] == 128
+    if additional_peak:
+        assert counts[0] < 384
+    else:
+        assert counts[0] == 384
+        assert sum(counts) >= 856
+
+
+def test_graph_calibration_accepts_small_shortfall_without_864_856_rebuilds(
+    monkeypatch,
+):
+    """The user's logged probe and second capture converge in two captures."""
+    from vllm.models.deepseek_v4_1 import hybrid_runtime as runtime
+
+    captures, saved = [], []
+    worker = SimpleNamespace(
+        _hybrid_graph_calibration=True,
+        _hybrid_cached_budget=None,
+        _hybrid_validated_headrooms=None,
+        _hybrid_cache_plan=(
+            [(2, 16)] * 3
+            + [(2, 24)] * 6
+            + [(0, 24)] * 7
+            + [(1, 24), (0, 24), (1, 24), (2, 16)]
+        ),
+        _hybrid_calibration_started=runtime.time.monotonic(),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    hidden_size=5120, moe_intermediate_size=2304, n_routed_experts=384
+                )
+            ),
+            cache_config=SimpleNamespace(gpu_memory_utilization=0.99),
+        ),
+    )
+
+    def capture():
+        captures.append(list(worker._hybrid_cache_plan))
+        return 123
+
+    worker.model_runner = SimpleNamespace(capture_model=capture)
+    monkeypatch.setattr(
+        runtime, "get_pp_group", lambda: SimpleNamespace(world_size=3, rank_in_group=2)
+    )
+    phases = iter(
+        [
+            [(5.065, 0.889), (2.865, 0.734), (4.657, 1.602)],
+            [(1.516, 0.912), (1.420, 0.756), (2.290, 1.584)],
+        ]
+    )
+
+    def profile(*args, **kwargs):
+        return [
+            (int(free * runtime.GiB), 68063395840, int(peak * runtime.GiB))
+            for free, peak in next(phases)
+        ]
+
+    monkeypatch.setattr(runtime, "_profile_hybrid_runtime_memory", profile)
+    monkeypatch.setattr(runtime, "_hybrid_memory", lambda _: [(0, 68063395840, 0)] * 3)
+    monkeypatch.setattr(runtime, "_clear_hybrid_graphs_and_cache", lambda _: None)
+    monkeypatch.setattr(
+        runtime,
+        "_allocate_hybrid_cache",
+        lambda w, p: setattr(w, "_hybrid_cache_plan", p),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_save_hybrid_budget",
+        lambda w, _: saved.append(list(w._hybrid_cache_plan)),
+    )
+    monkeypatch.setattr(runtime, "_log_hybrid_cache_plan", lambda _: None)
+    assert runtime.capture_hybrid_graphs(worker) == 123
+    assert len(captures) == 2
+    assert [sum(n for d, n in saved[0] if d == i) for i in range(3)] == [392, 128, 344]
+
+
+@pytest.mark.parametrize("restored_free", [500, 5])
+def test_graph_calibration_rechecks_restored_layout_after_final_expansion(
+    monkeypatch, restored_free
+):
+    """A failed last expansion restores a safe layout, never bypassing its check."""
+    from vllm.models.deepseek_v4_1 import hybrid_runtime as runtime
+
+    captures = []
+    worker = SimpleNamespace(
+        _hybrid_graph_calibration=True,
+        _hybrid_cached_budget=None,
+        _hybrid_validated_headrooms=None,
+        _hybrid_cache_plan=[(0, 8)],
+        _hybrid_calibration_started=runtime.time.monotonic(),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    hidden_size=32, moe_intermediate_size=32, n_routed_experts=384
+                )
+            ),
+            cache_config=SimpleNamespace(gpu_memory_utilization=0.99),
+        ),
+    )
+
+    def capture():
+        captures.append(list(worker._hybrid_cache_plan))
+        return 123
+
+    worker.model_runner = SimpleNamespace(capture_model=capture)
+    group = SimpleNamespace(world_size=1, rank_in_group=0)
+    monkeypatch.setattr(runtime, "get_pp_group", lambda: group)
+    monkeypatch.setattr(runtime, "_hybrid_memory", lambda _: [(500, 1000, 20)])
+    profiles = iter([(500, 1000, 20)] * 3 + [(5, 1000, 20), (restored_free, 1000, 20)])
+    monkeypatch.setattr(
+        runtime, "_profile_hybrid_runtime_memory", lambda *a, **kw: [next(profiles)]
+    )
+    monkeypatch.setattr(runtime, "plan_expert_cache", lambda *a: [(0, 16)])
+    expansions = iter([[(0, 24)], [(0, 32)], [(0, 32)]])
+    monkeypatch.setattr(runtime, "expand_expert_cache", lambda *a: next(expansions))
+    monkeypatch.setattr(runtime, "_clear_hybrid_graphs_and_cache", lambda _: None)
+    monkeypatch.setattr(
+        runtime,
+        "_allocate_hybrid_cache",
+        lambda w, plan: setattr(w, "_hybrid_cache_plan", plan),
+    )
+    saved = []
+    monkeypatch.setattr(
+        runtime,
+        "_save_hybrid_budget",
+        lambda w, _: saved.append(list(w._hybrid_cache_plan)),
+    )
+    monkeypatch.setattr(runtime, "_log_hybrid_cache_plan", lambda _: None)
+
+    if restored_free == 500:
+        assert runtime.capture_hybrid_graphs(worker) == 123
+        assert saved == [[(0, 24)]]
+    else:
+        with pytest.raises(RuntimeError, match="could not preserve runtime headroom"):
+            runtime.capture_hybrid_graphs(worker)
+        assert not saved
+    assert captures == [[(0, 8)], [(0, 16)], [(0, 24)], [(0, 32)], [(0, 24)]]
+
+
+def test_hybrid_memory_includes_remote_allocator_headroom():
+    """PP2's allocations on PP0 and PP1 contribute to those GPUs' peaks."""
+    from vllm.models.deepseek_v4_1.hybrid_runtime import _aggregate_hybrid_memory
+
+    samples = [
+        {0: (100, 1000, 10, 11, 12, 16, 5)},
+        {1: (200, 1000, 20, 22, 22, 25, 4)},
+        {
+            0: (100, 1000, 5, 7, 8, 11, 0),
+            1: (200, 1000, 6, 9, 9, 12, 0),
+            2: (300, 1000, 30, 34, 35, 41, 7),
+        },
+    ]
+    assert _aggregate_hybrid_memory(samples) == [
+        (100, 1000, 7),
+        (200, 1000, 7),
+        (300, 1000, 7),
+    ]
+
+
+@pytest.fixture
+def dsv41_startup_budget(tmp_path, monkeypatch):
+    from vllm.models.deepseek_v4_1.cache_budget import CacheBudgetProfile
+
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    profile = CacheBudgetProfile("model-config-hardware", [1000, 1000], 2, 384)
+    payload = {
+        "version": 2,
+        "fingerprint": profile.fingerprint,
+        "plan": [[0, 8], [1, 16]],
+        "growth": [50, 70],
+        "headroom": [100, 200],
+        "prefill_headroom": [80, 160],
+        "capture_free": [900, 850],
+        "workspaces": [[32, 0], [64, 16]],
+    }
+    return profile, payload
+
+
+def test_cache_budget_restores_plan_and_ignores_corrupt_memory(dsv41_startup_budget):
+    import json
+
+    profile, payload = dsv41_startup_budget
+    assert profile.load() is None
+    profile.save(payload)
+    assert profile.load() == payload
+    for invalid in (
+        dict(payload, headroom=[-1, 200]),
+        dict(payload, prefill_headroom=[101, 160]),
+        dict(payload, capture_free=[900, 1001]),
+    ):
+        profile.path.write_text(json.dumps(invalid))
+        assert profile.load() is None
+    profile.save(payload)
+    profile.fingerprint = "different-configuration"
+    assert profile.load() is None
+
+
+def test_serving_peak_is_saved_for_next_startup_and_never_lowered(dsv41_startup_budget):
+    profile, payload = dsv41_startup_budget
+    profile.save(payload)
+    updated = profile.record_runtime_peak(payload, [700, 800])
+    assert updated["headroom"] == [200, 200]
+    assert profile.load() == updated
+    assert profile.record_runtime_peak(updated, [800, 850]) == updated
+
+
+def test_reused_cache_budget_adapts_slots_without_moving_io_owners():
+    from vllm.models.deepseek_v4_1.cache_budget import fit_cached_plan
+    from vllm.models.deepseek_v4_1.hybrid import plan_expert_cache
+
+    plan = plan_expert_cache([345, 64, 402], local_device=2)
+    increased = fit_cached_plan(plan, [360, 96, 408], 384)
+    decreased = fit_cached_plan(plan, [320, 56, 384], 384)
+    assert sum(count for _, count in increased) == 864
+    for result, capacities in (
+        (increased, [360, 96, 408]),
+        (decreased, [320, 56, 384]),
+    ):
+        assert [device for device, _ in result] == [device for device, _ in plan]
+        assert all(count % 8 == 0 and count >= 8 for _, count in result)
+        for device, capacity in enumerate(capacities):
+            assert sum(count for owner, count in result if owner == device) <= capacity
+    assert fit_cached_plan(plan, [0, 64, 402], 384) is None
+
+
+def test_budget_identity_ignores_history_path_but_invalidates_memory_changes():
+    import json
+
+    from vllm.models.deepseek_v4_1.cache_budget import budget_fingerprint
+
+    class Config(SimpleNamespace):
+        def compute_hash(self):
+            return json.dumps(self.additional_config, sort_keys=True)
+
+    config = Config(
+        model_config=SimpleNamespace(
+            model="test-checkpoint",
+            revision=None,
+            max_model_len=524288,
+            hf_config=SimpleNamespace(to_dict=lambda: {"n_routed_experts": 384}),
+        ),
+        cache_config=SimpleNamespace(gpu_memory_utilization=0.985),
+        scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=2048),
+        additional_config={"deepseek_v41_hybrid": {"expert_profile": "first.json"}},
+    )
+    memory = [(1000, 2000, 10)]
+    first = budget_fingerprint(config, memory, [(20, [128], 2)])
+    config.additional_config["deepseek_v41_hybrid"]["expert_profile"] = "second.json"
+    assert budget_fingerprint(config, memory, [(20, [128], 2)]) == first
+    assert budget_fingerprint(config, memory, [(40, [256], 2)]) != first
+    config.scheduler_config.max_num_seqs = 4
+    assert budget_fingerprint(config, memory, [(20, [128], 2)]) != first
+
+
+@pytest.mark.parametrize("sliding", [False, True])
+def test_serving_memory_profile_uses_prefill_then_decode_and_cleans_requests(
+    monkeypatch,
+    sliding,
+):
+    from vllm.models.deepseek_v4_1 import hybrid_runtime as runtime
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    group = SimpleNamespace(world_size=1, cpu_group=None, barrier=lambda: None)
+    monkeypatch.setattr(runtime, "get_pp_group", lambda: group)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda result, value, group: result.__setitem__(0, value),
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(sliding_window=128), get_vocab_size=lambda: 64
+        ),
+        num_lookahead_tokens=7,
+    )
+    steps: list[SchedulerOutput] = []
+    connector_states: list[bool] = []
+    adaptive = object()
+    spec = (
+        SlidingWindowSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.float16,
+            sliding_window=128,
+        )
+        if sliding
+        else SimpleNamespace(block_size=128)
+    )
+    runner = SimpleNamespace(
+        vllm_config=config,
+        max_model_len=8192,
+        decode_query_len=8,
+        num_speculative_steps=7,
+        adaptive_verification=adaptive,
+        model_state=SimpleNamespace(max_encoder_len=0),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=40,
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)],
+        ),
+        kv_connector=SimpleNamespace(set_disabled=connector_states.append),
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        vllm_config=config,
+        execute_model=steps.append,
+        sample_tokens=lambda grammar: None,
+    )
+    runtime._profile_hybrid_serving_step(worker, 64, 8, decode=True)
+    prefill, decode, cleanup = steps
+    assert len(prefill.scheduled_new_reqs) == 8
+    assert all(
+        req.sampling_params.prompt_logprobs is None
+        for req in prefill.scheduled_new_reqs
+    )
+    assert all(
+        req.prompt_len - req.num_computed_tokens == 256
+        for req in prefill.scheduled_new_reqs
+    )
+    block_ids = {
+        block
+        for req in prefill.scheduled_new_reqs
+        for group_blocks in req.block_ids
+        for block in group_blocks
+    }
+    assert max(block_ids) < 40
+    assert all(req.num_computed_tokens % 128 == 0 for req in prefill.scheduled_new_reqs)
+    if sliding:
+        assert 0 in block_ids
+        assert all(req.num_computed_tokens > 4096 for req in prefill.scheduled_new_reqs)
+    else:
+        assert 0 not in block_ids
+    assert decode.total_num_scheduled_tokens == 64
+    assert all(
+        len(drafts) == 7 for drafts in decode.scheduled_spec_decode_tokens.values()
+    )
+    assert cleanup.finished_req_ids == set(decode.num_scheduled_tokens)
+    assert connector_states == [True, False]
+    assert runner.adaptive_verification is adaptive
+
+
+def test_profile_kv_initializes_shared_backing_before_synthetic_prefix_reads():
+    from vllm.models.deepseek_v4_1.hybrid_runtime import _zero_hybrid_profile_kv
+
+    storage = torch.full((512,), 255, dtype=torch.uint8)
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            kv_caches=[storage[:128], storage[128:].view(torch.int16)]
+        )
+    )
+    _zero_hybrid_profile_kv(worker)
+    assert torch.count_nonzero(storage) == 0
 
 
 @pytest.mark.parametrize(
@@ -1453,7 +2117,8 @@ def test_expert_cache_stats_exclude_warmup_and_do_not_recount(monkeypatch):
         result = CPUExpertModule.__new__(CPUExpertModule)
         torch.nn.Module.__init__(result)
         result.backend = SimpleNamespace(
-            cuda_route_counts=Mock(return_value=(hits, misses))
+            route_tail_skip=0,
+            cuda_route_stats=Mock(return_value=(hits, misses, 10, 2, 30)),
         )
         result.gpu_cache = cache
         result._eager_gpu_hits = result._eager_cpu_misses = 0
@@ -1474,8 +2139,8 @@ def test_expert_cache_stats_exclude_warmup_and_do_not_recount(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     state.reset_expert_cache_stats()
     stream.synchronize.assert_called_once()
-    cached.backend.cuda_route_counts.return_value = (107, 21)
-    uncached.backend.cuda_route_counts.return_value = (0, 128)
+    cached.backend.cuda_route_stats.return_value = (107, 21, 13, 3, 40)
+    uncached.backend.cuda_route_stats.return_value = (0, 128, 12, 4, 50)
     cached._eager_gpu_hits, cached._eager_cpu_misses = 2, 3
     cache.reload_updates += 1
     cache.reloaded_experts += 4
@@ -1485,6 +2150,9 @@ def test_expert_cache_stats_exclude_warmup_and_do_not_recount(monkeypatch):
     assert state.take_expert_cache_stats() == ExpertCacheStats(
         gpu_hits=9,
         cpu_misses=12,
+        tail_skipped_routes=5,
+        tail_skipped_experts=3,
+        tail_candidate_routes=30,
         updates=1,
         experts_reloaded=4,
         reload_seconds=0.5,
@@ -1496,17 +2164,21 @@ def test_expert_cache_stats_exclude_warmup_and_do_not_recount(monkeypatch):
     cached.gpu_cache = None
     state.reset_expert_cache_stats()
     assert state.take_expert_cache_stats() is None
+    uncached.backend.route_tail_skip = 4
+    state.reset_expert_cache_stats()
+    assert state.take_expert_cache_stats() == ExpertCacheStats()
+    assert stream.synchronize.call_count == 2
 
 
-@pytest.mark.parametrize("batched", [False, True])
-def test_cuda_route_counts_aggregate_all_graph_shapes(batched):
-    """Both bridge versions count actual routes across all captured shapes."""
+@pytest.mark.parametrize("bridge_api", ["stats", "counts", "legacy"])
+def test_cuda_route_counts_aggregate_all_graph_shapes(bridge_api):
+    """Old bridges retain route counts; new bridges include batch skip counts."""
     from unittest.mock import Mock
 
     backend = object.__new__(CPUMXFP4Experts)
     backend._cuda_tasks = {"one": 11, "four": 22}
     backend._cuda_library = SimpleNamespace()
-    if batched:
+    if bridge_api != "legacy":
 
         def collect(tasks, count, output):
             assert list(tasks) == [11, 22]
@@ -1521,9 +2193,21 @@ def test_cuda_route_counts_aggregate_all_graph_shapes(batched):
                 "expert_counts": [1, 0, 2],
             }
         )
+    if bridge_api == "stats":
+
+        def collect_stats(tasks, count, output):
+            assert list(tasks) == [11, 22]
+            assert count == 2
+            output[:] = (17, 3, 5, 2, 8)
+
+        backend._cuda_library.dsv41_cuda_tasks_route_stats = collect_stats
     assert backend.cuda_route_counts() == (17, 3)
+    assert backend.cuda_route_stats() == (
+        (17, 3, 5, 2, 8) if bridge_api == "stats" else (17, 3, 0, 0, 0)
+    )
     backend._cuda_tasks.clear()
     assert backend.cuda_route_counts() == (0, 0)
+    assert backend.cuda_route_stats() == (0, 0, 0, 0, 0)
 
 
 def test_eager_expert_cache_counts_exclude_padding(monkeypatch):

@@ -33,9 +33,13 @@ def apply_hybrid_defaults(args):
         "overlap_decode",
         "r8_refill",
         "adaptive_cache",
+        "route_tail_skip",
     }
     if unknown:
         raise ValueError(f"Unknown DeepSeek hybrid options: {sorted(unknown)}")
+    tail_skip = settings.get("route_tail_skip", 0)
+    if type(tail_skip) is not int or not 0 <= tail_skip < 8:
+        raise ValueError("route_tail_skip must be an integer from 0 to 7")
     if type(settings.setdefault("overlap_decode", True)) is not bool:
         raise ValueError("overlap_decode must be a boolean")
     if type(settings.setdefault("r8_refill", True)) is not bool:
@@ -145,6 +149,7 @@ def apply_hybrid_defaults(args):
             "num_threads": threads[0],
             "library_path": str(libraries[0]),
             "cuda_library_path": str(libraries[1]),
+            "route_tail_skip": tail_skip,
         },
         ced_prefill=True,
         pp_kv_transfer=True,
@@ -182,7 +187,61 @@ def plan_expert_cache(capacities, num_layers=20, bank_size=384, local_device=Non
         count = min(target, remaining[device]) // 8 * 8
         result.append((device, count))
         remaining[device] -= count
+    result = expand_expert_cache(result, capacities, bank_size)
+    maximum = (bank_size - 1) // 8 * 8
+    for device, capacity in enumerate(capacities):
+        if capacity < 8 or any(owner == device and count for owner, count in result):
+            continue
+        best = result
+        for layer in range(num_layers):
+            candidate = result.copy()
+            candidate[layer] = (device, min(capacity // 8 * 8, maximum))
+            candidate = expand_expert_cache(candidate, capacities, bank_size)
+            if sum(count for _, count in candidate) > sum(count for _, count in best):
+                best = candidate
+        result = best
     return result
+
+
+def expand_expert_cache(plan, capacities, bank_size=384):
+    """Fill aligned spare capacity without changing the cache devices."""
+    result = list(plan)
+    remaining = list(capacities)
+    for device, count in result:
+        remaining[device] -= count
+    while True:
+        candidates = [
+            i
+            for i, (device, count) in enumerate(result)
+            if count and count + 8 < bank_size and remaining[device] >= 8
+        ]
+        if not candidates:
+            break
+        layer = min(candidates, key=lambda i: result[i][1])
+        device, count = result[layer]
+        result[layer] = (device, count + 8)
+        remaining[device] -= 8
+    return result
+
+
+def minimum_cache_reserve(total, utilization):
+    """Keep existing slots when at least 60% of the planned reserve remains."""
+    reserve = int(total * (1 - utilization))
+    return (reserve * 3 + 4) // 5
+
+
+def calibrated_expert_capacities(memory, plan, expert_bytes, utilization):
+    """Subtract measured runtime headroom from post-capture device memory."""
+    capacities = []
+    for device, (free, total, headroom) in enumerate(memory):
+        slots = sum(count for owner, count in plan if owner == device)
+        weights = slots * expert_bytes
+        reserve = int(total * (1 - utilization)) + headroom
+        capacity = max(0, (free + weights - reserve) // expert_bytes)
+        if free - headroom >= minimum_cache_reserve(total, utilization):
+            capacity = max(slots, capacity)
+        capacities.append(capacity)
+    return capacities
 
 
 def native_libraries():

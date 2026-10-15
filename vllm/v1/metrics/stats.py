@@ -188,6 +188,10 @@ class ExpertCacheStats:
 
     gpu_hits: int = 0
     cpu_misses: int = 0
+    tail_skipped_routes: int = 0
+    # Each expert is counted once per layer and callback batch.
+    tail_skipped_experts: int = 0
+    tail_candidate_routes: int = 0
     decode_checks: int = 0
     updates: int = 0
     experts_reloaded: int = 0

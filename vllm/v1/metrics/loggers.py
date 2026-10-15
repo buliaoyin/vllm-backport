@@ -330,17 +330,28 @@ class LoggingStatLogger(StatLoggerBase):
         stats = self.expert_cache_stats
         if stats is None:
             return
-        routes = stats.gpu_hits + stats.cpu_misses
+        routes = stats.gpu_hits + stats.cpu_misses + stats.tail_skipped_routes
         hit_rate = f"{100 * stats.gpu_hits / routes:.2f}%" if routes else "N/A"
+        skip_rate = (
+            f"{100 * stats.tail_skipped_routes / stats.tail_candidate_routes:.2f}%"
+            if stats.tail_candidate_routes
+            else "N/A"
+        )
         log_fn(
             self.log_prefix + "Hybrid expert cache: GPU hit rate: %s "
             "(%d/%d routes), CPU routes: %d, "
+            "Tail-skipped expert computations: %d, Tail-skipped routes: %d "
+            "(%s of %d eligible CPU decode routes), "
             "Expert replacements: %d, Cache updates: %d, Reload time: %.1f ms, "
             "Host LRU hits: %d, Repacked experts: %d, Decode checks: %d",
             hit_rate,
             stats.gpu_hits,
             routes,
             stats.cpu_misses,
+            stats.tail_skipped_experts,
+            stats.tail_skipped_routes,
+            skip_rate,
+            stats.tail_candidate_routes,
             stats.experts_reloaded,
             stats.updates,
             stats.reload_seconds * 1000,

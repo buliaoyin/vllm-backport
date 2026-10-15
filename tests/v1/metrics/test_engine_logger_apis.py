@@ -98,6 +98,9 @@ def test_expert_cache_logging_is_weighted_per_interval_and_follows_spec(
     first = ExpertCacheStats(
         gpu_hits=90,
         cpu_misses=10,
+        tail_skipped_routes=10,
+        tail_skipped_experts=2,
+        tail_candidate_routes=20,
         decode_checks=2,
         updates=2,
         experts_reloaded=4,
@@ -119,7 +122,15 @@ def test_expert_cache_logging_is_weighted_per_interval_and_follows_spec(
     decoded = MsgpackDecoder(EngineCoreOutputs).decode(MsgpackEncoder().encode(output))
     stat_logger.record(decoded.scheduler_stats, None, engine_idx=0)
     stat_logger.record(
-        SchedulerStats(expert_cache_stats=ExpertCacheStats(gpu_hits=1, cpu_misses=9)),
+        SchedulerStats(
+            expert_cache_stats=ExpertCacheStats(
+                gpu_hits=1,
+                cpu_misses=9,
+                tail_skipped_routes=5,
+                tail_skipped_experts=1,
+                tail_candidate_routes=80,
+            )
+        ),
         None,
         engine_idx=1 if aggregate else 0,
     )
@@ -127,7 +138,9 @@ def test_expert_cache_logging_is_weighted_per_interval_and_follows_spec(
     assert len(messages) == 3
     assert "Avg prompt throughput" in messages[0]
     assert "SpecDecoding metrics" in messages[1]
-    assert "GPU hit rate: 82.73% (91/110 routes), CPU routes: 19" in messages[2]
+    assert "GPU hit rate: 72.80% (91/125 routes), CPU routes: 19" in messages[2]
+    assert "Tail-skipped expert computations: 3, Tail-skipped routes: 15" in messages[2]
+    assert "15.00% of 100 eligible CPU decode routes" in messages[2]
     assert (
         "Expert replacements: 4, Cache updates: 2, Reload time: 25.0 ms" in messages[2]
     )
@@ -139,6 +152,8 @@ def test_expert_cache_logging_is_weighted_per_interval_and_follows_spec(
     messages.clear()
     stat_logger.log()
     assert "GPU hit rate: 100.00% (1/1 routes), CPU routes: 0" in messages[-1]
+    assert "Tail-skipped expert computations: 0, Tail-skipped routes: 0" in messages[-1]
+    assert "N/A of 0 eligible CPU decode routes" in messages[-1]
     assert "Expert replacements: 0, Cache updates: 0" in messages[-1]
     messages.clear()
     stat_logger.log()

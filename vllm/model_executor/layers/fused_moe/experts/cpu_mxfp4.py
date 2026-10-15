@@ -33,8 +33,15 @@ class CPUMoEConfig:
     gpu_cache_static_experts: tuple[int, ...] | None = None
     gpu_cache_prefill: bool = False
     gpu_cache_dynamic: dict[str, Any] | None = None
+    route_tail_skip: int = 0
 
     def __post_init__(self):
+        if type(self.route_tail_skip) is not int or self.route_tail_skip < 0:
+            raise ValueError("route_tail_skip must be a nonnegative integer")
+        if self.route_tail_skip and (
+            self.backend != "ik" or not self.cuda_library_path
+        ):
+            raise ValueError("route_tail_skip requires IK CUDA callbacks")
         if self.backend not in ("kt", "llama", "ik"):
             raise ValueError(f"Unknown CPU MoE backend: {self.backend}")
         if self.start_layer < 0 or self.end_layer <= self.start_layer:
@@ -165,6 +172,9 @@ def _cuda_library(path: str):
     if hasattr(library, "dsv41_cuda_tasks_route_counts"):
         library.dsv41_cuda_tasks_route_counts.argtypes = [pointer, integer, pointer]
         library.dsv41_cuda_tasks_route_counts.restype = None
+    if hasattr(library, "dsv41_cuda_tasks_route_stats"):
+        library.dsv41_cuda_tasks_route_stats.argtypes = [pointer, integer, pointer]
+        library.dsv41_cuda_tasks_route_stats.restype = None
     if hasattr(library, "dsv41_cuda_task_stats"):
         library.dsv41_cuda_task_stats.argtypes = [pointer, pointer]
         library.dsv41_cuda_task_stats.restype = None
@@ -174,6 +184,11 @@ def _cuda_library(path: str):
     if hasattr(library, "dsv41_cuda_task_cached_routes"):
         library.dsv41_cuda_task_cached_routes.argtypes = [pointer]
         library.dsv41_cuda_task_cached_routes.restype = ctypes.c_uint64
+    if hasattr(library, "dsv41_cuda_task_set_tail_skip"):
+        library.dsv41_cuda_task_set_tail_skip.argtypes = [pointer, integer, integer]
+        library.dsv41_cuda_task_set_tail_skip.restype = integer
+        library.dsv41_cuda_task_tail_skipped_routes.argtypes = [pointer]
+        library.dsv41_cuda_task_tail_skipped_routes.restype = ctypes.c_uint64
     return library
 
 
@@ -230,6 +245,9 @@ class CPUMXFP4Experts:
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.top_k = top_k
+        self.route_tail_skip = config.route_tail_skip
+        if self.route_tail_skip >= top_k:
+            raise ValueError("route_tail_skip must be smaller than routed top-k")
         self.max_tokens = max_tokens
         self.swiglu_limit = swiglu_limit
         self._handle = None
@@ -240,6 +258,12 @@ class CPUMXFP4Experts:
             if config.cuda_library_path
             else None
         )
+        if self.route_tail_skip and (
+            self._cuda_library is None
+            or not hasattr(self._cuda_library, "dsv41_cuda_task_set_tail_skip")
+            or not hasattr(self._cuda_library, "dsv41_cuda_tasks_route_stats")
+        ):
+            raise RuntimeError("route_tail_skip requires an updated CUDA bridge")
         self._weights: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self._loaded: set[tuple[int, int]] = set()
         self._kt_moe: Any = None
@@ -589,12 +613,32 @@ class CPUMXFP4Experts:
         self._pool.sync()
         self._weights.clear()
 
-    def enqueue_cuda(self, tokens, hidden, ids, routes, output, stream):
+    def set_route_tail_skip(self, rank: int) -> None:
+        """Change the policy after all owning CUDA streams have completed."""
+        if type(rank) is not int or not 0 <= rank < self.top_k:
+            raise ValueError("route_tail_skip must be smaller than routed top-k")
+        if (
+            self._cuda_library is None
+            or not hasattr(self._cuda_library, "dsv41_cuda_task_set_tail_skip")
+            or not hasattr(self._cuda_library, "dsv41_cuda_tasks_route_stats")
+        ):
+            raise RuntimeError("route_tail_skip requires an updated CUDA bridge")
+        for key, task in self._cuda_tasks.items():
+            if self._cuda_library.dsv41_cuda_task_set_tail_skip(
+                task, rank if key[-1] else 0, self.num_experts
+            ):
+                raise RuntimeError("Cannot configure route_tail_skip")
+        self.route_tail_skip = rank
+
+    def enqueue_cuda(
+        self, tokens, hidden, ids, routes, output, stream, *, allow_tail_skip=False
+    ):
         assert self._cuda_library is not None
         self.prepare()
         pointers = tuple(tensor.data_ptr() for tensor in (hidden, ids, routes, output))
-        key = (tokens, *pointers)
-        if key not in self._cuda_tasks:
+        key = (tokens, *pointers, allow_tail_skip)
+        created = key not in self._cuda_tasks
+        if created:
             self._cuda_tasks[key] = self._cuda_library.dsv41_cuda_task_create(
                 self._handle,
                 ctypes.cast(self._library.dsv41_moe_forward, ctypes.c_void_p),
@@ -607,6 +651,15 @@ class CPUMXFP4Experts:
         if not self._cuda_tasks[key]:
             del self._cuda_tasks[key]
             raise RuntimeError("Cannot create CPU MoE CUDA host callback")
+        if created and allow_tail_skip and self.route_tail_skip:
+            if not hasattr(
+                self._cuda_library, "dsv41_cuda_task_set_tail_skip"
+            ) or not hasattr(self._cuda_library, "dsv41_cuda_tasks_route_stats"):
+                raise RuntimeError("route_tail_skip requires an updated CUDA bridge")
+            if self._cuda_library.dsv41_cuda_task_set_tail_skip(
+                self._cuda_tasks[key], self.route_tail_skip, self.num_experts
+            ):
+                raise RuntimeError("Cannot configure route_tail_skip")
         result = self._cuda_library.dsv41_cuda_task_enqueue(
             self._cuda_tasks[key], stream
         )
@@ -632,6 +685,22 @@ class CPUMXFP4Experts:
             return 0, 0
         return stats["cached_routes"], sum(stats["expert_counts"])
 
+    def cuda_route_stats(self) -> tuple[int, int, int, int, int]:
+        """Return cumulative route and tail-skip counts after stream completion."""
+        if not self._cuda_tasks:
+            return 0, 0, 0, 0, 0
+        if self._cuda_library is not None and hasattr(
+            self._cuda_library, "dsv41_cuda_tasks_route_stats"
+        ):
+            tasks = (ctypes.c_void_p * len(self._cuda_tasks))(
+                *self._cuda_tasks.values()
+            )
+            counts = (ctypes.c_uint64 * 5)()
+            self._cuda_library.dsv41_cuda_tasks_route_stats(tasks, len(tasks), counts)
+            return counts[0], counts[1], counts[2], counts[3], counts[4]
+        gpu_hits, cpu_routes = self.cuda_route_counts()
+        return gpu_hits, cpu_routes, 0, 0, 0
+
     def cuda_stats(self):
         if self._cuda_library is None or not hasattr(
             self._cuda_library, "dsv41_cuda_task_stats"
@@ -639,8 +708,13 @@ class CPUMXFP4Experts:
             return None
         total = [0] * 388
         cached_routes = 0
+        tail_skipped_routes = 0
         threads = []
         for task in self._cuda_tasks.values():
+            if hasattr(self._cuda_library, "dsv41_cuda_task_tail_skipped_routes"):
+                tail_skipped_routes += (
+                    self._cuda_library.dsv41_cuda_task_tail_skipped_routes(task)
+                )
             if hasattr(self._cuda_library, "dsv41_cuda_task_cached_routes"):
                 cached_routes += self._cuda_library.dsv41_cuda_task_cached_routes(task)
             values = (ctypes.c_uint64 * 388)()
@@ -657,12 +731,20 @@ class CPUMXFP4Experts:
                         "affinity_cpus": info[3],
                     }
                 )
+        skipped_experts = candidates = 0
+        if hasattr(self._cuda_library, "dsv41_cuda_tasks_route_stats"):
+            _, _, tail_skipped_routes, skipped_experts, candidates = (
+                self.cuda_route_stats()
+            )
         return {
             "calls": total[0],
             "tokens": total[1],
             "native_seconds": total[2] / 1e9,
             "untracked_routes": total[3],
             "cached_routes": cached_routes,
+            "tail_skipped_routes": tail_skipped_routes,
+            "tail_skipped_experts": skipped_experts,
+            "tail_candidate_routes": candidates,
             "expert_counts": total[4:],
             "callback_threads": threads,
         }

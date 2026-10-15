@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MPS ownership and post-KV expert allocation for hybrid serving."""
 
+import gc
 import os
 import random
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -20,7 +23,14 @@ from vllm.model_executor.layers.fused_moe.experts.cpu_mxfp4_numa import physical
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
 from .host_memory import check_host_headroom
-from .hybrid import GiB, hybrid_settings, plan_engram_cache, plan_expert_cache
+from .hybrid import (
+    GiB,
+    calibrated_expert_capacities,
+    expand_expert_cache,
+    hybrid_settings,
+    plan_engram_cache,
+    plan_expert_cache,
+)
 
 logger = init_logger(__name__)
 
@@ -251,11 +261,88 @@ def initialize_hybrid_cache(worker):
     settings = hybrid_settings(config)
     if settings is None:
         return
-    from .cpu_moe import CPUExpertModule
-    from .expert_cache import GPUExpertCache
-
     group = get_pp_group()
     runner = worker.model_runner
+    worker._hybrid_calibration_started = time.monotonic()
+    worker._hybrid_graph_calibration = (
+        worker.use_v2_model_runner
+        and not config.model_config.enforce_eager
+        and config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+    )
+    _zero_hybrid_profile_kv(worker)
+    if worker._hybrid_graph_calibration:
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        from .cache_budget import (
+            CacheBudgetProfile,
+            budget_fingerprint,
+            cached_expert_capacities,
+            fit_cached_plan,
+        )
+
+        memory = _hybrid_memory(worker)
+        worker._hybrid_cache_start = memory
+        kv_layouts: list[Any] = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            kv_layouts,
+            (
+                runner.kv_cache_config.num_blocks,
+                [tensor.size for tensor in runner.kv_cache_config.kv_cache_tensors],
+                len(current_workspace_manager().get_workspace_sizes()),
+            ),
+            group=group.cpu_group,
+        )
+        saved = None
+        worker._hybrid_budget_profile = None
+        if group.is_last_rank:
+            hf = config.model_config.hf_config
+            profile = CacheBudgetProfile(
+                budget_fingerprint(config, memory, kv_layouts),
+                [total for _, total, _ in memory],
+                hf.num_hidden_layers - 20,
+                hf.n_routed_experts,
+                [entry[2] for entry in kv_layouts],
+            )
+            worker._hybrid_budget_profile = profile
+            saved = profile.load()
+        entries: list[Any] = [None] * group.world_size
+        torch.distributed.all_gather_object(entries, saved, group=group.cpu_group)
+        saved = entries[-1]
+        worker._hybrid_cached_budget = saved
+        worker._hybrid_validated_headrooms = (
+            saved["headroom"] if saved is not None else None
+        )
+        if saved is not None:
+            hf = config.model_config.hf_config
+            expert_bytes = 3 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
+            capacities = cached_expert_capacities(
+                memory, saved, expert_bytes, config.cache_config.gpu_memory_utilization
+            )
+            plan = fit_cached_plan(saved["plan"], capacities, hf.n_routed_experts)
+            if plan is not None:
+                from vllm.v1.worker.workspace import current_workspace_manager
+
+                current_workspace_manager().reserve_workspace_sizes(
+                    saved["workspaces"][group.rank_in_group]
+                )
+                _initialize_hybrid_prefill_staging(worker)
+                worker._hybrid_cache_stats = [
+                    (0, free, 0, max(sizes, default=0))
+                    for (free, _, _), (_, sizes, _) in zip(memory, kv_layouts)
+                ]
+                worker._hybrid_cache_initial_slots = sum(count for _, count in plan)
+                logger.info(
+                    "Reusing hybrid expert cache startup budget: "
+                    "slots=%s; skipping full-context workspace profiling",
+                    [
+                        sum(n for d, n in plan if d == i)
+                        for i in range(group.world_size)
+                    ],
+                )
+                _allocate_hybrid_cache(worker, plan)
+                return
+            worker._hybrid_cached_budget = None
+    staging_bytes = _initialize_hybrid_prefill_staging(worker)
     torch.accelerator.synchronize()
     torch.accelerator.empty_cache()
     before = torch.accelerator.memory_allocated()
@@ -271,12 +358,11 @@ def initialize_hybrid_cache(worker):
         shapes.add((decode_tokens, runner.max_num_reqs))
     with torch.inference_mode():
         for tokens, requests in sorted(shapes, reverse=True):
-            runner._dummy_run(
+            _profile_hybrid_serving_step(
+                worker,
                 tokens,
-                num_reqs=requests,
-                context_len=config.model_config.max_model_len
-                - (tokens + requests - 1) // requests,
-                skip_eplb=True,
+                requests,
+                decode=tokens == decode_tokens and requests == runner.max_num_reqs,
             )
             torch.accelerator.synchronize()
             logger.info(
@@ -288,30 +374,6 @@ def initialize_hybrid_cache(worker):
     torch.accelerator.synchronize()
     transient = torch.accelerator.max_memory_allocated() - before
     torch.accelerator.empty_cache()
-    staging_bytes = 0
-    if not group.is_last_rank and runner.max_num_tokens >= 1024:
-        from vllm.v1.worker.gpu.pp_utils import PPSendStaging
-
-        model = runner.model.language_model.model
-        rows = runner.max_num_tokens
-        specs = {
-            "hidden_states": (
-                (rows, model.hc_mult, model.config.hidden_size),
-                config.model_config.dtype,
-            ),
-            "pre_mix": ((rows, model.hc_mult), torch.float32),
-        }
-        if (
-            model.pp_shared_kv is not None
-            and model.pp_shared_kv.plan.outgoing_source is not None
-        ):
-            specs.update(
-                shared_kv_rows=((rows, 584), torch.uint8),
-                shared_topk_indices=((rows, model.config.index_topk), torch.int32),
-            )
-        worker._pp_send_staging = PPSendStaging(specs, worker.device)
-        staging_bytes = worker._pp_send_staging.nbytes
-        logger.info("PP prefill send buffers: 2 slots, %.3f GiB", staging_bytes / GiB)
     free, total = torch.accelerator.get_memory_info()
     # KVCacheTensor entries are views of one shared backing allocation.
     kv_sizes = {tensor.size for tensor in runner.kv_cache_config.kv_cache_tensors}
@@ -322,7 +384,7 @@ def initialize_hybrid_cache(worker):
         graph_reserve = max(
             GiB, transient, getattr(worker, "cudagraph_memory_estimate", 0)
         )
-    reserve = GiB // 2 + graph_reserve
+    reserve = graph_reserve
     profiled = (
         getattr(worker, "available_kv_cache_memory_bytes", free)
         - kv_bytes
@@ -348,6 +410,80 @@ def initialize_hybrid_cache(worker):
     torch.distributed.all_gather_object(
         stats, (available, free, transient, kv_bytes), group=group.cpu_group
     )
+    worker._hybrid_cache_stats = stats
+    hf = config.model_config.hf_config
+    expert_bytes = 3 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
+    plan = plan_expert_cache(
+        [int(item[0] // expert_bytes) for item in stats],
+        hf.num_hidden_layers - 20,
+        hf.n_routed_experts,
+        group.world_size - 1,
+    )
+    worker._hybrid_cache_initial_slots = sum(count for _, count in plan)
+    if worker._hybrid_graph_calibration:
+        plan = [
+            (device, max(8, count // 16 * 8) if count else 0) for device, count in plan
+        ]
+    _allocate_hybrid_cache(worker, plan, probe=worker._hybrid_graph_calibration)
+    if not worker._hybrid_graph_calibration:
+        _log_hybrid_cache_plan(worker)
+
+
+def _zero_hybrid_profile_kv(worker):
+    """Give synthetic computed prefixes finite KV data before startup profiles."""
+    seen = set()
+    with torch.inference_mode():
+        for tensor in worker.model_runner.kv_caches:
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() in seen:
+                continue
+            seen.add(storage.data_ptr())
+            view = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+            view.set_(storage, 0, (storage.nbytes(),)).zero_()
+
+
+def _initialize_hybrid_prefill_staging(worker):
+    if get_pp_group().is_last_rank or worker.model_runner.max_num_tokens < 1024:
+        return 0
+    from vllm.v1.worker.gpu.pp_utils import PPSendStaging
+
+    runner = worker.model_runner
+    model = runner.model.language_model.model
+    specs = {
+        "hidden_states": (
+            (runner.max_num_tokens, model.hc_mult, model.config.hidden_size),
+            worker.vllm_config.model_config.dtype,
+        ),
+        "pre_mix": ((runner.max_num_tokens, model.hc_mult), torch.float32),
+    }
+    if (
+        model.pp_shared_kv is not None
+        and model.pp_shared_kv.plan.outgoing_source is not None
+    ):
+        specs.update(
+            shared_kv_rows=((runner.max_num_tokens, 584), torch.uint8),
+            shared_topk_indices=(
+                (runner.max_num_tokens, model.config.index_topk),
+                torch.int32,
+            ),
+        )
+    worker._pp_send_staging = PPSendStaging(specs, worker.device)
+    logger.info(
+        "PP prefill send buffers: 2 slots, %.3f GiB",
+        worker._pp_send_staging.nbytes / GiB,
+    )
+    return worker._pp_send_staging.nbytes
+
+
+def _allocate_hybrid_cache(worker, plan, *, probe=False):
+    from .cpu_moe import CPUExpertModule
+    from .expert_cache import GPUExpertCache
+
+    config = worker.vllm_config
+    settings = hybrid_settings(config)
+    group = get_pp_group()
+    runner = worker.model_runner
+    worker._hybrid_cache_plan = plan
     if group.is_last_rank:
         hf = config.model_config.hf_config
         modules = [
@@ -356,10 +492,6 @@ def initialize_hybrid_cache(worker):
             if isinstance(m, CPUExpertModule)
         ]
         expert_bytes = 3 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
-        capacities = [int(item[0] // expert_bytes) for item in stats]
-        plan = plan_expert_cache(
-            capacities, len(modules), hf.n_routed_experts, group.rank_in_group
-        )
         pools = {}
         if "adaptive_cache" in settings:
             from .cache_capacity import CapacityPolicy, SharedExpertPool
@@ -459,8 +591,8 @@ def initialize_hybrid_cache(worker):
             module.gpu_cache = cache
             module.use_prefill_cache = True
             logger.info(
-                "Automatic GPU expert cache: layer=%d device=%d slots=%d "
-                "bytes=%d host_lru=%d",
+                "%s GPU expert cache: layer=%d device=%d slots=%d bytes=%d host_lru=%d",
+                "Probe" if probe else "Calibrating",
                 layer,
                 device,
                 count,
@@ -469,7 +601,7 @@ def initialize_hybrid_cache(worker):
             )
         for device, pool in pools.items():
             logger.info(
-                "Adaptive expert capacity: device=%d slots=%d layers=%s",
+                "Calibrating adaptive expert capacity: device=%d slots=%d layers=%s",
                 device,
                 pool.capacity,
                 [cache.layer_idx for cache in pool.caches],
@@ -484,7 +616,8 @@ def initialize_hybrid_cache(worker):
             )
         total_experts = len(modules) * hf.n_routed_experts
         logger.info(
-            "GPU expert cache coverage=%.2f%% (%d/%d routed experts, %.3f GiB); "
+            "Calibrating GPU expert cache coverage=%.2f%% "
+            "(%d/%d routed experts, %.3f GiB); "
             "Hybrid GPU cache plan=%s, host LRU %.3f GiB; post-KV budgets=%s",
             100 * cached_experts / max(1, total_experts),
             cached_experts,
@@ -492,9 +625,593 @@ def initialize_hybrid_cache(worker):
             cached_experts * expert_bytes / (1 << 30),
             plan,
             lru_slots * len(modules) * expert_bytes / GiB,
-            stats,
+            worker._hybrid_cache_stats,
         )
     torch.distributed.barrier(group=group.cpu_group)
+
+
+def _log_hybrid_cache_plan(worker):
+    group = get_pp_group()
+    if not group.is_last_rank:
+        return
+    hf = worker.vllm_config.model_config.hf_config
+    expert_bytes = 3 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
+    plan = worker._hybrid_cache_plan
+    for layer, (device, count) in enumerate(plan, start=20):
+        logger.info(
+            "Automatic GPU expert cache: layer=%d device=%d slots=%d bytes=%d",
+            layer,
+            device,
+            count,
+            count * expert_bytes,
+        )
+    for device in range(group.world_size):
+        logger.info(
+            "Hybrid final expert capacity: device=%d slots=%d",
+            device,
+            sum(count for owner, count in plan if owner == device),
+        )
+    logger.info(
+        "Hybrid final GPU cache plan=%s, total=%d slots, "
+        "initial estimate=%d (%.3f GiB)",
+        plan,
+        sum(count for _, count in plan),
+        worker._hybrid_cache_initial_slots,
+        sum(count for _, count in plan) * expert_bytes / GiB,
+    )
+
+
+def _hybrid_memory(worker, *, reset_peak=False, empty_cache=True):
+    """Sample every allocator owner after all PP and remote GPU streams finish."""
+    group = get_pp_group()
+    devices = range(group.world_size) if group.is_last_rank else [group.rank_in_group]
+    for device in devices:
+        torch.accelerator.synchronize(device)
+    torch.distributed.barrier(group=group.cpu_group)
+    if empty_cache:
+        for device in devices:
+            with torch.accelerator.device_index(device):
+                torch.accelerator.empty_cache()
+    torch.distributed.barrier(group=group.cpu_group)
+    local = {}
+    for device in devices:
+        with torch.accelerator.device_index(device):
+            if reset_peak:
+                torch.accelerator.reset_peak_memory_stats()
+            free, total = torch.accelerator.get_memory_info()
+            allocated = torch.accelerator.memory_allocated()
+            peak = torch.accelerator.max_memory_allocated()
+            reserved = torch.accelerator.memory_reserved()
+            peak_reserved = torch.accelerator.max_memory_reserved()
+            initial_headroom = 0
+            if (
+                device == group.rank_in_group
+                and group.is_first_rank
+                and worker.model_runner.model_state.supports_mm_inputs
+            ):
+                initial_headroom = max(
+                    getattr(
+                        worker, "_hybrid_cache_stats", [(0, 0, 0, 0)] * group.world_size
+                    )[device][2],
+                    getattr(worker, "peak_activation_memory", 0)
+                    - getattr(worker, "cudagraph_memory_estimate", 0),
+                )
+            local[device] = (
+                free,
+                total,
+                allocated,
+                peak,
+                reserved,
+                peak_reserved,
+                initial_headroom,
+            )
+    samples: list[Any] = [None] * group.world_size
+    torch.distributed.all_gather_object(samples, local, group=group.cpu_group)
+    return _aggregate_hybrid_memory(samples)
+
+
+def _aggregate_hybrid_memory(samples):
+    memory = []
+    for device in range(len(samples)):
+        free, total, *_ = samples[device][device]
+        headroom = sum(
+            max(
+                0,
+                owner[device][3] - owner[device][2],
+                owner[device][6],
+            )
+            for owner in samples
+            if device in owner
+        )
+        memory.append((free, total, headroom))
+    return memory
+
+
+def _profile_hybrid_serving_step(worker, tokens, requests, *, decode=False):
+    """Exercise CED, sampler and PP buffers with normal scheduler inputs."""
+    from vllm import SamplingParams
+    from vllm.v1.core.sched.output import (
+        CachedRequestData,
+        NewRequestData,
+        SchedulerOutput,
+    )
+    from vllm.v1.kv_cache_interface import (
+        CircularBufferSpec,
+        KpoolTailSpec,
+        SlidingWindowSpec,
+        UniformTypeKVCacheSpecs,
+    )
+    from vllm.v1.worker.gpu.warmup import _warmup_block_counter
+
+    runner = worker.model_runner
+    config = worker.vllm_config
+    query = (tokens + requests - 1) // requests
+    if not config.cache_config.enable_prefix_caching:
+        runner._dummy_run(
+            tokens,
+            num_reqs=requests,
+            uniform_decode=decode,
+            context_len=config.model_config.max_model_len - query,
+            skip_eplb=True,
+        )
+        return
+    width = config.model_config.hf_config.sliding_window
+    seed_query = max(2 * width, runner.decode_query_len + 1) if decode else query
+    lookahead = max(config.num_lookahead_tokens, runner.decode_query_len * 2)
+    specs = [group.kv_cache_spec for group in runner.kv_cache_config.kv_cache_groups]
+    counter = _warmup_block_counter(runner)
+
+    def shared_count(context, spec):
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.first_spec
+        if isinstance(spec, (CircularBufferSpec, SlidingWindowSpec)):
+            return 0
+        return context // spec.block_size
+
+    def skipped_count(context, spec):
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.first_spec
+        if isinstance(spec, KpoolTailSpec):
+            return 0
+        if isinstance(spec, SlidingWindowSpec):
+            skipped = max(
+                0, context - spec.sliding_window + 1 - spec.extra_retained_tokens
+            )
+            return skipped // spec.block_size
+        return 0
+
+    def counts(context):
+        shared = [shared_count(context, spec) for spec in specs]
+        full = [counter(context + seed_query + lookahead, spec) for spec in specs]
+        return shared, [
+            n - prefix - skipped_count(context, spec)
+            for n, prefix, spec in zip(full, shared, specs)
+        ]
+
+    low, high = 0, max(0, runner.max_model_len - seed_query - lookahead) // width
+    while low < high:
+        middle = (low + high + 1) // 2
+        shared, unique = counts(middle * width)
+        if sum(shared) + requests * sum(unique) < runner.kv_cache_config.num_blocks:
+            low = middle
+        else:
+            high = middle - 1
+    limits: list[Any] = [None] * get_pp_group().world_size
+    torch.distributed.all_gather_object(limits, low, group=get_pp_group().cpu_group)
+    # Computed prefix hits are block-aligned and cannot supply a partial
+    # R128 encoder state to the first replay window.
+    context = min(limits) * width
+    shared, unique = counts(context)
+    skipped = [skipped_count(context, spec) for spec in specs]
+    next_block = 1
+
+    def blocks(count):
+        nonlocal next_block
+        values = list(range(next_block, next_block + count))
+        next_block += count
+        return values
+
+    prefix_blocks = [blocks(count) for count in shared]
+    vocab_size = config.model_config.get_vocab_size()
+    prompt = [i % vocab_size for i in range(context + seed_query)]
+    logger.info(
+        "Hybrid serving memory profile: requests=%d query=%d context=%d mode=%s",
+        requests,
+        query,
+        context,
+        "decode" if decode else "CED prefill",
+    )
+    ids = [f"_hybrid_memory_{i}" for i in range(requests)]
+    params = SamplingParams.for_sampler_warmup()
+    params.prompt_logprobs = None
+    output = SchedulerOutput.make_empty()
+    output.num_spec_tokens_to_schedule = runner.num_speculative_steps
+    output.num_common_prefix_blocks = shared
+    output.scheduled_new_reqs = [
+        NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=prompt,
+            prefill_token_ids=prompt,
+            mm_features=[],
+            sampling_params=params,
+            pooling_params=None,
+            block_ids=tuple(
+                [0] * nulls + prefix + blocks(count)
+                for nulls, prefix, count in zip(skipped, prefix_blocks, unique)
+            ),
+            num_computed_tokens=context,
+            lora_request=None,
+        )
+        for req_id in ids
+    ]
+    output.num_scheduled_tokens = {req_id: seed_query for req_id in ids}
+    output.total_num_scheduled_tokens = seed_query * requests
+    cleanup = SchedulerOutput.make_empty()
+    cleanup.finished_req_ids = set(ids)
+    adaptive = runner.adaptive_verification
+    runner.adaptive_verification = None
+    runner.kv_connector.set_disabled(True)
+    try:
+        worker.execute_model(output)
+        sampled = worker.sample_tokens(None)
+        if sampled is not None and hasattr(sampled, "get_output"):
+            sampled.get_output()
+        torch.accelerator.synchronize()
+        get_pp_group().barrier()
+        if decode:
+            cached = CachedRequestData.make_empty()
+            cached.req_ids = ids
+            cached.num_computed_tokens = [context + seed_query] * requests
+            cached.num_output_tokens = [1] * requests
+            cached.new_block_ids = [None] * requests
+            output = SchedulerOutput.make_empty()
+            output.scheduled_cached_reqs = cached
+            output.num_spec_tokens_to_schedule = runner.num_speculative_steps
+            output.num_common_prefix_blocks = shared
+            output.num_scheduled_tokens = {req_id: query for req_id in ids}
+            output.total_num_scheduled_tokens = query * requests
+            if runner.num_speculative_steps:
+                output.scheduled_spec_decode_tokens = {
+                    req_id: [0] * (query - 1) for req_id in ids
+                }
+            worker.execute_model(output)
+            sampled = worker.sample_tokens(None)
+            if sampled is not None and hasattr(sampled, "get_output"):
+                sampled.get_output()
+            torch.accelerator.synchronize()
+            get_pp_group().barrier()
+    finally:
+        worker.execute_model(cleanup)
+        runner.kv_connector.set_disabled(False)
+        runner.adaptive_verification = adaptive
+
+
+def _profile_hybrid_runtime_memory(worker, *, decode_only=False):
+    runner = worker.model_runner
+    config = worker.vllm_config
+    baseline = _hybrid_memory(worker, reset_peak=True)
+    group = get_pp_group()
+    minimum = [free for free, _, _ in baseline]
+    phase_minima: dict[tuple[int, int, bool], list[int]] = {}
+    active_phase: list[tuple[int, int, bool] | None] = [None]
+    finished = threading.Event()
+    errors = []
+
+    def sample():
+        try:
+            while not finished.is_set():
+                for device in range(group.world_size):
+                    free = torch.accelerator.get_memory_info(device)[0]
+                    minimum[device] = min(minimum[device], free)
+                    phase = active_phase[0]
+                    if phase is not None:
+                        phase_minima[phase][device] = min(
+                            phase_minima[phase][device], free
+                        )
+                finished.wait(0.002)
+        except Exception as error:
+            errors.append(error)
+
+    monitor = None
+    if group.is_last_rank:
+        monitor = threading.Thread(target=sample, daemon=True)
+        monitor.start()
+    torch.distributed.barrier(group=group.cpu_group)
+    tokens = min(runner.max_num_tokens, config.model_config.max_model_len)
+    shapes = {(tokens, 1), (tokens, min(tokens, runner.max_num_reqs))}
+    decode_tokens = runner.max_num_reqs * runner.decode_query_len
+    if decode_tokens <= tokens:
+        shapes.add((decode_tokens, runner.max_num_reqs))
+    if decode_only:
+        shapes = {(min(tokens, decode_tokens), min(tokens, runner.max_num_reqs))}
+    try:
+        with torch.inference_mode():
+            for tokens, requests in sorted(shapes, reverse=True):
+                decode = tokens == decode_tokens and requests == runner.max_num_reqs
+                phase = (tokens, requests, decode)
+                phase_minima[phase] = [total for _, total, _ in baseline]
+                active_phase[0] = phase
+                _profile_hybrid_serving_step(
+                    worker,
+                    tokens,
+                    requests,
+                    decode=decode,
+                )
+                if group.is_last_rank:
+                    for device in range(group.world_size):
+                        free = torch.accelerator.get_memory_info(device)[0]
+                        minimum[device] = min(minimum[device], free)
+                        phase_minima[phase][device] = min(
+                            phase_minima[phase][device], free
+                        )
+        retained = _hybrid_memory(worker, empty_cache=False)
+        if group.is_last_rank:
+            minimum = [min(low, row[0]) for low, row in zip(minimum, retained)]
+    finally:
+        finished.set()
+        if monitor is not None:
+            monitor.join()
+    if errors:
+        raise RuntimeError("Cannot sample hybrid physical memory") from errors[0]
+    minima: list[Any] = [None] * group.world_size
+    torch.distributed.all_gather_object(
+        minima, (minimum, phase_minima), group=group.cpu_group
+    )
+    minimum, phase_minima = minima[-1]
+    memory = _hybrid_memory(worker)
+    observations: list[dict[str, Any]] = []
+    for (tokens, requests, decode), free_min in phase_minima.items():
+        observations.append(
+            {
+                "tokens": tokens,
+                "requests": requests,
+                "decode": decode,
+                "minimum_free": free_min,
+                "physical_headroom": [
+                    max(0, free - low) for (free, _, _), low in zip(memory, free_min)
+                ],
+            }
+        )
+    worker._hybrid_runtime_observations = observations
+    prefill = [row for row in observations if not row["decode"]]
+    worker._hybrid_prefill_headroom = [
+        max(floor, max(row["physical_headroom"][device] for row in prefill))
+        if prefill
+        else 0
+        for device, (_, _, floor) in enumerate(memory)
+    ]
+    result = []
+    for device, (free, total, floor) in enumerate(memory):
+        physical = max(0, free - minimum[device])
+        result.append((free, total, max(floor, physical)))
+        if device == group.rank_in_group:
+            logger.info(
+                "Hybrid runtime physical peak: device=%d headroom=%.3f GiB, "
+                "allocation floor=%.3f GiB, profile=%s",
+                device,
+                physical / GiB,
+                floor / GiB,
+                "decode check" if decode_only else "full context",
+            )
+    return result
+
+
+def _clear_hybrid_graphs_and_cache(worker):
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    from vllm.v1.worker.workspace import unlock_workspace
+
+    _hybrid_memory(worker)
+    runner = worker.model_runner
+    CUDAGraphWrapper.clear_all_graphs()
+    BreakableCUDAGraphWrapper.clear_all_graphs()
+    manager = runner.cudagraph_manager
+    manager.graphs.clear()
+    manager._graphs_captured = False
+    manager.hidden_states = None
+    manager.aux_hidden_states.clear()
+    manager.intermediate_tensors = None
+    manager.breakable_cg_runner = None
+    if runner.model_state.supports_mm_inputs:
+        runner.model_state.encoder_runner.clear()
+    if runner.speculator is not None:
+        speculator = runner.speculator
+        speculator.query_cudagraph_manager = None
+        speculator._draft_managers.clear()
+        speculator.hidden_states = None
+        speculator.init_cudagraph_manager(
+            worker.vllm_config.compilation_config.cudagraph_mode
+        )
+    runner.model_state.hybrid_capacity_pools = ()
+    for module in runner.model_state.cpu_expert_modules:
+        module.gpu_cache = None
+        module.use_prefill_cache = False
+    gc.collect()
+    unlock_workspace()
+    _hybrid_memory(worker)
+
+
+def _save_hybrid_budget(worker, memory):
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    group = get_pp_group()
+    sizes: list[Any] = [None] * group.world_size
+    torch.distributed.all_gather_object(
+        sizes, current_workspace_manager().get_workspace_sizes(), group=group.cpu_group
+    )
+    if not group.is_last_rank:
+        return
+    profile = worker._hybrid_budget_profile
+    hf = worker.vllm_config.model_config.hf_config
+    expert_bytes = 3 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
+    growth = [
+        max(
+            0,
+            start[0]
+            - free
+            - sum(
+                count for owner, count in worker._hybrid_cache_plan if owner == device
+            )
+            * expert_bytes,
+        )
+        for device, (start, (free, _, _)) in enumerate(
+            zip(worker._hybrid_cache_start, memory)
+        )
+    ]
+    payload = {
+        "version": 2,
+        "fingerprint": profile.fingerprint,
+        "growth": growth,
+        "headroom": [row[2] for row in memory],
+        "prefill_headroom": worker._hybrid_prefill_headroom,
+        "capture_free": [row[0] for row in memory],
+        "plan": worker._hybrid_cache_plan,
+        "workspaces": sizes,
+        "observations": getattr(worker, "_hybrid_runtime_observations", []),
+    }
+    profile.save(payload)
+    worker._hybrid_budget_payload = payload
+
+
+def capture_hybrid_graphs(worker):
+    """Calibrate per-device cache budgets against complete Graph captures."""
+    runner = worker.model_runner
+    if not getattr(worker, "_hybrid_graph_calibration", False):
+        return runner.capture_model()
+    from vllm.compilation.counter import compilation_counter
+
+    from .hybrid import minimum_cache_reserve
+
+    group = get_pp_group()
+    config = worker.vllm_config
+    hf = config.model_config.hf_config
+    expert_bytes = 3 * hf.hidden_size * hf.moe_intermediate_size * 17 // 32
+    utilization = config.cache_config.gpu_memory_utilization
+    counters = (
+        compilation_counter.num_cudagraph_captured,
+        compilation_counter.num_gpu_runner_capture_triggers,
+    )
+    fit_limits = [None] * group.world_size
+    saved = worker._hybrid_cached_budget
+    validated_headrooms = worker._hybrid_validated_headrooms
+    verified_plan = None
+    verified_headrooms = None
+    for attempt in range(5):
+        before = _hybrid_memory(worker)
+        graph_bytes = runner.capture_model()
+        captured = _hybrid_memory(worker)
+        reuse_prefill = saved is not None and worker._hybrid_cache_plan == [
+            tuple(entry) for entry in saved["plan"]
+        ]
+        memory = _profile_hybrid_runtime_memory(worker, decode_only=reuse_prefill)
+        if reuse_prefill:
+            worker._hybrid_prefill_headroom = saved["prefill_headroom"]
+        if validated_headrooms is not None:
+            memory = [
+                (free, total, max(peak, validated))
+                for (free, total, peak), validated in zip(memory, validated_headrooms)
+            ]
+        if saved is not None and any(
+            free - peak < minimum_cache_reserve(total, utilization)
+            for free, total, peak in memory
+        ):
+            logger.info(
+                "Reused expert budget failed the Graph memory check; "
+                "profiling full context"
+            )
+            assert validated_headrooms is not None
+            if reuse_prefill:
+                memory = _profile_hybrid_runtime_memory(worker)
+                memory = [
+                    (free, total, max(peak, validated))
+                    for (free, total, peak), validated in zip(
+                        memory, validated_headrooms
+                    )
+                ]
+            saved = None
+        plan = worker._hybrid_cache_plan
+        measured = calibrated_expert_capacities(memory, plan, expert_bytes, utilization)
+        safe = True
+        for device, (free, total, headroom) in enumerate(memory):
+            slots = sum(count for owner, count in plan if owner == device)
+            planned = int(total * (1 - utilization)) + headroom
+            required = minimum_cache_reserve(total, utilization) + headroom
+            safe &= free >= required
+            if free < required:
+                limit = max(0, slots - 8)
+                fit_limits[device] = (
+                    min(fit_limits[device], limit)
+                    if fit_limits[device] is not None
+                    else limit
+                )
+            if device == group.rank_in_group:
+                logger.info(
+                    "Hybrid Graph calibration: pass=%d/5 device=%d capture growth=%.3f "
+                    "GiB, free=%.3f GiB, runtime headroom=%.3f GiB, "
+                    "planned free=%.3f GiB, required free=%.3f GiB "
+                    "(40%% reserve tolerance), slots=%d capacity=%d, reused=%s",
+                    attempt + 1,
+                    device,
+                    (before[device][0] - captured[device][0]) / GiB,
+                    free / GiB,
+                    headroom / GiB,
+                    planned / GiB,
+                    required / GiB,
+                    slots,
+                    measured[device],
+                    saved is not None,
+                )
+        if safe:
+            verified_plan = list(plan)
+            verified_headrooms = [row[2] for row in memory]
+        capacities = [
+            min(capacity, limit) if limit is not None else capacity
+            for capacity, limit in zip(measured, fit_limits)
+        ]
+        next_plan = (
+            expand_expert_cache(plan, capacities, hf.n_routed_experts)
+            if safe and (attempt or saved is not None)
+            else plan_expert_cache(
+                capacities,
+                len(plan),
+                hf.n_routed_experts,
+                group.world_size - 1,
+            )
+        )
+        if safe and (next_plan == plan or attempt >= 3):
+            if next_plan != plan:
+                logger.warning(
+                    "Hybrid cache calibration reached its capture limit; "
+                    "keeping the verified safe plan"
+                )
+            _save_hybrid_budget(worker, memory)
+            _log_hybrid_cache_plan(worker)
+            logger.info(
+                "Hybrid cache startup finished: captures=%d elapsed=%.2f seconds, "
+                "reused=%s",
+                attempt + 1,
+                time.monotonic() - worker._hybrid_calibration_started,
+                saved is not None,
+            )
+            return graph_bytes
+        if attempt >= 3:
+            if attempt == 3 and verified_plan is not None:
+                logger.warning(
+                    "Final expert cache expansion exceeded the memory budget; "
+                    "restoring and rechecking the last verified layout"
+                )
+                next_plan = verified_plan
+                validated_headrooms = verified_headrooms
+                saved = None
+            else:
+                raise RuntimeError(
+                    "Hybrid Graph cache calibration could not preserve runtime headroom"
+                )
+        _clear_hybrid_graphs_and_cache(worker)
+        compilation_counter.num_cudagraph_captured = counters[0]
+        compilation_counter.num_gpu_runner_capture_triggers = counters[1]
+        _allocate_hybrid_cache(worker, next_plan)
+    raise AssertionError("Unreachable hybrid cache calibration state")
 
 
 def warmup_hybrid_input_kernels(worker):
@@ -523,6 +1240,22 @@ def activate_hybrid_cache(worker):
     """Begin request learning only after kernel warmup and graph capture."""
     if hybrid_settings(worker.vllm_config) is None:
         return
+    if get_pp_group().is_last_rank and getattr(worker, "_hybrid_budget_payload", None):
+        from .cache_budget import RuntimeBudgetObserver
+
+        try:
+            worker.model_runner.model_state.hybrid_budget_observer = (
+                RuntimeBudgetObserver(
+                    worker._hybrid_budget_profile,
+                    worker._hybrid_budget_payload,
+                    [
+                        torch.cuda.get_device_properties(device).uuid
+                        for device in range(get_pp_group().world_size)
+                    ],
+                )
+            )
+        except Exception as error:
+            logger.warning("Cannot track expert cache serving peaks: %s", error)
     from .cpu_moe import CPUExpertModule
 
     torch.accelerator.synchronize()

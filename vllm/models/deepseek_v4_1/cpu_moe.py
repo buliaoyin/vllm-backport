@@ -69,12 +69,21 @@ def cpu_moe_config(vllm_config: VllmConfig, layer: int) -> CPUMoEConfig | None:
         raise ValueError("CPU MoE does not support EPLB or overlapping microbatches")
     if getattr(hf, "expert_dtype", "fp4") != "fp4":
         raise ValueError("CPU MoE requires native MXFP4 expert weights")
+    if config.route_tail_skip and config.route_tail_skip >= hf.num_experts_per_tok:
+        raise ValueError("route_tail_skip must be smaller than routed top-k")
     compilation = vllm_config.compilation_config
+    if (
+        config.route_tail_skip
+        and compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+    ):
+        raise ValueError("route_tail_skip requires FULL_DECODE_ONLY graphs")
     full_callbacks = (
         config.cuda_library_path is not None
         and compilation.cudagraph_mode.has_full_cudagraphs()
         and max_callback_tokens(vllm_config) <= 128
     )
+    if config.route_tail_skip and not full_callbacks:
+        raise ValueError("route_tail_skip decode callbacks are limited to 128 tokens")
     if compilation.cudagraph_mode != CUDAGraphMode.NONE and not (
         full_callbacks
         or (
@@ -156,6 +165,15 @@ class CPUExpertModule(nn.Module):
             hf.hidden_size,
             hf.moe_intermediate_size,
         )
+        if config.route_tail_skip:
+            logger.info_once(
+                "CPU expert tail skipping: keep top %d, scope=decode batch, "
+                "max requests=%d. Skipped contributions are zero without "
+                "renormalization; decisions depend on co-batched requests.",
+                config.route_tail_skip,
+                vllm_config.scheduler_config.max_num_seqs,
+                scope="process",
+            )
 
     def load_weight(
         self, expert: int, projection: int, kind: str, weight: torch.Tensor
@@ -221,10 +239,15 @@ class CPUExpertModule(nn.Module):
 
     def take_cache_stats(self) -> ExpertCacheStats:
         """Collect deltas after the existing postprocess stream synchronization."""
-        gpu_hits, cpu_misses = self.backend.cuda_route_counts()
+        gpu_hits, cpu_misses, skipped_routes, skipped_experts, candidates = (
+            self.backend.cuda_route_stats()
+        )
         stats = ExpertCacheStats(
             gpu_hits=gpu_hits + self._eager_gpu_hits,
             cpu_misses=cpu_misses + self._eager_cpu_misses,
+            tail_skipped_routes=skipped_routes,
+            tail_skipped_experts=skipped_experts,
+            tail_candidate_routes=candidates,
         )
         if self.gpu_cache is not None:
             cache = self.gpu_cache
@@ -255,6 +278,10 @@ class CPUExpertModule(nn.Module):
             routes_cpu,
             output_cpu,
             torch.cuda.current_stream().cuda_stream,
+            allow_tail_skip=(
+                get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+                or torch.cuda.is_current_stream_capturing()
+            ),
         )
         return (
             output_cpu[:tokens]

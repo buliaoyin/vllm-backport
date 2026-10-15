@@ -3184,7 +3184,7 @@ def test_dsv41_adaptive_capacity_rejects_invalid_policy(value):
 
 @pytest.mark.parametrize(
     "settings",
-    [{"expert_profile_interval": 8}, {"expert_profile": False}],
+    [{"expert_profile_interval": 8}, {"expert_profile": False}, {"route_tail_skip": 6}],
 )
 def test_dsv41_expert_profile_allows_default_path_interval_and_disable(
     monkeypatch, settings
@@ -3215,6 +3215,39 @@ def test_dsv41_expert_profile_rejects_invalid_paths_and_intervals(settings):
     args = EngineArgs(additional_config={"deepseek_v41_hybrid": settings})
     with pytest.raises(ValueError, match="expert_profile"):
         apply_hybrid_defaults(args)
+
+
+@pytest.mark.parametrize("rank", [-1, 8, True, 1.5])
+def test_dsv41_route_tail_skip_rejects_invalid_rank(rank):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1.hybrid import apply_hybrid_defaults
+
+    args = EngineArgs(
+        additional_config={"deepseek_v41_hybrid": {"route_tail_skip": rank}}
+    )
+    with pytest.raises(ValueError, match="route_tail_skip"):
+        apply_hybrid_defaults(args)
+
+
+@pytest.mark.parametrize("requests", [1, 2, 8])
+def test_dsv41_route_tail_skip_accepts_batch_conservative_policy(monkeypatch, requests):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.deepseek_v4_1 import hybrid
+
+    monkeypatch.setattr(hybrid, "native_libraries", lambda: [Path("ik"), Path("cuda")])
+    args = EngineArgs(
+        max_num_seqs=requests,
+        pipeline_parallel_size=3,
+        additional_config={
+            "deepseek_v41_hybrid": {
+                "pipeline_layers": [7, 8, 25],
+                "route_tail_skip": 4,
+            }
+        },
+    )
+    hybrid.apply_hybrid_defaults(args)
+    assert args.max_num_seqs == requests
+    assert args.additional_config["cpu_moe"]["route_tail_skip"] == 4
 
 
 @pytest.mark.parametrize("option", ["overlap_decode", "r8_refill"])

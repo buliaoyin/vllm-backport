@@ -69,6 +69,23 @@ CUDA_VISIBLE_DEVICES=0,1,2 NCCL_P2P_DISABLE=1 \
 节点的线程数。首次检查启动时，可先将 `--max-model-len` 降为 `32768`、
 `--kv-cache-tokens` 降为 `131072`，再按负载增加预算。
 
+可选跳过 CPU 尾部专家计算，将上例的 `--additional-config` 替换为：
+
+```bash
+--additional-config '{"deepseek_v41_hybrid":{"pipeline_layers":[7,8,25],"cpu_threads":[24,24],"route_tail_skip":4}}'
+```
+
+`route_tail_skip=4` 表示保留当前 Top-6 路由中的前四名，跳过排名靠后且未命中
+GPU 缓存的 CPU 专家。采用整批保守裁剪：只要任意 token 将某专家排入前四名，
+就保留该专家在本批次中的全部路由；GPU 缓存命中始终计算。支持多并发，
+仅作用于完整 decode Graph。参数默认 `0`（关闭），设为 `5` 时保留前五名。
+
+开启 `route_tail_skip=4` 后，此前三张 170HX、RAM Engram、单请求 Python 负载
+实测 **decode 提速约 30%（32.09%）**；中英文与 Python 三类任务综合提升
+**23.60%**。收益随负载、缓存命中和并发变化。跳过的专家贡献置零，属于有损加速，
+可能改变生成内容和 DSpark 采纳率。机制和测量范围见
+[专家尾部跳过说明](docs/features/deepseek_v41_expert_cache.md#可选的解码专家尾部跳过)。
+
 重复长前缀、多轮对话可在上例增加 `--enable-prefix-caching`（混合模式默认关闭）。
 命中后仍至少重算最后 **128 token**，按 KV 块边界对齐，以重建 CED 尾回放和
 草稿上下文；日志中的 `Prefix cache hit rate` 反映前缀复用，与专家缓存命中率独立。

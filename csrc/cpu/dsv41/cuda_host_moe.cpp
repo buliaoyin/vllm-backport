@@ -10,11 +10,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace {
 using Forward = int (*)(void*, int, const float*, const int32_t*, const float*,
@@ -37,6 +39,41 @@ struct Task {
   std::array<uint64_t, 388> stats{};
   std::array<uint64_t, 4> thread_info{};
   uint64_t cached_routes = 0;
+  uint64_t tail_skipped_routes = 0;
+  uint64_t tail_skipped_experts = 0;
+  uint64_t tail_candidate_routes = 0;
+  int tail_skip_rank = 0;
+  std::vector<int32_t> filtered_ids;
+  std::vector<int> best_rank;
+
+  const int32_t* filter_tail(int actual) {
+    if (!tail_skip_rank) return ids;
+    const int entries = actual * topk;
+    for (int i = 0; i < entries; ++i)
+      if (!std::isfinite(routes[i])) return ids;
+    std::fill(best_rank.begin(), best_rank.end(), topk);
+    for (int t = 0; t < actual; ++t) {
+      for (int j = 0; j < topk; ++j) {
+        const int i = t * topk + j;
+        const int expert = ids[i];
+        if (expert < 0 || size_t(expert) >= best_rank.size()) continue;
+        int rank = 0;
+        for (int q = 0; q < topk; ++q) {
+          const float other = routes[t * topk + q];
+          rank += other > routes[i] || (other == routes[i] && q < j);
+        }
+        best_rank[expert] = std::min(best_rank[expert], rank);
+      }
+    }
+    std::copy_n(ids, entries, filtered_ids.begin());
+    for (int i = 0; i < entries; ++i) {
+      const int expert = ids[i];
+      if (expert >= 0 && size_t(expert) < best_rank.size() &&
+          best_rank[expert] >= tail_skip_rank)
+        filtered_ids[i] = -2;
+    }
+    return filtered_ids.data();
+  }
 
   void fail(const char* message_) {
     std::snprintf(message, sizeof(message), "%s", message_);
@@ -73,8 +110,9 @@ void CUDART_CB run(void* ptr) {
       }
       task.thread_info[1] = tid;
       const auto start = std::chrono::steady_clock::now();
-      const int status = task.forward(task.moe, actual, task.input, task.ids,
-                                      task.routes, task.output);
+      const auto* filtered_ids = task.filter_tail(actual);
+      const int status = task.forward(task.moe, actual, task.input,
+                                      filtered_ids, task.routes, task.output);
       task.stats[0] += 1;
       task.stats[1] += actual;
       task.stats[2] += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -83,9 +121,18 @@ void CUDART_CB run(void* ptr) {
       if (status) {
         task.fail(task.error());
       } else {
+        if (filtered_ids != task.ids) {
+          task.tail_skipped_experts += std::count_if(
+              task.best_rank.begin(), task.best_rank.end(), [&](int rank) {
+                return rank >= task.tail_skip_rank && rank < task.topk;
+              });
+        }
         for (int i = 0; i < actual * task.topk; ++i) {
           const int expert = task.ids[i];
-          if (expert >= 0 && expert < 384)
+          if (task.tail_skip_rank && expert >= 0) ++task.tail_candidate_routes;
+          if (expert >= 0 && filtered_ids[i] == -2)
+            ++task.tail_skipped_routes;
+          else if (expert >= 0 && expert < 384)
             ++task.stats[4 + expert];
           else if (expert == -2)
             ++task.cached_routes;
@@ -126,6 +173,18 @@ void* dsv41_cuda_task_create(void* moe, void* forward, void* error, int tokens,
   return task.release();
 }
 
+// The owner must complete its stream before changing a captured task's policy.
+int dsv41_cuda_task_set_tail_skip(void* handle, int rank, int num_experts) {
+  auto& task = *static_cast<Task*>(handle);
+  if (rank < 0 || rank >= task.topk || num_experts < 1) return 1;
+  task.tail_skip_rank = rank;
+  if (rank) {
+    task.filtered_ids.resize(size_t(task.tokens) * task.topk);
+    task.best_rank.resize(num_experts);
+  }
+  return 0;
+}
+
 int dsv41_cuda_task_enqueue(void* handle, void* stream) {
   return cudaLaunchHostFunc(static_cast<cudaStream_t>(stream), run, handle);
 }
@@ -145,6 +204,10 @@ uint64_t dsv41_cuda_task_cached_routes(void* handle) {
   return static_cast<Task*>(handle)->cached_routes;
 }
 
+uint64_t dsv41_cuda_task_tail_skipped_routes(void* handle) {
+  return static_cast<Task*>(handle)->tail_skipped_routes;
+}
+
 // Like task_stats, read only after the owning stream has completed its work.
 void dsv41_cuda_tasks_route_counts(void* const* handles, int count,
                                    uint64_t* output) {
@@ -155,6 +218,20 @@ void dsv41_cuda_tasks_route_counts(void* const* handles, int count,
     for (size_t expert = 4; expert < task.stats.size(); ++expert) {
       output[1] += task.stats[expert];
     }
+  }
+}
+
+// GPU routes, CPU routes, skipped routes, skipped expert computations, eligible
+// CPU decode routes. The owner must finish its CUDA work before reading.
+void dsv41_cuda_tasks_route_stats(void* const* handles, int count,
+                                  uint64_t* output) {
+  dsv41_cuda_tasks_route_counts(handles, count, output);
+  output[2] = output[3] = output[4] = 0;
+  for (int i = 0; i < count; ++i) {
+    const auto& task = *static_cast<Task*>(handles[i]);
+    output[2] += task.tail_skipped_routes;
+    output[3] += task.tail_skipped_experts;
+    output[4] += task.tail_candidate_routes;
   }
 }
 

@@ -456,6 +456,7 @@ class Worker(WorkerBase):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            from vllm.models.deepseek_v4_1.hybrid import hybrid_settings
             from vllm.models.deepseek_v4_1.hybrid_runtime import (
                 initialize_hybrid_devices,
                 preserve_hybrid_cpu_affinity,
@@ -484,7 +485,23 @@ class Worker(WorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            is_hybrid = hybrid_settings(self.vllm_config) is not None
+            self.requested_memory = request_memory(
+                init_snapshot,
+                self.cache_config,
+                account_for_initial_usage=is_hybrid,
+            )
+            if is_hybrid:
+                initial_usage = init_snapshot.total_memory - init_snapshot.free_memory
+                logger.info(
+                    "Hybrid startup memory budget: total=%.3f GiB, "
+                    "initial occupancy=%.3f GiB, remaining=%.3f GiB, "
+                    "reserved=%.3f GiB",
+                    (self.requested_memory + initial_usage) / GiB_bytes,
+                    initial_usage / GiB_bytes,
+                    self.requested_memory / GiB_bytes,
+                    (init_snapshot.free_memory - self.requested_memory) / GiB_bytes,
+                )
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
@@ -817,6 +834,7 @@ class Worker(WorkerBase):
         from vllm.models.deepseek_v4_1.hybrid import hybrid_settings
         from vllm.models.deepseek_v4_1.hybrid_runtime import (
             activate_hybrid_cache,
+            capture_hybrid_graphs,
             initialize_hybrid_cache,
             warmup_hybrid_input_kernels,
         )
@@ -888,7 +906,7 @@ class Worker(WorkerBase):
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            cuda_graph_memory_bytes = capture_hybrid_graphs(self)
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (

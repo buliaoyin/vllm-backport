@@ -559,14 +559,35 @@ def sanity_check_mm_encoder_outputs(
     )
 
 
-def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> int:
+def request_memory(
+    init_snapshot: MemorySnapshot,
+    cache_config: CacheConfig,
+    *,
+    account_for_initial_usage: bool = False,
+) -> int:
     """
     Calculate the amount of memory required by vLLM, then validate
     that the current amount of free memory is sufficient for that.
+
+    When accounting for initial usage, return only the remaining budget.
+    All device occupancy at the snapshot is charged once, including remote
+    workers' CUDA contexts and any existing external allocations.
     """
     requested_memory = math.ceil(
         init_snapshot.total_memory * cache_config.gpu_memory_utilization
     )
+
+    if account_for_initial_usage:
+        initial_usage = init_snapshot.total_memory - init_snapshot.free_memory
+        requested_memory -= initial_usage
+        if requested_memory <= 0:
+            raise ValueError(
+                f"Startup memory usage on device {init_snapshot.device_} "
+                f"({format_gib(initial_usage)} GiB) leaves no memory for the "
+                "model within the desired GPU memory utilization "
+                f"({cache_config.gpu_memory_utilization}). Decrease startup "
+                "memory usage or reduce GPU memory used by other processes."
+            )
 
     if init_snapshot.free_memory < requested_memory:
         raise ValueError(
