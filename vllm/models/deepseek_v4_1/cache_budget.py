@@ -26,8 +26,44 @@ def budget_fingerprint(config, memory, kv_sizes):
     normalized = copy.copy(config)
     normalized.additional_config = copy.deepcopy(config.additional_config)
     settings = normalized.additional_config["deepseek_v41_hybrid"]
-    for key in ("expert_profile", "expert_profile_interval"):
+    for key in (
+        "expert_profile",
+        "expert_profile_interval",
+        "route_tail_skip",
+        "cpu_threads",
+        "host_cache_gib",
+        "engram_cache_gib",
+    ):
         settings.pop(key, None)
+    cpu_moe = normalized.additional_config.get("cpu_moe", {})
+    for key in ("route_tail_skip", "num_threads"):
+        cpu_moe.pop(key, None)
+    normalized.additional_config.pop("cpu_phase_threads", None)
+    adaptive = settings.get("adaptive_cache")
+    if adaptive is True:
+        adaptive = settings["adaptive_cache"] = {}
+    elif adaptive is False:
+        settings.pop("adaptive_cache")
+    if isinstance(adaptive, dict):
+        for key in (
+            "interval",
+            "max_swaps",
+            "decay",
+            "resize",
+            "capacity_only",
+            "history",
+            "online",
+            "horizon",
+            "safety_factor",
+        ):
+            adaptive.pop(key, None)
+        adaptive.setdefault("min_experts", 8)
+    normalized.cache_config = copy.copy(config.cache_config)
+    if (
+        normalized.cache_config.kv_offloading_backend == "native"
+        and normalized.cache_config.kv_offloading_size
+    ):
+        normalized.cache_config.kv_offloading_size = 1.0
     root = Path(__file__).parents[2]
     paths = [
         *Path(__file__).parent.glob("*.py"),
@@ -67,7 +103,9 @@ def budget_fingerprint(config, memory, kv_sizes):
         "native": native,
         "allocator": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
         "allocator_config": os.environ.get("PYTORCH_ALLOC_CONF"),
-        "utilization": config.cache_config.gpu_memory_utilization,
+        "prefix_caching": config.cache_config.enable_prefix_caching,
+        "decode_query_len": config.uniform_decode_query_len,
+        "lookahead_tokens": config.num_lookahead_tokens,
         "max_model_len": config.model_config.max_model_len,
         "max_num_seqs": config.scheduler_config.max_num_seqs,
         "max_num_batched_tokens": config.scheduler_config.max_num_batched_tokens,

@@ -42,6 +42,24 @@ GPU 常驻热点专家，其余路由由 CPU 处理。缓存根据 verification-
 `libdsv41_ik`，已有混合推理的构建要求见
 [构建说明](../contributing/deepseek_v41_build.md)。
 
+## CPU KV 卸载
+
+可在混推启动命令中加入 `--kv-offloading-backend native --kv-offloading-size 32`，
+启用 32 GiB 主存 KV 卸载，并保持 `--enable-prefix-caching`。
+压缩器和 indexer 的循环暂存组不参与前缀命中、卸载或恢复；原始组编号和物理块映射
+保持一致。CPU 前缀命中按可复用组的块边界对齐，并为 CED 留下至少一个完整的
+sliding-window 重算窗口，重建请求独立的暂存状态。
+稀疏保留时同时保存 CED 重算起点之前的 sliding-window KV，避免非整块长度的
+前缀因存储、查询边界不一致而无法从 CPU 恢复。
+native CPU 卸载在 PP 下为每个 worker 分配连续、按页对齐的独立区域，按区域批量
+注册 pinned 内存，避免逐小块注册耗尽 CUDA 资源；各区域总量仍受卸载预算限制。
+内置 `OffloadingConnector` 与无 connector 时共用紧凑的 GPU KV 池估算：
+保留每个请求仍需的窗口和状态，再按整批在途 token、lookahead 和推测 token
+预留共享临时空间，不为每个请求重复预留整个 batch 的窗口临时空间。
+调度前回收已完成计算的旧窗口；回写源块被复用前，worker 等待对应搬运完成。
+外部或自定义 connector 继续使用保守预留。比较 GPU KV 与专家容量时，可核对
+`Reserving ... GiB KV per worker` 日志。
+
 ## 学习和恢复
 
 1. 文件不存在时按默认选择启动。发送实际业务的代表性请求，让原有在线策略学习。
@@ -76,7 +94,10 @@ Graph 校准和重启复用采用同一阈值；扩容仍按完整规划余量�
 
 MRV2 的完整 Graph 模式首次启动先分配较小的探测缓存，完成 Graph 捕获后全卡同步。
 预热最大 prefill 分块、单请求、多请求和最大 decode 批次，并采样每张卡同时发生的
-物理显存峰值。启用 prefix cache 时使用真实调度输入，覆盖 CED 回放、PP 发送缓冲、
+物理显存峰值。decode 预热先为各请求建立 CED 状态，按
+`max_num_batched_tokens` 分批预填充，再合并全部请求执行完整并发的 decode；
+单请求的预填充超过该上限时也分块执行，不缩小最终的 decode 并发数。
+启用 prefix cache 时使用真实调度输入，覆盖 CED 回放、PP 发送缓冲、
 采样和 DSpark，而普通 dummy 输入不会启用 CED。上下文长度受各 PP 的实际 KV
 块数、共享前缀和 lookahead 约束。包括本卡 PP worker 和最后一级 worker 在远端卡上的占用，
 避免把不同进程、不同时刻的分配器峰值相加；保留 Tensor 分配和初始模型 profile
@@ -102,6 +123,14 @@ MRV2 的完整 Graph 模式首次启动先分配较小的探测缓存，完成 G
 `$VLLM_CACHE_ROOT/startup_plan/dsv41_experts_<指纹>.json`，与热点名单独立。
 指纹包含模型 checkpoint、配置、可见 GPU、CUDA 可用总显存、KV 布局、驱动、
 Torch/CUDA、相关源码和 native 库。预算文件版本为 `2`，与热点名单文件的版本独立。
+`route_tail_skip`、CPU 线程数、主存专家 LRU 预算、Engram 主存缓存大小、热点名单
+路径及保存间隔不进入显存预算指纹；动态容量策略只保留池启停和 `min_experts`，
+调整检查间隔、替换上限、学习及收益阈值可复用已测峰值。
+native CPU KV 卸载开启后，仅调整主存容量也可复用；启停或切换 backend 仍区分。
+单独调整 `gpu_memory_utilization` 时，按新比例和本次空闲显存重新计算槽数；
+实际 KV 布局相同时可复用峰值。分层、并发、prefill/decode 上限、Graph 形状、
+prefix cache、RAM/SSD 模式、`r8_refill` 和 `overlap_decode` 等影响显存的设置仍参与指纹。
+指纹规则更新后，旧文件首次启动需要重新记录；后续上述策略参数变化可复用。
 配置匹配时恢复工作区容量，按本次实际空闲显存调整槽数，完成正常 Graph 捕获。
 布局与已验证布局一致时保留完整峰值并做 decode 快速校验；布局变化时重测完整上下文。
 空间不足或记录失效时重新校准。配置指纹相同的已验证峰值始终保留，

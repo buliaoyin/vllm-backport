@@ -64,7 +64,12 @@ def build_offloading_config(
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    for group in groups:
+    cacheable_groups = tuple(
+        group
+        for group, kv_group in zip(groups, kv_cache_config.kv_cache_groups)
+        if kv_group.kv_cache_spec.prefix_cacheable
+    )
+    for group in cacheable_groups:
         assert group.tokens_per_block % tokens_per_hash == 0, (
             f"tokens_per_block={group.tokens_per_block} not divisible by "
             f"tokens_per_hash={tokens_per_hash}. "
@@ -91,12 +96,12 @@ def build_offloading_config(
     elif tokens_per_chunk is not None:
         tokens_per_chunk_int = int(tokens_per_chunk)
 
-        unique_tokens_per_block = {group.tokens_per_block for group in groups}
+        unique_tokens_per_block = {group.tokens_per_block for group in cacheable_groups}
 
         assert len(unique_tokens_per_block) == 1, (
             "If 'block_size' is specified in kv_connector_extra_config, "
-            "there must be at least one KV cache group, "
-            "and all groups must have the same block size."
+            "there must be at least one prefix-cacheable KV cache group, "
+            "and all prefix-cacheable groups must have the same block size."
         )
 
         tokens_per_block = unique_tokens_per_block.pop()

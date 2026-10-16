@@ -18,8 +18,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -148,6 +150,62 @@ def _full_attention_spec(block_size: int = 16) -> FullAttentionSpec:
         head_size=128,
         dtype=torch.float32,
     )
+
+
+def _make_scratch_hybrid_kv_cache_config(kind: str) -> KVCacheConfig:
+    kwargs = dict(
+        block_size=64 if kind == "large_ring" else 16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    scratch: KVCacheSpec = (
+        KpoolTailSpec(**kwargs, sliding_window=128)
+        if kind == "kpool_tail"
+        else CircularBufferSpec(**kwargs)
+    )
+    if kind == "uniform_ring":
+        scratch = UniformTypeKVCacheSpecs(
+            block_size=scratch.block_size, kv_cache_specs={"scratch": scratch}
+        )
+    return KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["before"], _full_attention_spec(32)),
+            KVCacheGroupSpec(["scratch"], scratch),
+            KVCacheGroupSpec(["after"], _full_attention_spec(32)),
+        ],
+    )
+
+
+@pytest.mark.parametrize("kind", ["ring", "large_ring", "uniform_ring", "kpool_tail"])
+@pytest.mark.parametrize("extra_config", [{}, {"block_size": 64}])
+def test_scratch_groups_preserve_indices_without_affecting_offload_hashes(
+    kind, extra_config
+):
+    config = _make_vllm_config(extra_config=extra_config)
+    config.cache_config.block_size = 32
+    config.speculative_config = None
+    kv_cache_config = _make_scratch_hybrid_kv_cache_config(kind)
+
+    offloading = build_offloading_config(config, kv_cache_config)
+    scheduler = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading), config, kv_cache_config
+    )
+
+    assert offloading.cache.tokens_per_hash == 32
+    assert [g.layer_names for g in offloading.groups] == [
+        ("before",),
+        ("scratch",),
+        ("after",),
+    ]
+    chunks = 2 if extra_config else 1
+    assert [g.hashes_per_chunk for g in scheduler.kv_group_configs] == [
+        chunks,
+        0,
+        chunks,
+    ]
 
 
 def _mla_spec(

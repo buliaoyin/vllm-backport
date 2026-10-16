@@ -824,10 +824,7 @@ def _profile_hybrid_serving_step(worker, tokens, requests, *, decode=False):
     ids = [f"_hybrid_memory_{i}" for i in range(requests)]
     params = SamplingParams.for_sampler_warmup()
     params.prompt_logprobs = None
-    output = SchedulerOutput.make_empty()
-    output.num_spec_tokens_to_schedule = runner.num_speculative_steps
-    output.num_common_prefix_blocks = shared
-    output.scheduled_new_reqs = [
+    new_reqs = [
         NewRequestData(
             req_id=req_id,
             prompt_token_ids=prompt,
@@ -844,20 +841,49 @@ def _profile_hybrid_serving_step(worker, tokens, requests, *, decode=False):
         )
         for req_id in ids
     ]
-    output.num_scheduled_tokens = {req_id: seed_query for req_id in ids}
-    output.total_num_scheduled_tokens = seed_query * requests
+    max_tokens = config.scheduler_config.max_num_batched_tokens
+    seed_batch_size = max(1, max_tokens // seed_query)
+    if seed_query * requests > max_tokens:
+        logger.info(
+            "Hybrid serving seed prefill split: requests=%d query=%d "
+            "max_batch_tokens=%d max_batch_requests=%d",
+            requests,
+            seed_query,
+            max_tokens,
+            seed_batch_size,
+        )
     cleanup = SchedulerOutput.make_empty()
     cleanup.finished_req_ids = set(ids)
     adaptive = runner.adaptive_verification
     runner.adaptive_verification = None
     runner.kv_connector.set_disabled(True)
     try:
-        worker.execute_model(output)
-        sampled = worker.sample_tokens(None)
-        if sampled is not None and hasattr(sampled, "get_output"):
-            sampled.get_output()
-        torch.accelerator.synchronize()
-        get_pp_group().barrier()
+        for start in range(0, requests, seed_batch_size):
+            batch = new_reqs[start : start + seed_batch_size]
+            batch_ids = [req.req_id for req in batch]
+            chunk_size = max_tokens // len(batch)
+            for offset in range(0, seed_query, chunk_size):
+                chunk_tokens = min(chunk_size, seed_query - offset)
+                output = SchedulerOutput.make_empty()
+                output.num_spec_tokens_to_schedule = runner.num_speculative_steps
+                output.num_common_prefix_blocks = shared
+                if offset == 0:
+                    output.scheduled_new_reqs = batch
+                else:
+                    cached = CachedRequestData.make_empty()
+                    cached.req_ids = batch_ids
+                    cached.num_computed_tokens = [context + offset] * len(batch)
+                    cached.num_output_tokens = [0] * len(batch)
+                    cached.new_block_ids = [None] * len(batch)
+                    output.scheduled_cached_reqs = cached
+                output.num_scheduled_tokens = dict.fromkeys(batch_ids, chunk_tokens)
+                output.total_num_scheduled_tokens = chunk_tokens * len(batch)
+                worker.execute_model(output)
+                sampled = worker.sample_tokens(None)
+                if sampled is not None and hasattr(sampled, "get_output"):
+                    sampled.get_output()
+                torch.accelerator.synchronize()
+                get_pp_group().barrier()
         if decode:
             cached = CachedRequestData.make_empty()
             cached.req_ids = ids

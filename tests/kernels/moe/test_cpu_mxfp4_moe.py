@@ -1829,28 +1829,88 @@ def test_reused_cache_budget_adapts_slots_without_moving_io_owners():
     assert fit_cached_plan(plan, [0, 64, 402], 384) is None
 
 
-def test_budget_identity_ignores_history_path_but_invalidates_memory_changes():
-    import json
-
-    from vllm.models.deepseek_v4_1.cache_budget import budget_fingerprint
+@pytest.fixture
+def dsv41_budget_config():
+    from vllm.config import CacheConfig, CompilationConfig, CUDAGraphMode, VllmConfig
 
     class Config(SimpleNamespace):
-        def compute_hash(self):
-            return json.dumps(self.additional_config, sort_keys=True)
+        compute_hash = VllmConfig.compute_hash
 
-    config = Config(
+    return Config(
+        **dict.fromkeys(
+            (
+                "parallel_config",
+                "device_config",
+                "load_config",
+                "offload_config",
+                "attention_config",
+                "engram_config",
+                "lora_config",
+                "speculative_config",
+                "structured_outputs_config",
+                "profiler_config",
+                "quant_config",
+                "kernel_config",
+                "kv_transfer_config",
+                "ec_transfer_config",
+            )
+        ),
         model_config=SimpleNamespace(
             model="test-checkpoint",
             revision=None,
             max_model_len=524288,
             hf_config=SimpleNamespace(to_dict=lambda: {"n_routed_experts": 384}),
+            multimodal_config=None,
+            compute_hash=lambda: "model-graph",
         ),
-        cache_config=SimpleNamespace(gpu_memory_utilization=0.985),
-        scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=2048),
-        additional_config={"deepseek_v41_hybrid": {"expert_profile": "first.json"}},
+        observability_config=SimpleNamespace(compute_hash=lambda: "metrics"),
+        cache_config=CacheConfig(
+            gpu_memory_utilization=0.985,
+            enable_prefix_caching=True,
+            kv_offloading_size=32,
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            cudagraph_capture_sizes=[1, 2, 4, 8, 16, 32, 64, 128],
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=8,
+            max_num_batched_tokens=2048,
+            compute_hash=lambda: "scheduler-graph",
+        ),
+        uniform_decode_query_len=8,
+        num_lookahead_tokens=7,
+        additional_config={
+            "deepseek_v41_hybrid": {
+                "pipeline_layers": [7, 8, 25],
+                "expert_profile": "first.json",
+                "cpu_threads": [24, 24],
+                "route_tail_skip": 0,
+                "host_cache_gib": 0,
+                "engram_storage": "ssd",
+                "engram_cache_gib": 1,
+                "r8_refill": True,
+                "overlap_decode": True,
+                "adaptive_cache": {"min_experts": 8, "interval": 128},
+            },
+            "cpu_moe": {"backend": "ik", "num_threads": 24, "route_tail_skip": 0},
+            "cpu_phase_threads": [24, 24],
+            "ced_prefill": True,
+        },
     )
+
+
+def test_budget_identity_ignores_history_path_but_invalidates_memory_changes(
+    dsv41_budget_config,
+):
+    from vllm.models.deepseek_v4_1.cache_budget import budget_fingerprint
+
+    config = dsv41_budget_config
     memory = [(1000, 2000, 10)]
     first = budget_fingerprint(config, memory, [(20, [128], 2)])
+    assert config.cache_config.kv_offloading_size == 32
+    assert budget_fingerprint(config, [(500, 2000, 100)], [(20, [128], 2)]) == first
+    assert budget_fingerprint(config, [(1000, 4000, 10)], [(20, [128], 2)]) != first
     config.additional_config["deepseek_v41_hybrid"]["expert_profile"] = "second.json"
     assert budget_fingerprint(config, memory, [(20, [128], 2)]) == first
     assert budget_fingerprint(config, memory, [(40, [256], 2)]) != first
@@ -1858,10 +1918,90 @@ def test_budget_identity_ignores_history_path_but_invalidates_memory_changes():
     assert budget_fingerprint(config, memory, [(20, [128], 2)]) != first
 
 
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("deepseek_v41_hybrid.route_tail_skip", 4),
+        ("cpu_moe.route_tail_skip", 4),
+        ("deepseek_v41_hybrid.cpu_threads", [16, 20]),
+        ("cpu_moe.num_threads", 16),
+        ("cpu_phase_threads", [16, 20]),
+        ("deepseek_v41_hybrid.host_cache_gib", 12),
+        ("deepseek_v41_hybrid.engram_cache_gib", 4),
+        ("deepseek_v41_hybrid.expert_profile", False),
+        ("deepseek_v41_hybrid.expert_profile_interval", 1),
+        ("deepseek_v41_hybrid.adaptive_cache.interval", 64),
+        ("deepseek_v41_hybrid.adaptive_cache.max_swaps", 32),
+        ("deepseek_v41_hybrid.adaptive_cache.online", False),
+        ("deepseek_v41_hybrid.adaptive_cache.safety_factor", 2.0),
+    ],
+)
+def test_budget_identity_reuses_peaks_for_host_policies(
+    dsv41_budget_config, path, value
+):
+    import copy
+
+    from vllm.models.deepseek_v4_1.cache_budget import budget_fingerprint
+
+    config = dsv41_budget_config
+    memory, kv_sizes = [(1000, 2000, 10)], [(20, [128], 2)]
+    first = budget_fingerprint(config, memory, kv_sizes)
+    target = config.additional_config
+    *parents, field = path.split(".")
+    for parent in parents:
+        target = target[parent]
+    target[field] = value
+    original = copy.deepcopy(config.additional_config)
+    assert budget_fingerprint(config, memory, kv_sizes) == first
+    assert config.additional_config == original
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "invalidates"),
+    [
+        ("cache_config", "gpu_memory_utilization", 0.99, False),
+        ("cache_config", "kv_offloading_size", 64, False),
+        ("cache_config", "kv_offloading_size", None, True),
+        ("cache_config", "kv_offloading_backend", "lmcache", True),
+        ("cache_config", "enable_prefix_caching", False, True),
+        ("compilation_config", "cudagraph_capture_sizes", [1, 2, 4], True),
+        ("scheduler_config", "max_num_batched_tokens", 4096, True),
+        ("model_config", "max_model_len", 131072, True),
+        (None, "uniform_decode_query_len", 6, True),
+        (None, "num_lookahead_tokens", 5, True),
+        ("deepseek_v41_hybrid", "pipeline_layers", [6, 9, 25], True),
+        ("deepseek_v41_hybrid", "engram_storage", "ram", True),
+        ("deepseek_v41_hybrid", "r8_refill", False, True),
+        ("deepseek_v41_hybrid", "overlap_decode", False, True),
+        ("deepseek_v41_hybrid", "adaptive_cache", False, True),
+        ("deepseek_v41_hybrid", "adaptive_cache", {"min_experts": 16}, True),
+    ],
+)
+def test_budget_identity_separates_memory_shape_from_budget_targets(
+    dsv41_budget_config, section, field, value, invalidates
+):
+    from vllm.models.deepseek_v4_1.cache_budget import budget_fingerprint
+
+    config = dsv41_budget_config
+    memory, kv_sizes = [(1000, 2000, 10)], [(20, [128], 2)]
+    first = budget_fingerprint(config, memory, kv_sizes)
+    if section == "deepseek_v41_hybrid":
+        config.additional_config[section][field] = value
+    else:
+        setattr(getattr(config, section) if section else config, field, value)
+    assert (budget_fingerprint(config, memory, kv_sizes) != first) == invalidates
+
+
 @pytest.mark.parametrize("sliding", [False, True])
+@pytest.mark.parametrize(
+    ("requests", "max_batched_tokens"),
+    [(8, 2048), (16, 2048), (16, 1792), (16, 128)],
+)
 def test_serving_memory_profile_uses_prefill_then_decode_and_cleans_requests(
     monkeypatch,
     sliding,
+    requests,
+    max_batched_tokens,
 ):
     from vllm.models.deepseek_v4_1 import hybrid_runtime as runtime
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1877,6 +2017,7 @@ def test_serving_memory_profile_uses_prefill_then_decode_and_cleans_requests(
     )
     config = SimpleNamespace(
         cache_config=SimpleNamespace(enable_prefix_caching=True),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_batched_tokens),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(sliding_window=128), get_vocab_size=lambda: 64
         ),
@@ -1904,46 +2045,72 @@ def test_serving_memory_profile_uses_prefill_then_decode_and_cleans_requests(
         adaptive_verification=adaptive,
         model_state=SimpleNamespace(max_encoder_len=0),
         kv_cache_config=SimpleNamespace(
-            num_blocks=40,
+            num_blocks=5 * requests,
             kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)],
         ),
         kv_connector=SimpleNamespace(set_disabled=connector_states.append),
     )
+
+    computed: dict[str, int] = {}
+
+    def execute(output):
+        assert output.total_num_scheduled_tokens <= max_batched_tokens
+        assert output.total_num_scheduled_tokens == sum(
+            output.num_scheduled_tokens.values()
+        )
+        for req in output.scheduled_new_reqs:
+            assert req.req_id not in computed
+            computed[req.req_id] = req.num_computed_tokens
+        cached = output.scheduled_cached_reqs
+        assert [computed[req_id] for req_id in cached.req_ids] == (
+            cached.num_computed_tokens
+        )
+        for req_id, count in output.num_scheduled_tokens.items():
+            computed[req_id] += count
+        for req_id in output.finished_req_ids:
+            computed.pop(req_id)
+        steps.append(output)
+
     worker = SimpleNamespace(
         model_runner=runner,
         vllm_config=config,
-        execute_model=steps.append,
+        execute_model=execute,
         sample_tokens=lambda grammar: None,
     )
-    runtime._profile_hybrid_serving_step(worker, 64, 8, decode=True)
-    prefill, decode, cleanup = steps
-    assert len(prefill.scheduled_new_reqs) == 8
-    assert all(
-        req.sampling_params.prompt_logprobs is None
-        for req in prefill.scheduled_new_reqs
-    )
-    assert all(
-        req.prompt_len - req.num_computed_tokens == 256
-        for req in prefill.scheduled_new_reqs
-    )
+    runtime._profile_hybrid_serving_step(worker, 8 * requests, requests, decode=True)
+    *prefills, decode, cleanup = steps
+    new_reqs = [req for step in prefills for req in step.scheduled_new_reqs]
+    assert len({req.req_id for req in new_reqs}) == len(new_reqs) == requests
+    assert all(req.sampling_params.prompt_logprobs is None for req in new_reqs)
+    assert all(req.prompt_len - req.num_computed_tokens == 256 for req in new_reqs)
+    for req in new_reqs:
+        assert (
+            sum(step.num_scheduled_tokens.get(req.req_id, 0) for step in prefills)
+            == 256
+        )
     block_ids = {
         block
-        for req in prefill.scheduled_new_reqs
+        for req in new_reqs
         for group_blocks in req.block_ids
         for block in group_blocks
     }
-    assert max(block_ids) < 40
-    assert all(req.num_computed_tokens % 128 == 0 for req in prefill.scheduled_new_reqs)
+    assert max(block_ids) < runner.kv_cache_config.num_blocks
+    assert all(req.num_computed_tokens % 128 == 0 for req in new_reqs)
     if sliding:
         assert 0 in block_ids
-        assert all(req.num_computed_tokens > 4096 for req in prefill.scheduled_new_reqs)
+        assert all(req.num_computed_tokens > 4096 for req in new_reqs)
     else:
         assert 0 not in block_ids
-    assert decode.total_num_scheduled_tokens == 64
+    assert decode.total_num_scheduled_tokens == 8 * requests
+    assert set(decode.scheduled_cached_reqs.req_ids) == {req.req_id for req in new_reqs}
+    assert decode.scheduled_cached_reqs.num_computed_tokens == [
+        req.prompt_len for req in new_reqs
+    ]
     assert all(
         len(drafts) == 7 for drafts in decode.scheduled_spec_decode_tokens.values()
     )
     assert cleanup.finished_req_ids == set(decode.num_scheduled_tokens)
+    assert not computed
     assert connector_states == [True, False]
     assert runner.adaptive_verification is adaptive
 

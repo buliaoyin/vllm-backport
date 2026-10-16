@@ -8,6 +8,7 @@ import torch
 
 from tests.v1.kv_connector.unit.offloading_connector.test_config import (
     _make_mamba_hybrid_kv_cache_config,
+    _make_scratch_hybrid_kv_cache_config,
     _make_vllm_config,
 )
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
@@ -76,6 +77,82 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
+
+
+@pytest.mark.parametrize("kind", ["ring", "large_ring", "uniform_ring", "kpool_tail"])
+@pytest.mark.parametrize("local_tokens", [0, 64])
+@pytest.mark.parametrize("ced", [False, True])
+def test_scratch_groups_never_transfer_or_constrain_prefix_hits(
+    kind, local_tokens, ced
+):
+    """A one-block scratch group must not be read as reusable prefix KV."""
+    config = _make_vllm_config()
+    config.cache_config.block_size = 32
+    config.speculative_config = None
+    config.model_config.hf_config.model_type = "deepseek_v41"
+    config.model_config.hf_config.sliding_window = 128
+    config.additional_config = {"ced_prefill": ced}
+    kv_config = _make_scratch_hybrid_kv_cache_config(kind)
+    spec = MockOffloadingSpec(build_offloading_config(config, kv_config))
+    scheduler = OffloadingConnectorScheduler(spec, config, kv_config)
+    request = MagicMock()
+    request.request_id = "scratch"
+    request.kv_transfer_params = None
+    request.num_prompt_tokens = request.num_tokens = 257
+    request.num_computed_tokens = 0
+    request.skip_reading_prefix_cache = False
+    request.status = RequestStatus.RUNNING
+    request.is_finished.return_value = False
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(8)]
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    blocks = (
+        [KVCacheBlock(i) for i in range(11, 19)],
+        [KVCacheBlock(99)],
+        [KVCacheBlock(i) for i in range(31, 39)],
+    )
+    state.update_block_id_groups(tuple([b.block_id for b in group] for group in blocks))
+    spec.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(
+        keys
+    )
+    assert (
+        scheduler._build_aligned_boundary_store_jobs({"scratch": [(1, 99, 256)]}) == {}
+    )
+
+    stores = scheduler._build_store_jobs(
+        SimpleNamespace(num_scheduled_tokens={"scratch": 256}, finished_req_ids=set())
+    )
+    [store] = stores.values()
+    assert store.src_spec.group_sizes == [8, 0, 8]
+    assert 99 not in store.src_spec.block_ids
+    assert {get_offload_group_idx(k) for k in store.dst_spec.offload_keys} == {0, 2}
+    assert not state.group_states[1].offload_keys
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1 for job_id in stores}
+            )
+        )
+    )
+
+    spec.manager.lookup.return_value = LookupResult.HIT
+    external, load_async = scheduler.get_num_new_matched_tokens(request, local_tokens)
+    expected_hit = 128 if ced else 256
+    assert (external, load_async) == (expected_hit - local_tokens, True)
+    assert {
+        get_offload_group_idx(c.args[0]) for c in spec.manager.lookup.call_args_list
+    } == {
+        0,
+        2,
+    }
+    scheduler.update_state_after_alloc(request, KVCacheBlocks(blocks), external)
+    [load] = scheduler._current_batch_load_jobs.values()
+    assert load.dst_spec.group_sizes == [external // 32, 0, external // 32]
+    assert 99 not in load.dst_spec.block_ids
+    assert 99 in scheduler._current_batch_allocated_block_ids
+    assert {get_offload_group_idx(k) for k in load.src_spec.offload_keys} == {0, 2}
+    assert state.group_states[1].num_hit_chunks == 0
 
 
 @pytest.mark.parametrize("boundary", [3840, 3904])
@@ -3975,6 +4052,64 @@ def test_multiple_in_flight_stores_all_flushed_by_fence(request_runner):
     assert len(runner.connector_scheduler._jobs) == 0
 
 
+@pytest.mark.parametrize("in_flight", [0, 8])
+def test_native_idle_window_reuse_waits_for_pending_store(request_runner, in_flight):
+    """Reclaim idle windows only after compute; wait for stores before reuse."""
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["swa"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=8,
+        async_scheduling=False,
+        kv_cache_groups=groups,
+    )
+    runner.scheduler.cache_config.kv_cache_tokens = 2048
+    runner.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(
+        keys
+    )
+    runner.new_request(token_ids=list(range(12)))
+    runner.run(decoded_tokens=[0], complete_transfers=False)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    manager = runner.scheduler.kv_cache_manager.coordinator.single_type_managers[1]
+    old_block = manager.req_to_blocks[request.request_id][0]
+    jobs = runner.connector_scheduler._block_id_to_pending_jobs[
+        old_block.block_id
+    ].copy()
+
+    budget = runner.scheduler.max_num_scheduled_tokens
+    runner.scheduler.max_num_scheduled_tokens = 0
+    request.num_in_flight_tokens = in_flight
+    idle = runner.scheduler.schedule()
+    assert not idle.num_scheduled_tokens
+    assert manager.req_to_blocks[request.request_id][0].is_null == (in_flight == 0)
+    assert jobs <= runner.connector_scheduler._jobs.keys()
+
+    request.num_in_flight_tokens = 0
+    runner.scheduler.max_num_scheduled_tokens = budget
+    output = runner.scheduler.schedule()
+    metadata = output.kv_connector_metadata
+    assert jobs <= metadata.jobs_to_flush
+    runner.worker_connector.handle_preemptions(metadata)
+    assert jobs <= runner.offloading_spec.handler.flushed_jobs
+    assert jobs.isdisjoint(runner.offloading_spec.handler.waiting_jobs)
+
+
 def test_request_finished_mixed_full_attn_and_sliding_window(
     request_runner,
 ):
@@ -4319,11 +4454,78 @@ def test_retention_interval_zero_stores_only_replay_boundary(
     )
 
 
+@pytest.mark.parametrize("async_scheduling", [True, False])
+@pytest.mark.parametrize("draft", [True, False])
+@pytest.mark.parametrize("num_tokens", [256, 304])
+def test_ced_sparse_offload_preserves_replay_window(
+    request_runner, async_scheduling, draft, num_tokens
+):
+    """A CPU prefix hit must retain the window before CED's replay suffix."""
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=128, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["swa"],
+            SlidingWindowSpec(
+                block_size=32,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+            is_eagle_group=draft,
+        ),
+    ]
+    runner = request_runner(
+        block_size=32,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=groups,
+        retention_interval=0,
+        extra_config_overrides={"offload_prompt_only": True},
+    )
+    runner.connector_scheduler.config = runner.connector_scheduler.config._replace(
+        min_prefill_tokens=128
+    )
+    runner.scheduler.kv_cache_manager.min_prefill_tokens = 128
+    runner.scheduler.kv_cache_manager.coordinator.min_prefill_tokens = 128
+    runner.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(
+        key for key in keys if (key, 0) not in runner.offloaded
+    )
+    runner.new_request(token_ids=list(range(num_tokens)))
+    runner.run(decoded_tokens=[0])
+    swa_blocks = 4 if num_tokens == 256 else 8
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            *((1, i) for i in range(swa_blocks + int(draft))),
+        ),
+    )
+
+    runner.scheduler.reset_prefix_cache()
+    runner.manager.lookup.side_effect = lambda key, ctx: (
+        LookupResult.HIT if (key, 0) in runner.offloaded else LookupResult.MISS
+    )
+    runner.new_request(token_ids=list(range(num_tokens)))
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=((0, 0), *((1, i) for i in range(4))),
+    )
+
+
 def _shared_kv_mtp_config():
     """Speculative config for a shared-group MTP model: eagle-family method
     whose drafter layer merges into a target KV-cache group, so no group
     self-identifies as a drafter group (issue #52735)."""
     spec = MagicMock(name="shared_kv_mtp_spec")
+    spec.method = "mtp"
+    spec.use_dspark.return_value = False
     spec.use_eagle.return_value = True
     spec.use_eagle_block_drop.return_value = True
     spec.use_multi_module_mtp.return_value = False

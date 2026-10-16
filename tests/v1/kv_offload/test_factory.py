@@ -139,13 +139,14 @@ def test_create_cpu_offloading_spec():
     assert spec.num_chunks > 0
 
 
-def test_cpu_spec_sizes_normalized_worker_layout():
-    # The CPU spec now rounds the offloaded row up to the mmap page size
-    # (matching the shared region), so kv_bytes_per_chunk picks up padding
-    # while cpu_page_size_per_worker stays the un-padded per-worker slot.
+def test_cpu_spec_sizes_normalized_worker_layout(monkeypatch):
+    """Each PP worker's contiguous allocation must fit the shared budget."""
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
     alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
     spec = _create_spec(
-        cpu_bytes_to_use=alignment * 3,
+        cpu_bytes_to_use=alignment * 18,
         worker_kv_bytes_per_block=16,
         blocks_per_chunk=2,
         world_size=6,
@@ -154,8 +155,8 @@ def test_cpu_spec_sizes_normalized_worker_layout():
     )
 
     assert isinstance(spec, CPUOffloadingSpec)
-    assert spec.cpu_page_size_per_worker == 32
-    assert spec.kv_bytes_per_chunk == alignment
+    assert spec.cpu_page_size_per_worker == alignment
+    assert spec.kv_bytes_per_chunk == alignment * 6
     assert spec.num_chunks == 3
 
 
@@ -484,6 +485,52 @@ def test_cpu_spec_create_worker_rank_assignment(
     spec.create_worker(MagicMock())
 
     assert region_calls[0]["rank"] == expected_rank
+
+
+@pytest.mark.parametrize("world_size", [3, 4])
+@pytest.mark.parametrize("page_bytes", [32, 4096, 4608])
+def test_cpu_pp_workers_use_contiguous_regions_within_total_budget(
+    monkeypatch, world_size, page_bytes
+):
+    """PP must batch host registrations without changing chunk granularity."""
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    budget = 65536 * world_size
+    spec = _create_spec(
+        cpu_bytes_to_use=budget,
+        worker_kv_bytes_per_block=page_bytes,
+        world_size=world_size,
+        pp_size=world_size,
+        tp_size=1,
+    )
+    region_calls = []
+
+    def create_region(**kwargs):
+        region_calls.append(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(cpu_spec_module, "SharedOffloadRegion", create_region)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
+    for rank in range(world_size):
+        monkeypatch.setattr(
+            cpu_spec_module.torch.accelerator,
+            "current_device_index",
+            lambda rank=rank: rank,
+        )
+        spec.create_worker(MagicMock())
+
+    assert len({r["engine_id"] for r in region_calls}) == world_size
+    assert (
+        sum(r["num_chunks"] * r["kv_bytes_per_chunk"] for r in region_calls) <= budget
+    )
+    assert spec.blocks_per_chunk == 1
+    for region in region_calls:
+        assert region["rank"] == 0
+        assert region["kv_bytes_per_chunk"] == region["cpu_page_size"]
+        assert region["cpu_page_size"] >= page_bytes
+        assert region["cpu_page_size"] % SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT == 0
+        assert region["num_chunks"] == spec.num_chunks
 
 
 def test_offloading_spec_has_replicated_layout_default():

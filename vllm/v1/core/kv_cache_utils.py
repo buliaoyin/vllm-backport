@@ -2407,6 +2407,15 @@ def _max_memory_usage_bytes_from_groups(
     return bytes_per_block * total_blocks
 
 
+def supports_shared_kv_scratch(config: VllmConfig) -> bool:
+    """Whether idle windows can be reclaimed before scheduling the next batch."""
+    transfer = config.kv_transfer_config
+    return transfer is None or (
+        transfer.kv_connector == "OffloadingConnector"
+        and transfer.kv_connector_module_path is None
+    )
+
+
 def _token_budget_num_blocks(
     config: VllmConfig, groups: list[KVCacheGroupSpec], target: int, num_reqs: int
 ) -> int:
@@ -2709,7 +2718,7 @@ def get_kv_cache_configs(
             ),
             default=1,
         )
-        if token_budget is not None and vllm_config.kv_transfer_config is None:
+        if token_budget is not None and supports_shared_kv_scratch(vllm_config):
             blocks = max(
                 (
                     _token_budget_num_blocks(vllm_config, groups, target, num_reqs)

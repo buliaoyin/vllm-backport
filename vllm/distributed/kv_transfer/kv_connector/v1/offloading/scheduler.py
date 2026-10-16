@@ -4,6 +4,7 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
+from math import lcm
 from typing import Any, NamedTuple
 
 from vllm.config import VllmConfig
@@ -38,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    iter_layer_specs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.kv_offload.base import (
@@ -87,6 +89,7 @@ class GroupOffloadConfig(NamedTuple):
     group_idx: int
     tokens_per_block: int
     tokens_per_chunk: int
+    # Zero for scratch groups, which retain their original group index.
     hashes_per_chunk: int
     # KV cache spec metadata propagated onto emitted BlockStored events so
     # KV-aware consumers can classify and filter the group.
@@ -174,6 +177,7 @@ class SchedulerOffloadConfig(NamedTuple):
     alignment_tokens: int | None = None
     retention_interval: int | None = None
     dcp_world_size: int = 1
+    min_prefill_tokens: int = 1
 
     @classmethod
     def from_spec(
@@ -190,6 +194,8 @@ class SchedulerOffloadConfig(NamedTuple):
         full_attn_tokens_per_chunk: set[int] = set()
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            if not kv_spec.prefix_cacheable:
+                continue
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
             )
@@ -206,7 +212,11 @@ class SchedulerOffloadConfig(NamedTuple):
             alignment_tokens = full_attn_tokens_per_chunk.pop()
         elif not full_attn_tokens_per_chunk:
             all_tokens_per_chunk = [
-                tpb * spec.blocks_per_chunk for tpb in spec.tokens_per_block
+                tpb * spec.blocks_per_chunk
+                for tpb, group in zip(
+                    spec.tokens_per_block, kv_cache_config.kv_cache_groups
+                )
+                if group.kv_cache_spec.prefix_cacheable
             ]
             if all_tokens_per_chunk:
                 alignment_tokens = max(all_tokens_per_chunk)
@@ -252,10 +262,16 @@ class SchedulerOffloadConfig(NamedTuple):
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
             kv_spec = kv_cache_group.kv_cache_spec
-            sw = get_sliding_window_size_in_chunks(
-                kv_spec, tokens_per_block * spec.blocks_per_chunk
+            sw = (
+                get_sliding_window_size_in_chunks(
+                    kv_spec, tokens_per_block * spec.blocks_per_chunk
+                )
+                if kv_spec.prefix_cacheable
+                else 0
             )
-            manager_cls = KVCacheSpecRegistry.get_manager_class(kv_spec)
+            manager_cls = KVCacheSpecRegistry.get_manager_class(
+                next(iter(iter_layer_specs(kv_spec)))
+            )
             assert manager_cls is not None, (
                 f"No manager found for KV cache spec {type(kv_spec).__name__}"
             )
@@ -267,6 +283,8 @@ class SchedulerOffloadConfig(NamedTuple):
                     hashes_per_chunk=(
                         (tokens_per_block * spec.blocks_per_chunk)
                         // spec.tokens_per_hash
+                        if kv_spec.prefix_cacheable
+                        else 0
                     ),
                     sliding_window_size_in_chunks=sw,
                     kv_cache_spec=kv_spec,
@@ -310,7 +328,8 @@ class SchedulerOffloadConfig(NamedTuple):
                 )
             for config in kv_group_configs:
                 if (
-                    config.sliding_window_size_in_chunks is not None
+                    config.hashes_per_chunk
+                    and config.sliding_window_size_in_chunks is not None
                     and retention_interval % config.tokens_per_chunk != 0
                 ):
                     raise ValueError(
@@ -318,6 +337,15 @@ class SchedulerOffloadConfig(NamedTuple):
                         f"({retention_interval}) must be a multiple of "
                         f"tokens_per_chunk ({config.tokens_per_chunk})."
                     )
+
+        min_prefill_tokens = 1
+        additional_config = getattr(vllm_config, "additional_config", None)
+        if (
+            isinstance(additional_config, dict)
+            and additional_config.get("ced_prefill", False)
+            and vllm_config.model_config.hf_config.model_type == "deepseek_v41"
+        ):
+            min_prefill_tokens = vllm_config.model_config.hf_config.sliding_window
 
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
@@ -329,6 +357,7 @@ class SchedulerOffloadConfig(NamedTuple):
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
+            min_prefill_tokens=min_prefill_tokens,
         )
 
 
@@ -393,6 +422,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if not group_config.hashes_per_chunk:
+                continue
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -437,6 +468,8 @@ class RequestOffloadState:
         and a permanent hole breaks prefix-reuse lookup. ``is_finished`` is
         monotonic, so the finish-time calls all see the lifted exclusion.
         """
+        if not group_config.hashes_per_chunk:
+            return 0
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
         # Finished requests have no pending speculation.
@@ -466,6 +499,8 @@ class RequestOffloadState:
         ):
             group_state.num_hit_chunks = (
                 num_cached_tokens // group_config.tokens_per_chunk
+                if group_config.hashes_per_chunk
+                else 0
             )
 
 
@@ -545,6 +580,8 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            if not group_config.hashes_per_chunk:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
@@ -747,6 +784,18 @@ class OffloadingConnectorScheduler:
                 req_status.req_context,
             )
 
+    def _ced_replay_boundary(self, num_tokens: int) -> int:
+        alignment = lcm(
+            *(
+                group.tokens_per_chunk
+                for group in self.config.kv_group_configs
+                if group.hashes_per_chunk
+            )
+        )
+        return round_down(
+            max(0, num_tokens - self.config.min_prefill_tokens), alignment
+        )
+
     def _lookup_complete_chunks(self, req_status: RequestOffloadState) -> int | None:
         """
         Find how many tokens beyond num_locally_computed_tokens can be loaded.
@@ -758,11 +807,15 @@ class OffloadingConnectorScheduler:
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
         max_hit_size_tokens: int = req_status.req.num_tokens
+        if self.config.min_prefill_tokens > 1:
+            # Rebuild scratch state from a complete, aligned replay window.
+            max_hit_size_tokens = self._ced_replay_boundary(max_hit_size_tokens)
         if self._sliding_window_groups:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
-            max_hit_size_tokens -= 1
+            if self.config.min_prefill_tokens == 1:
+                max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
                 max_hit_size_tokens = round_down(
@@ -1099,6 +1152,10 @@ class OffloadingConnectorScheduler:
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
             )
+            if not group_config.hashes_per_chunk:
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
 
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
@@ -1255,7 +1312,8 @@ class OffloadingConnectorScheduler:
             for group_idx, block_id, boundary in entries:
                 group_config = self.config.kv_group_configs[group_idx]
                 if (
-                    block_id == 0
+                    not group_config.hashes_per_chunk
+                    or block_id == 0
                     or boundary > max_boundary
                     or boundary % group_config.tokens_per_chunk != 0
                 ):
@@ -1487,12 +1545,19 @@ class OffloadingConnectorScheduler:
             reachable_boundaries: tuple[int, ...] = ()
             if self.config.retention_interval is not None:
                 reachable_boundaries = (req.num_prompt_tokens - 1,)
+                if self.config.min_prefill_tokens > 1:
+                    reachable_boundaries += (
+                        self._ced_replay_boundary(req.num_prompt_tokens),
+                    )
                 if req.shared_prefix_boundary:
                     reachable_boundaries += (req.shared_prefix_boundary,)
 
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if not group_config.hashes_per_chunk:
+                    group_store_ranges.append((0, 0))
+                    continue
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )

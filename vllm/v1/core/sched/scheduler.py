@@ -38,7 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, supports_shared_kv_scratch
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -628,7 +628,9 @@ class Scheduler(SchedulerInterface):
         return 2048
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        if self.cache_config.kv_cache_tokens is not None and self.connector is None:
+        if self.cache_config.kv_cache_tokens is not None and supports_shared_kv_scratch(
+            self.vllm_config
+        ):
             for request in self.running:
                 self.kv_cache_manager.recycle_sliding_windows(request)
 

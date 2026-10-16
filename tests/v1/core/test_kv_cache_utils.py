@@ -4153,7 +4153,8 @@ def test_explicit_kv_token_budget_reserves_concurrent_capacity_before_experts():
 @pytest.mark.parametrize(
     "windowed", [new_sliding_window_spec, new_chunked_local_attention_spec]
 )
-def test_token_budget_shares_scratch_between_requests(windowed):
+@pytest.mark.parametrize("connector", ["none", "native", "remote", "custom"])
+def test_token_budget_shares_scratch_between_requests(windowed, connector):
     """Sixteen requests must not reserve sixteen copies of the batch workspace."""
     model = ModelConfig(max_model_len=2048)
     config = VllmConfig(
@@ -4166,12 +4167,23 @@ def test_token_budget_shares_scratch_between_requests(windowed):
             is_encoder_decoder=False,
         ),
     )
+    if connector != "none":
+        config.kv_transfer_config = KVTransferConfig(
+            kv_connector="NixlConnector"
+            if connector == "remote"
+            else "OffloadingConnector",
+            kv_role="kv_both",
+            kv_connector_module_path="external.connector"
+            if connector == "custom"
+            else None,
+        )
     config.cache_config.kv_cache_layout = "BLHNC"
     workers = [{"full": new_kv_cache_spec(), "window": windowed()}]
     caches = get_kv_cache_configs(config, workers, [1 << 30])
     # Full KV: 256 blocks; windows/state/alignment and one shared batch:
     # comfortably below the 256 extra blocks the old formula reserved.
-    assert 256 < caches[0].num_blocks < 384
+    assert caches[0].num_blocks > 256
+    assert (caches[0].num_blocks < 384) == (connector in ("none", "native"))
     assert get_kv_cache_capacity(config, caches[0])[0] >= 4096
 
 

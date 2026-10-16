@@ -43,6 +43,7 @@ def _all_workers_barrier() -> None:
 
 class CPUOffloadingSpec(OffloadingSpec):
     BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    _use_worker_regions = True
 
     @classmethod
     def build_metric_definitions(
@@ -112,6 +113,15 @@ class CPUOffloadingSpec(OffloadingSpec):
 
             # calculate cpu_page_size_per_worker
             self.cpu_page_size_per_worker = kv_bytes_per_chunk // num_copies
+            if (
+                self._use_worker_regions
+                and self.config.parallel.pp_size > 1
+                and self._uses_shared_region()
+            ):
+                self.cpu_page_size_per_worker = round_up(
+                    self.cpu_page_size_per_worker, self.BLOCK_SIZE_ALIGNMENT
+                )
+                kv_bytes_per_chunk = self.cpu_page_size_per_worker * num_copies
 
             # calculate num_chunks
             aligned_kv_bytes_per_chunk = round_up(
@@ -169,18 +179,30 @@ class CPUOffloadingSpec(OffloadingSpec):
         # num_chunks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
         if self._uses_shared_region() and self.num_chunks > 0:
+            world_size = self.config.parallel.world_size
             # Replicated layout puts all ranks on slot 0 (single MLA copy);
             # otherwise each rank takes its own slot by physical device index.
             if self.replicated_layout:
                 rank = 0
             else:
-                world_size = self.config.parallel.world_size
                 rank = torch.accelerator.current_device_index() % world_size
+            engine_id = self.config.engine_id
+            region_bytes_per_chunk = self.kv_bytes_per_chunk
+            if (
+                self._use_worker_regions
+                and self.config.parallel.pp_size > 1
+                and not self.replicated_layout
+            ):
+                # CPU-only offloading needs no cross-rank view. Contiguous
+                # worker regions avoid one CUDA host registration per chunk.
+                engine_id = f"{engine_id}_worker{rank}"
+                region_bytes_per_chunk = self.cpu_page_size_per_worker
+                rank = 0
             mmap_region = SharedOffloadRegion(
-                engine_id=self.config.engine_id,
+                engine_id=engine_id,
                 num_chunks=self.num_chunks,
                 rank=rank,
-                kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+                kv_bytes_per_chunk=region_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
                 barrier=_all_workers_barrier,
             )
